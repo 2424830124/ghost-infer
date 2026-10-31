@@ -357,6 +357,7 @@ fn tool_label(t: &ToolLine) -> String {
         "read_chat" => "Read an earlier chat".into(),
         "check_work" => "Asked to check its work".into(),
         "keep_going" => "Sent back to work".into(),
+        "subagent" => format!("Ran a subagent: {}", s("description")),
         "compacted" => "Compacted the chat to fit the context".into(),
         "unreadable_tool_call" if t.result.as_deref().is_some_and(|r| r.contains("reached its limit")) => "Wrote a tool call the length limit cut off".into(),
         "unreadable_tool_call" => "Wrote a tool call that could not be read".into(),
@@ -1034,23 +1035,14 @@ impl App {
             }
             Message::NewChat => {
                 if self.busy.is_none() {
-                    self.chat = None;
-                    self.title = None;
-                    self.chat_cwd = None;
-                    self.goal = None;
-                    self.parts = Json::Null;
-                    self.messages.clear();
-                    self.shown = window();
-                    self.context.0 = 0.0;
-                    self.tasks.clear();
-                    self.plan_open = None;
+                    self.clear_chat();
                 }
             }
+            // the open chat deleted: a new chat in its place, as New chat leaves it (its task list and goal
+            // went on showing above the message box)
             Message::DeleteChat(id) => {
                 if self.chat.as_deref() == Some(id.as_str()) {
-                    self.chat = None;
-                    self.title = None;
-                    self.messages.clear();
+                    self.clear_chat();
                 }
                 return self.call(
                     move |api| {
@@ -2051,6 +2043,20 @@ impl App {
         Task::batch([task, iced::widget::operation::focus("editor")])
     }
 
+    /// No chat open: what a new one starts with (no messages, task list, goal or context).
+    fn clear_chat(&mut self) {
+        self.chat = None;
+        self.title = None;
+        self.chat_cwd = None;
+        self.goal = None;
+        self.parts = Json::Null;
+        self.messages.clear();
+        self.shown = window();
+        self.context.0 = 0.0;
+        self.tasks.clear();
+        self.plan_open = None;
+    }
+
     /// What / offers: the server's commands, then the installed skills.
     fn slash_all(&self) -> Vec<Slash> {
         let commands = COMMANDS.iter().map(|(n, a)| Slash { name: n.to_string(), about: a.to_string() });
@@ -2198,6 +2204,8 @@ impl App {
         let s = |k: &str| ev.get(k).and_then(Json::as_str).unwrap_or("").to_string();
         match kind {
             "preview" => return self.show_preview(s("url")),
+            // the model is replying in another chat: this one goes next
+            "waiting" => self.status = s("text"),
             "chat" => {
                 let new = self.chat.is_none();
                 self.chat = Some(s("id"));
@@ -2225,6 +2233,8 @@ impl App {
                 self.last_chunk_at = Some(self.born.elapsed().as_millis() as u64);
                 self.status = match s("name").as_str() {
                     "write_file" | "edit_file" => "Writing a file".into(),
+                    // a subagent writing (its own text stays out of the reply)
+                    "subagent" => "A subagent is working".into(),
                     _ => "Writing a tool call".into(),
                 };
             }

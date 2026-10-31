@@ -83,11 +83,19 @@ pub fn prompt() -> String {
     format!("Skills you can use. When a task matches one, call use_skill with its name before you start, then follow its instructions:\n{}", lines.join("\n"))
 }
 
-/// The most of a skill's instructions use_skill gives at once, in characters (about 6,000 tokens).
+/// The most of a skill's instructions use_skill gives at once, in characters (about 6,000 tokens), in a
+/// context of 48K tokens or more.
 const SKILL_CHARS: usize = 24000;
 
-/// The use_skill tool: a skill's instructions, and where its other files are.
-pub fn use_skill(name: &str) -> String {
+/// The most of a skill use_skill gives with a context of `ctx` tokens: about an eighth of it (16,000
+/// characters in 32K), up to SKILL_CHARS. Taste's 24,000 with a 26 KB page to read and rewrite overflowed
+/// a 32K context each time it was loaded again after a compaction, round after round.
+pub fn skill_chars(ctx: usize) -> usize {
+    (ctx / 2).clamp(4000, SKILL_CHARS)
+}
+
+/// The use_skill tool: a skill's instructions (at most `max` characters of them), and where its other files are.
+pub fn use_skill(name: &str, max: usize) -> String {
     let skills = list();
     let Some(s) = skills.iter().find(|s| s.name.eq_ignore_ascii_case(name.trim())) else {
         return format!("Error: no skill named {name}. The skills are: {}", skills.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", "));
@@ -98,20 +106,20 @@ pub fn use_skill(name: &str) -> String {
     let dir = s.dir.display().to_string();
     format!(
         "{}\n\n(This skill's folder is {dir}. Read the files it mentions with read_file, using full paths in that folder; run its scripts with run_command and cwd set to that folder.)",
-        skill_text(body.trim(), &text, &path.display().to_string())
+        skill_text(body.trim(), &text, &path.display().to_string(), max)
     )
 }
 
-/// A skill's instructions as use_skill gives them: whole when they fit in SKILL_CHARS; else their start, to a
-/// line's end, then the headings of the rest with their lines in SKILL.md, so the model reads only the part a
-/// task needs (Taste's SKILL.md is 85 KB: read whole, it fills a 32K context on its own).
-fn skill_text(body: &str, file: &str, path: &str) -> String {
-    if body.len() <= SKILL_CHARS {
+/// A skill's instructions as use_skill gives them: whole when they fit in `max` characters; else their start,
+/// to a line's end, then the headings of the rest with their lines in SKILL.md, so the model reads only the
+/// part a task needs (Taste's SKILL.md is 85 KB: read whole, it fills a 32K context on its own).
+fn skill_text(body: &str, file: &str, path: &str, max: usize) -> String {
+    if body.len() <= max {
         return body.to_string();
     }
     let lines: Vec<&str> = body.lines().collect();
     let (mut kept, mut chars) = (0, 0);
-    while kept < lines.len() && chars + lines[kept].len() < SKILL_CHARS {
+    while kept < lines.len() && chars + lines[kept].len() < max {
         chars += lines[kept].len() + 1;
         kept += 1;
     }
@@ -406,14 +414,15 @@ mod tests {
         let body: String = (0..3000).map(|i| if i % 500 == 0 { format!("## Part {:<12}\n", i / 500) } else { format!("{:<19}\n", "text") }).collect();
         let file = format!("---\nname: big\ndescription: d\n---\n{body}");
         let (_, parsed) = parse(&file);
-        let out = skill_text(parsed.trim(), &file, "SKILL.md");
+        let out = skill_text(parsed.trim(), &file, "SKILL.md", SKILL_CHARS);
         assert!(out.len() < SKILL_CHARS + 2000, "{}", out.len());
+        assert_eq!(skill_chars(32768), 16384);
         // about 1,200 lines fit; the body starts on the file's 5th line, so its line 1500 (Part 3) is the file's
         // 1505th, and Part 2 (kept) is not listed
         assert!(out.contains("line 1505: ## Part 3"), "{}", &out[out.len() - 400..]);
         assert!(!out.contains("## Part 2;"));
         assert!(out.contains("do not read the whole file"));
-        assert_eq!(skill_text("short", "short", "SKILL.md"), "short");
+        assert_eq!(skill_text("short", "short", "SKILL.md", SKILL_CHARS), "short");
     }
 
     #[test]

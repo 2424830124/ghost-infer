@@ -13,6 +13,8 @@
 //! Events, one JSON object per server-sent event:
 //!   {"type":"chat","id","title","checkpoint"}     the chat this run belongs to (new chats get an id here), and
 //!                                                 the checkpoint its file changes go under (POST /api/tools/undo)
+//!   {"type":"waiting","text"}                     the model is replying in another chat: this reply waits for it
+//!                                                 (one at a time, so neither reads its whole prompt again)
 //!   {"type":"text","text"}                        reply text as it streams (a thinking reply starts with <think>)
 //!   {"type":"calling","name"}                     a piece of a tool call being written, one per piece as "text"
 //!                                                 is (the call itself comes whole, as "tool_call"); "name" its
@@ -40,7 +42,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -68,7 +70,8 @@ const TOOLS: &str = r#"{
   {"type":"function","function":{"name":"read_chat","description":"Read an earlier chat found with search_chats.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"The chat's id"}},"required":["id"]}}},
   {"type":"function","function":{"name":"schedule_task","description":"Do something later, or again and again, even while the user is away: remind them, check on something, run a job. At that time the prompt is sent to you in this chat, and you work on it with the same tools (only those the user allows without asking). Give exactly one of in_minutes, at, every_minutes or daily_at.","parameters":{"type":"object","properties":{"prompt":{"type":"string","description":"What to do then, as an instruction to yourself, with every detail needed (you may not remember this chat by then)"},"name":{"type":"string","description":"A short name for it, a few words"},"in_minutes":{"type":"integer","description":"Once, this many minutes from now"},"at":{"type":"string","description":"Once, at this local time: HH:MM (today, or tomorrow if it has passed) or YYYY-MM-DD HH:MM"},"every_minutes":{"type":"integer","description":"Again and again, this many minutes apart (at least 5)"},"daily_at":{"type":"string","description":"Every day at this local time, HH:MM"},"days":{"type":"string","description":"With daily_at: only on these days, e.g. mon,tue,wed,thu,fri"}},"required":["prompt"]}}},
   {"type":"function","function":{"name":"list_schedules","description":"The scheduled tasks: id, name, when each runs next, and the time now.","parameters":{"type":"object","properties":{},"required":[]}}},
-  {"type":"function","function":{"name":"cancel_schedule","description":"Cancel a scheduled task by its id from list_schedules.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"The task's id"}},"required":["id"]}}}
+  {"type":"function","function":{"name":"cancel_schedule","description":"Cancel a scheduled task by its id from list_schedules.","parameters":{"type":"object","properties":{"id":{"type":"string","description":"The task's id"}},"required":["id"]}}},
+  {"type":"function","function":{"name":"subagent","description":"Hand a self-contained task to a subagent: it does it with the same tools in a fresh context of its own, and only its final report comes back to you. Use it for work that needs a lot of reading you will not need afterwards (reviewing a long file against guidelines, searching many files, researching a question): that reading then never fills your own context. It does not see this chat, so put everything it needs in the prompt: the paths, what to check, and whether it should change files or only report. Not for reading one known file or a quick search: do those yourself. Its report is not shown to the user: tell them what matters from it.","parameters":{"type":"object","properties":{"description":{"type":"string","description":"A few words saying what it will do, for the user: Review the page"},"prompt":{"type":"string","description":"The task, with everything needed to do it"}},"required":["description","prompt"]}}}
  ],
  "files": [
   {"type":"function","function":{"name":"read_file","description":"Read a text file, with line numbers. For a big file, read part of it with offset and limit.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"File path"},"offset":{"type":"integer","description":"First line to read, from 1"},"limit":{"type":"integer","description":"How many lines (default 300)"}},"required":["path"]}}},
@@ -80,7 +83,7 @@ const TOOLS: &str = r#"{
   {"type":"function","function":{"name":"edit_file","description":"Replace exact text in a file. Read the file first; old_string must match exactly once, so include enough surrounding lines.","parameters":{"type":"object","properties":{"path":{"type":"string","description":"File path"},"old_string":{"type":"string","description":"The exact text to replace"},"new_string":{"type":"string","description":"The text to put in its place"},"replace_all":{"type":"boolean","description":"Replace every match"}},"required":["path","old_string","new_string"]}}}
  ],
  "cmd": [
-  {"type":"function","function":{"name":"run_command","description":"Run programs, builds, tests and scripts: a Windows PowerShell command and its output. To find or read files use list_files, search_files and read_file instead (stops after 60 s unless timeout is set).","parameters":{"type":"object","properties":{"command":{"type":"string","description":"PowerShell command"},"cwd":{"type":"string","description":"Folder to run it in"},"timeout":{"type":"integer","description":"Seconds, up to 600"},"description":{"type":"string","description":"A few words saying what it does, for the user: Run the unit tests"}},"required":["command"]}}},
+  {"type":"function","function":{"name":"run_command","description":"Run programs, builds, tests and scripts: a Windows PowerShell command and its output. To find or read files use list_files, search_files and read_file instead (stops after 60 s unless timeout is set). Each call starts afresh in cwd: a cd does not carry over to the next call, so set cwd instead.","parameters":{"type":"object","properties":{"command":{"type":"string","description":"PowerShell command"},"cwd":{"type":"string","description":"Folder to run it in"},"timeout":{"type":"integer","description":"Seconds, up to 600"},"description":{"type":"string","description":"A few words saying what it does, for the user: Run the unit tests"}},"required":["command"]}}},
   {"type":"function","function":{"name":"start_process","description":"Start a long-running PowerShell command (a server, a build) in the background. Returns its id.","parameters":{"type":"object","properties":{"command":{"type":"string","description":"PowerShell command"},"cwd":{"type":"string","description":"Folder to run it in"},"description":{"type":"string","description":"A few words saying what it does, for the user: Run the unit tests"}},"required":["command"]}}},
   {"type":"function","function":{"name":"check_process","description":"A background process's state and the output it printed since the last check.","parameters":{"type":"object","properties":{"id":{"type":"integer","description":"Process id"}},"required":["id"]}}},
   {"type":"function","function":{"name":"stop_process","description":"Stop a background process.","parameters":{"type":"object","properties":{"id":{"type":"integer","description":"Process id"}},"required":["id"]}}}
@@ -109,7 +112,7 @@ const SKILL_TOOLS: [&str; 2] = [
 /// remember (Qwen3 4B said it remembered without saving anything). The turned-on groups' other tools are named
 /// in the system prompt only, and tool_search loads a description when the model needs one: a short prompt
 /// reads faster and leaves a small model less to choose from.
-const CORE_TOOLS: [&str; 12] = ["read_file", "list_files", "search_files", "write_file", "edit_file", "run_command", "web_search", "fetch_url", "use_skill", "get_system_info", "update_tasks", "remember"];
+const CORE_TOOLS: [&str; 13] = ["read_file", "list_files", "search_files", "write_file", "edit_file", "run_command", "web_search", "fetch_url", "use_skill", "get_system_info", "update_tasks", "remember", "subagent"];
 
 const TOOL_SEARCH: &str = r#"{"type":"function","function":{"name":"tool_search","description":"Load the full description of tools that the system prompt lists by name only, so you can call them. Use \"select:<name>,<name>\" for tools you know by name, or a few words saying what you need to find tools by what they do. Call it before using such a tool for the first time in a chat. Not for telling the user what you can do: every tool is already named in the system prompt.","parameters":{"type":"object","properties":{"query":{"type":"string","description":"select:<names>, or keywords"},"max_results":{"type":"integer","description":"Most tools to return for keywords (default 5)"}},"required":["query"]}}}"#;
 
@@ -278,9 +281,10 @@ fn tool_prompt(folders: &[PathBuf], can_run: bool, deferred: &[Json]) -> String 
     format!("You can use tools to do things on the user's computer. {where_} It runs Windows; commands run in Windows PowerShell. Answer greetings, chat and questions you can answer yourself directly, without tools; that includes questions about what you can do, which the tools below answer. Use tools when the request needs them; calls that do not depend on each other can go together in one turn. Before saying you cannot do something, check whether one of your tools can. Report what tools show faithfully: if a command failed or a search did not answer the question, say so, and never present a guess as a finding. To find and read files use list_files, search_files and read_file rather than commands, and read a file before you edit it. For a task of 3 or more steps, keep a task list with update_tasks. Save a fact with remember only when the user tells you something worth keeping for later chats. When the user refers to an earlier conversation, look it up with search_chats.{check}{more} Use tools until the task is done, then answer briefly.")
 }
 
-/// Files whose changes can be checked by running something (a notes file is not).
-const CODE: [&str; 31] = [
-    "rs", "py", "js", "mjs", "cjs", "ts", "tsx", "jsx", "go", "java", "kt", "c", "h", "cc", "cpp", "hpp", "cs", "rb", "php", "swift", "lua", "sh", "ps1", "bat", "cmd", "html", "css", "vue", "svelte", "sql", "dart",
+/// Files whose changes can be checked by running something (a notes file is not; nor a web page or its
+/// stylesheet, which the preview pane shows as it changes: sent back to "run" one, a model reads it all again).
+const CODE: [&str; 29] = [
+    "rs", "py", "js", "mjs", "cjs", "ts", "tsx", "jsx", "go", "java", "kt", "c", "h", "cc", "cpp", "hpp", "cs", "rb", "php", "swift", "lua", "sh", "ps1", "bat", "cmd", "vue", "svelte", "sql", "dart",
 ];
 
 fn is_code(path: &str) -> bool {
@@ -303,6 +307,48 @@ fn bad_call_result(arguments: &str) -> String {
         "<tool_call>{\"name\": \"TOOL\", \"arguments\": {...}}</tool_call> as valid JSON, with every brace and bracket closed"
     };
     format!("Error: this tool call could not be read, so nothing was run. Send it again as {form}.")
+}
+
+/// The most of a tool's output the model gets as it is, in characters: an eighth of its context (8,000 in 64K),
+/// from 4,000 to 30,000. Claude Code's limits are 30,000 to 100,000 in 200K.
+fn output_chars(ctx: usize) -> usize {
+    (ctx / 8).clamp(4000, 30000)
+}
+
+/// A tool's output too long for the context (output_chars), saved to a file in %LOCALAPPDATA%\ghost-infer\
+/// outputs\<chat>, and the model given its start and where the rest is, as Claude Code's <persisted-output>
+/// does: it reads on with read_file or searches it with search_files if it needs more. A recursive folder
+/// listing came to 16,000 characters twice in one chat, each pushing it into a compaction. A file it read
+/// (lines it asked for) and a skill's instructions (their own limit) are not saved, only cut if very long.
+fn spill(output: String, name: &str, chat_id: &str, call_id: &str, ctx: usize) -> String {
+    let n = output.chars().count();
+    if n <= output_chars(ctx) {
+        return output;
+    }
+    if matches!(name, "read_file" | "use_skill" | "subagent") {
+        return crate::tools::clip(&output, crate::tools::MAX_RESULT);
+    }
+    let dir = crate::tools::outputs_dir().map(|d| d.join(chat_id));
+    let path = dir.filter(|d| std::fs::create_dir_all(d).is_ok()).map(|d| d.join(format!("{call_id}.txt")));
+    let Some(path) = path.filter(|p| std::fs::write(p, &output).is_ok()) else {
+        return crate::tools::clip(&output, crate::tools::MAX_RESULT);
+    };
+    let preview: String = output.chars().take(2000).collect();
+    format!(
+        "<persisted-output>\nOutput too large ({n} characters, {} lines). Full output saved to: {}\nRead it with read_file (offset and limit) or search it with search_files when you need more of it.\n\nPreview (first 2,000 characters):\n{preview}\n...\n</persisted-output>",
+        output.lines().count(),
+        path.display()
+    )
+}
+
+/// The file a cut-off call was writing, from what of it came: Qwen3-Coder's <parameter=path>, GLM's
+/// <arg_key>path</arg_key><arg_value>, or JSON's "path".
+fn cut_path(raw: &str) -> Option<String> {
+    let after = |open: &str, close: &str| raw.split_once(open).and_then(|(_, r)| r.split_once(close)).map(|(p, _)| p.trim().to_string());
+    after("<parameter=path>", "</parameter>")
+        .or_else(|| after("<arg_key>path</arg_key><arg_value>", "</arg_value>"))
+        .or_else(|| after("\"path\": \"", "\"").or_else(|| after("\"path\":\"", "\"")).map(|p| p.replace("\\\\", "\\")))
+        .filter(|p| !p.is_empty())
 }
 
 /// The result of a call the reply's length limit cut off (`tokens` generated): sending it again whole would
@@ -355,7 +401,7 @@ fn check_goal(req: &Request, chat: &Chat, work: &mpsc::Sender<Work>, shared: &Sh
     let tools = if req.groups.is_empty() { Vec::new() } else { tools_for(&req.groups) };
     let mut history = for_model(&chat.messages);
     let ask = format!("(Check from ghost, not a message from the user.) The user's goal for this chat: {goal}\nJudge whether it is met from what the tool results above show; a reply saying it is done is not proof. Reply with JSON only and no tool calls: {{\"met\": true, \"reason\": \"the result that shows it\"}} or {{\"met\": false, \"reason\": \"what is still missing\"}}.");
-    history.push(obj(vec![("role", str("user")), ("content", str(&ask))]));
+    history.push(obj(vec![("role", str("user")), ("content", str(&ask)), ("aside", Json::Bool(true))]));
     let Ok(prompt) = prompt_for(req, &history, &tools, false, shared, loaded) else { return (false, "the check could not be made".into()) };
     let (tx, events) = mpsc::channel();
     let job = Job { model: loaded.id.clone(), kind: Kind::Chat, prompt, max_tokens: Some(120), temperature: 0.0, top_k: shared.defaults.1, top_p: shared.defaults.2, seed: 1, stop: Vec::new(), lead: "", events: tx };
@@ -679,7 +725,7 @@ fn make_room(chat: &mut Chat, need: usize, tok: &crate::tokenizer::Tokenizer) ->
 /// a small model), after the chat itself so the server's cache still holds the prompt.
 const COMPACT_PROMPT: &str = "(From ghost, not from the user) This chat has grown too long for your context, so it is being compacted: everything above will be replaced by your summary of it. Do not call any tools; write only the summary, inside <summary></summary>, under these headings:
 1. The user's requests: every request and instruction the user gave, in their own words, the latest last.
-2. Done so far: the files created or changed (full paths) and what is in them now, the commands run and what they showed.
+2. Done so far: the files created or changed (full paths) and what is in them now, the commands run and what they showed. Only what a tool's result shows happened counts: a call that failed or was cut off changed nothing, so say what it was meant to do and that it is still to do.
 3. What was learned: facts and decisions that matter for the rest of the work, errors and how they were fixed, anything the user said to do differently.
 4. Current work: exactly what you were doing right before this, and where it stopped.
 5. Next step: the next thing to do for the user's latest request, if anything is left.
@@ -705,7 +751,7 @@ fn compact(out: &mut Out, req: &Request, chat: &mut Chat, tools: &[Json], work: 
     let mut asked = None;
     for _ in 0..4 {
         let mut history = for_model(&chat.messages);
-        history.push(obj(vec![("role", str("user")), ("content", str(COMPACT_PROMPT))]));
+        history.push(obj(vec![("role", str("user")), ("content", str(COMPACT_PROMPT)), ("aside", Json::Bool(true))]));
         let prompt = format!("{}{START}", prompt_for(req, &history, tools, false, shared, loaded)?);
         // the question and the summary have to fit: old tool outputs out first if they do not
         let n = loaded.tok.encode(&prompt).len();
@@ -749,13 +795,14 @@ fn compact(out: &mut Out, req: &Request, chat: &mut Chat, tools: &[Json], work: 
     Ok(true)
 }
 
-/// This round's prompt, made to fit: when it would leave the reply less room than it asks for (up to a
-/// quarter of the context), the chat is compacted into a summary (compact); if no summary comes, make_room
+/// This round's prompt, made to fit: when it would leave the reply less room than it asks for (up to 3/8 of
+/// the context: a whole web page in one write_file, about 8,000 tokens, with its thinking, in 32K; at a
+/// quarter one was cut off), the chat is compacted into a summary (compact); if no summary comes, make_room
 /// takes out enough that it fills at most half of the rest, so the next rounds fit too and start the same
 /// way (the server's cache still holds them: each taking out changes the prompt's start, and the whole of it
 /// is read again).
 fn fitted_prompt(out: &mut Out, req: &Request, chat: &mut Chat, tools: &[Json], work: &mpsc::Sender<Work>, shared: &Shared, loaded: &Loaded) -> Result<String, String> {
-    let limit = loaded.ctx - req.max_tokens.min(loaded.ctx / 4);
+    let limit = loaded.ctx - req.max_tokens.min(loaded.ctx * 3 / 8);
     let mut compacted = false;
     for _ in 0..8 {
         let prompt = prompt_for(req, &for_model(&chat.messages), tools, req.thinking, shared, loaded)?;
@@ -1071,6 +1118,38 @@ impl Drop for Going {
     }
 }
 
+/// One reply on the model at a time: two chats taking turns round by round throw out each other's cache, so
+/// each round reads its whole prompt again (two landing pages at once took 25 minutes, 17 of them reading
+/// prompts again). A reply waits for the one going to end.
+static REPLYING: AtomicBool = AtomicBool::new(false);
+
+/// The model's turn, held while a reply runs.
+struct Turn;
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        REPLYING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Waits for the model's turn, saying so to the client once; None if the client went away meanwhile.
+fn take_turn(out: &mut Out) -> Option<Turn> {
+    let mut said = false;
+    loop {
+        if REPLYING.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            return Some(Turn);
+        }
+        if !said {
+            said = true;
+            let _ = emit(out, obj(vec![("type", str("waiting")), ("text", str("Waiting for the reply in another chat to finish"))]));
+        }
+        if !ping(out) {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
 /// Milliseconds since the last run ended, or None while one is going (scheduled runs wait for quiet).
 pub fn idle_ms() -> Option<u64> {
     (RUNNING.load(Ordering::SeqCst) == 0).then(|| (now_ms() as u64).saturating_sub(LAST_END.load(Ordering::SeqCst)))
@@ -1136,7 +1215,12 @@ pub fn load_chat(id: &str) -> Result<Json, String> {
 }
 
 pub fn delete_chat(id: &str) -> Result<(), String> {
-    std::fs::remove_file(chat_file(id)?).map_err(|_| format!("no chat {id}"))
+    std::fs::remove_file(chat_file(id)?).map_err(|_| format!("no chat {id}"))?;
+    // the outputs it saved go with it (the id was checked by chat_file)
+    if let Some(dir) = crate::tools::outputs_dir() {
+        let _ = std::fs::remove_dir_all(dir.join(id));
+    }
+    Ok(())
 }
 
 /// The user has seen what a scheduled run added to this chat. Left alone while a run holds the chat (it
@@ -1168,6 +1252,7 @@ struct Chat {
     goal: Json,   // its /goal (new_goal), or null
     parts: Json,  // how its last prompt split (prompt_parts), for the clients
     named: bool,  // the model has named it (after its first request that is more than a greeting)
+    transient: bool, // a subagent's chat: never saved
 }
 
 impl Chat {
@@ -1180,7 +1265,7 @@ impl Chat {
             h.write_u64(t as u64);
             h.finish() & 0xffff
         };
-        Chat { id: format!("{:x}-{rnd:04x}", t as u64), title: String::new(), created: t, updated: t, messages: Vec::new(), tokens: 0.0, tasks: Json::Arr(Vec::new()), unread: false, cwd: String::new(), goal: Json::Null, parts: Json::Null, named: false }
+        Chat { id: format!("{:x}-{rnd:04x}", t as u64), title: String::new(), created: t, updated: t, messages: Vec::new(), tokens: 0.0, tasks: Json::Arr(Vec::new()), unread: false, cwd: String::new(), goal: Json::Null, parts: Json::Null, named: false, transient: false }
     }
 
     fn load(id: &str) -> Result<Chat, String> {
@@ -1199,6 +1284,7 @@ impl Chat {
             parts: j.get("parts").cloned().unwrap_or(Json::Null),
             // chats saved before this were named after their first reply
             named: j.get("named").and_then(Json::as_bool).unwrap_or_else(|| j.get("messages").and_then(Json::as_array).is_some_and(|m| m.iter().any(|m| role(m) == "assistant"))),
+            transient: false,
         })
     }
 
@@ -1209,6 +1295,9 @@ impl Chat {
 
     /// Saved without counting as a change (the chat list is newest first, and reading a chat is not news).
     fn save_as_is(&self) -> Result<(), String> {
+        if self.transient {
+            return Ok(());
+        }
         let j = obj(vec![
             ("id", str(&self.id)),
             ("title", str(&self.title)),
@@ -1252,6 +1341,7 @@ struct Request {
     memory: String, // the remembered facts, likewise
     skills: String, // the installed skills, likewise
     preview: bool,  // the client shows web pages the model writes itself (the app's preview pane)
+    sub: String,    // a subagent's: the id of the call that started it, its own calls' ids begun with it ("" for a reply)
 }
 
 impl Request {
@@ -1277,6 +1367,7 @@ impl Request {
             memory: memory_prompt(),
             skills: super::skills::prompt(),
             preview: b.get("preview").and_then(Json::as_bool).unwrap_or(false),
+            sub: String::new(),
         }
     }
 
@@ -1299,8 +1390,18 @@ impl Out<'_> {
     }
 }
 
-/// One event to the client; Err when it has gone away.
+/// One event to the client; Err when it has gone away. While a subagent runs, the user sees its calls, their
+/// results, approvals and pages, and its writing as progress; not its text, task list or context.
 fn emit(out: &mut Out, ev: Json) -> Result<(), String> {
+    let ev = if SUBAGENT.with(std::cell::Cell::get) == 0 {
+        ev
+    } else {
+        match ev.get("type").and_then(Json::as_str) {
+            Some("tool_call" | "tool_result" | "approval" | "preview" | "waiting") => ev,
+            Some("text" | "calling") => obj(vec![("type", str("calling")), ("name", str("subagent"))]),
+            _ => return Ok(()),
+        }
+    };
     match out {
         Out::Client(conn) => sse(conn, &ev.to_string()).map_err(|_| "the client went away".to_string()),
         Out::Away => Ok(()),
@@ -1379,7 +1480,7 @@ pub fn run(conn: &mut TcpStream, body: &Json, work: &mpsc::Sender<Work>, shared:
                 // need not think to load them
                 let skills = skill_commands(m);
                 if !skills.is_empty() {
-                    let loads: Vec<(String, String, String)> = skills.iter().enumerate().map(|(i, name)| (format!("call_skill_{i}"), obj(vec![("name", str(name))]).to_string(), super::skills::use_skill(name))).collect();
+                    let loads: Vec<(String, String, String)> = skills.iter().enumerate().map(|(i, name)| (format!("call_skill_{i}"), obj(vec![("name", str(name))]).to_string(), super::skills::use_skill(name, super::skills::skill_chars(loaded.ctx)))).collect();
                     let calls = loads.iter().map(|(id, args, _)| obj(vec![("id", str(id)), ("type", str("function")), ("function", obj(vec![("name", str("use_skill")), ("arguments", str(args))]))])).collect();
                     chat.messages.push(obj(vec![("role", str("assistant")), ("content", str("")), ("tool_calls", Json::Arr(calls))]));
                     for (id, args, result) in &loads {
@@ -1404,6 +1505,7 @@ pub fn run(conn: &mut TcpStream, body: &Json, work: &mpsc::Sender<Work>, shared:
         }
         chat.save()?;
         let first = !chat.named && req.message.as_deref().is_some_and(|m| !is_greeting(m));
+        let Some(_turn) = take_turn(&mut out) else { return Err("the client went away".into()) };
         reply(&mut out, &req, &mut chat, first, work, shared, loaded)
     })();
     if let Err(e) = result {
@@ -1555,10 +1657,12 @@ pub fn run_away(w: &Wakeup, keep: impl Fn(&str) -> bool, work: &mpsc::Sender<Wor
         memory: memory_prompt(),
         skills: super::skills::prompt(),
         preview: false,
+        sub: String::new(),
     };
     let before = chat.messages.len();
     chat.messages.push(obj(vec![("role", str("user")), ("content", str(w.text)), ("shown", str(w.shown))]));
     chat.save()?;
+    let _turn = take_turn(&mut Out::Away);
     reply(&mut Out::Away, &req, &mut chat, false, work, shared, loaded)?;
     let text = chat.messages[before..].iter().rev().find(|m| role(m) == "assistant").and_then(|m| m.get("content").and_then(Json::as_str)).unwrap_or("").to_string();
     let kept = keep(&text);
@@ -1624,7 +1728,7 @@ fn name_chat(req: &Request, chat: &Chat, work: &mpsc::Sender<Work>, shared: &Sha
     let tools = if req.groups.is_empty() { Vec::new() } else { tools_for(&req.groups) };
     let mut history = for_model(&chat.messages);
     let ask = "Name this chat for the user's chat list: 3 to 7 words in sentence case (a capital only on the first word and on names) saying what the user wants. Reply with JSON only and no tool calls, like {\"title\": \"Fix the login button on mobile\"} or {\"title\": \"Plan a budget trip to Penang\"}. Too vague: {\"title\": \"Chat\"}. Too long: {\"title\": \"Help me find out why the login button does not work on my phone\"}.";
-    history.push(obj(vec![("role", str("user")), ("content", str(ask))]));
+    history.push(obj(vec![("role", str("user")), ("content", str(ask)), ("aside", Json::Bool(true))]));
     let prompt = prompt_for(req, &history, &tools, false, shared, loaded).ok()?;
     let (tx, events) = mpsc::channel();
     let job = Job { model: loaded.id.clone(), kind: Kind::Chat, prompt, max_tokens: Some(48), temperature: 0.0, top_k: shared.defaults.1, top_p: shared.defaults.2, seed: 1, stop: Vec::new(), lead: "", events: tx };
@@ -1679,13 +1783,18 @@ fn tool_name(t: &Json) -> &str {
 fn rounds(out: &mut Out, req: &Request, chat: &mut Chat, checkpoint: &str, work: &mpsc::Sender<Work>, shared: &Shared, loaded: &Loaded) -> Result<&'static str, String> {
     let reply_start = chat.messages.len();
     let parts = prompt_parts(req, loaded);
-    let tools = if req.groups.is_empty() { Vec::new() } else { tools_for(&req.groups) };
-    let deferred = if req.groups.is_empty() { Vec::new() } else { deferred_tools(&req.groups) };
+    // a subagent's tools: not those SUB_LEFT_OUT keeps from it
+    let kept = |t: &Json| req.sub.is_empty() || !SUB_LEFT_OUT.contains(&tool_name(t));
+    let tools: Vec<Json> = if req.groups.is_empty() { Vec::new() } else { tools_for(&req.groups) }.into_iter().filter(kept).collect();
+    let deferred: Vec<Json> = if req.groups.is_empty() { Vec::new() } else { deferred_tools(&req.groups) }.into_iter().filter(kept).collect();
+    // a subagent's calls' ids begin with its own call's, so its approvals and results find their lines
+    let prefix = if req.sub.is_empty() { String::new() } else { format!("{}.", req.sub) };
     let mut changed = false;
     let can_run = tools.iter().any(|t| tool_name(t) == "run_command");
     let (mut unchecked, mut nudged) = (false, false); // code changed and nothing run since; the nudge sent
     let mut planned = false; // the task list was written in this reply (an old one is not this reply's goal)
     let (mut goal_nudges, mut done_then) = (0, 0); // goal nudges in a row, and the steps done at the last one
+    let mut cut_write: Option<String> = None; // a file write the length limit cut off, not done again since
     for round in 0..MAX_ROUNDS {
         let prompt = fitted_prompt(out, req, chat, &tools, work, shared, loaded)?;
         let lead = super::reply_lead(&prompt);
@@ -1708,13 +1817,13 @@ fn rounds(out: &mut Out, req: &Request, chat: &mut Chat, checkpoint: &str, work:
                         emit(out, obj(vec![("type", str("text")), ("text", str(&t))]))?;
                     }
                     Part::Call { name, arguments } => {
-                        let id = format!("call_{}_{}", round, calls.len());
+                        let id = format!("{prefix}call_{}_{}", round, calls.len());
                         emit(out, obj(vec![("type", str("tool_call")), ("id", str(&id)), ("name", str(&name)), ("arguments", str(&arguments))]))?;
                         calls.push((id, name, arguments));
                     }
                     // a call it could not read: kept as a call, so its result tells the model to send it again
                     Part::Bad(raw) => {
-                        let id = format!("call_{}_{}", round, calls.len());
+                        let id = format!("{prefix}call_{}_{}", round, calls.len());
                         // what it wrote as a string (the prompt shows calls inside tags of their own)
                         let written = raw.trim_start_matches(ToolCalls::OPEN).trim_end_matches(ToolCalls::CLOSE).trim();
                         let arguments = obj(vec![("text", str(written))]).to_string();
@@ -1757,7 +1866,27 @@ fn rounds(out: &mut Out, req: &Request, chat: &mut Chat, checkpoint: &str, work:
             let tc = calls.iter().map(|(id, name, args)| obj(vec![("id", str(id)), ("type", str("function")), ("function", obj(vec![("name", str(name)), ("arguments", str(args))]))])).collect();
             msg.push(("tool_calls", Json::Arr(tc)));
         }
+        // a call cut off did nothing: its text out of the prompt from now on (a page of it filled the context)
+        if let Some((_, _, args)) = cut.as_ref().and_then(|id| calls.iter().find(|c| &c.0 == id)) {
+            msg.push(("args_trimmed", Json::Bool(true)));
+            let raw = Json::parse(args).ok().and_then(|a| a.get("text").and_then(Json::as_str).map(String::from)).unwrap_or_default();
+            if raw.contains("write_file") || raw.contains("edit_file") {
+                cut_write = Some(cut_path(&raw).unwrap_or_else(|| "the file".into()));
+            }
+        }
         chat.messages.push(obj(msg));
+        // the reply about to end with a cut-off write never done again (a model can lose track of it, as one
+        // did after a compaction: it reviewed the old page instead): sent back to it, once
+        if calls.is_empty() && round + 1 < MAX_ROUNDS {
+            if let Some(path) = cut_write.take() {
+                let say = format!("(Automatic check from ghost, not a message from the user) Your write of {path} was cut off earlier and never done again, so the file does not have it. Write it now, in parts (write_file with the first part, then write_file with \"append\": true for each further part), or say in one line why not.");
+                chat.messages.push(obj(vec![("role", str("user")), ("content", str(&say)), ("auto", Json::Bool(true)), ("goal", Json::Bool(true))]));
+                emit(out, obj(vec![("type", str("nudge")), ("kind", str("goal")), ("text", str(&say))]))?;
+                mark_changed(chat, reply_start, changed);
+                chat.save()?;
+                continue;
+            }
+        }
         if calls.is_empty() && unchecked && can_run && !nudged && round + 1 < MAX_ROUNDS {
             nudged = true;
             chat.messages.push(obj(vec![("role", str("user")), ("content", str(NUDGE)), ("auto", Json::Bool(true))]));
@@ -1824,6 +1953,7 @@ fn rounds(out: &mut Out, req: &Request, chat: &mut Chat, checkpoint: &str, work:
 Call it again with these parameters.", unloaded.unwrap().to_string()), false),
                 "tool_search" => (tool_search(&deferred, &arguments), false),
                 "update_tasks" => (update_tasks(out, chat, &arguments)?, false),
+                "subagent" => (subagent(out, &id, &arguments, chat, checkpoint, req, work, shared, loaded)?, false),
                 BAD_CALL if cut.as_ref() == Some(&id) => (cut_call_result(usage.1), false),
                 BAD_CALL => (bad_call_result(&arguments), false),
                 _ => {
@@ -1831,10 +1961,12 @@ Call it again with these parameters.", unloaded.unwrap().to_string()), false),
                     call(out, &id, &name, &arguments, chat, reply_start, checkpoint, req, shared, loaded)?
                 }
             };
+            let result = spill(result, &name, &chat.id, &id, loaded.ctx);
             let secs = RUN_SECS.with(|c| c.replace(-1.0));
             let secs = (secs >= 0.0).then(|| num((secs * 10.0).round() / 10.0));
             if !denied && approval_group(&name) == Some("edit") && !result.starts_with("Error") {
                 changed = true;
+                cut_write = None; // done again
                 unchecked |= Json::parse(&arguments).ok().and_then(|a| a.get("path").and_then(Json::as_str).map(is_code)).unwrap_or(false);
             }
             if !denied && approval_group(&name) == Some("cmd") {
@@ -1921,7 +2053,94 @@ thread_local! {
 /// One tool call: refused if it repeats itself, put to the user if its group needs an OK, then run.
 /// Returns its result for the model and whether the user said no.
 #[allow(clippy::too_many_arguments)]
+/// What a subagent does without: scheduling, memory, earlier chats and subagents of its own.
+const SUB_LEFT_OUT: [&str; 8] = ["subagent", "schedule_task", "list_schedules", "cancel_schedule", "remember", "forget", "search_chats", "read_chat"];
+
+/// Put before a subagent's task: Claude Code's brief for its general-purpose agent.
+const SUB_INTRO: &str = "(From ghost, not from the user) You are a subagent: the main agent has handed you the task below. Do it fully with your tools; do not gold-plate it, but do not leave it half-done. You do not see the main chat or the user, and the main agent sees only your last message: end with a concise report of what you did and found, with the paths and specifics it needs, and nothing else.";
+
+thread_local! {
+    /// Subagents running on this thread (a reply's subagent call runs on its thread): their events are what
+    /// the user sees of them (emit).
+    static SUBAGENT: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The subagent tool, as Claude Code's Agent tool: the task done in a fresh chat of its own (the reply's tools
+/// but those SUB_LEFT_OUT keeps, the chat's folder and permission mode), its file changes under the reply's
+/// checkpoint, and only its last message back as the result, so its reading never fills the main chat's
+/// context. Its calls and approvals show in the reply; its writing counts as progress (emit).
+#[allow(clippy::too_many_arguments)]
+fn subagent(out: &mut Out, id: &str, arguments: &str, parent: &Chat, checkpoint: &str, req: &Request, work: &mpsc::Sender<Work>, shared: &Shared, loaded: &Loaded) -> Result<String, String> {
+    if !req.sub.is_empty() {
+        return Ok("Error: a subagent cannot start another one; do this part yourself.".into());
+    }
+    let args = Json::parse(arguments).unwrap_or(Json::Null);
+    let task = args.get("prompt").and_then(Json::as_str).unwrap_or("").trim();
+    if task.is_empty() {
+        return Ok("Error: subagent needs \"prompt\": the task, with everything needed to do it.".into());
+    }
+    // the main chat's id, so the outputs it saves (spill) go with the main chat when that is deleted
+    let mut chat = Chat { id: parent.id.clone(), cwd: parent.cwd.clone(), transient: true, ..Chat::new() };
+    chat.messages.push(obj(vec![("role", str("user")), ("content", str(&format!("{SUB_INTRO}\n\nThe task:\n{task}")))]));
+    let sub = Request { sub: id.to_string(), chat: None, message: None, goal: false, ..req.clone() };
+    SUBAGENT.with(|d| d.set(d.get() + 1));
+    let done = rounds(out, &sub, &mut chat, checkpoint, work, shared, loaded);
+    SUBAGENT.with(|d| d.set(d.get() - 1));
+    let finish = done?;
+    let last = chat.messages.iter().rev().find(|m| role(m) == "assistant").and_then(|m| m.get("content").and_then(Json::as_str)).unwrap_or("");
+    let report = last.rsplit("</think>").next().unwrap_or(last).trim();
+    let note = match finish {
+        "length" => " (it stopped at the length limit)",
+        "rounds" => " (it stopped after its most rounds)",
+        _ => "",
+    };
+    Ok(if report.is_empty() { format!("The subagent finished without a report{note}.") } else { format!("(The subagent's report{note}; the user has not seen it.)\n{report}") })
+}
+
+/// A read_file of lines the prompt still holds, unchanged since (no write or edit of the file after that read,
+/// and its output not taken out): a line saying so in place of the lines again, as Claude Code answers an
+/// unchanged re-read. One landing page's run read the same 300 lines of it three times.
+fn unchanged_read(chat: &Chat, this: &str, arguments: &str) -> Option<String> {
+    let path = |a: &Json| a.get("path").and_then(Json::as_str).map(|p| p.replace('\\', "/").to_lowercase());
+    let range = |a: &Json| (a.get("offset").and_then(Json::as_f64).map_or(1, |o| o.max(1.0) as i64), a.get("limit").and_then(Json::as_f64).map(|l| l as i64));
+    let want = Json::parse(arguments).ok()?;
+    let file = path(&want)?;
+    let msgs = &chat.messages;
+    for (i, m) in msgs.iter().enumerate().rev() {
+        if flag(m, "dropped") {
+            break; // left out: what is before it too
+        }
+        // (this call is in the chat already, its output not yet)
+        for c in m.get("tool_calls").and_then(Json::as_array).unwrap_or(&[]).iter().rev().filter(|c| c.get("id").and_then(Json::as_str) != Some(this)) {
+            let Some(f) = c.get("function") else { continue };
+            let args = f.get("arguments").and_then(Json::as_str).and_then(|a| Json::parse(a).ok()).unwrap_or(Json::Null);
+            if path(&args).as_ref() != Some(&file) {
+                continue;
+            }
+            match f.get("name").and_then(Json::as_str) {
+                Some("write_file" | "edit_file") => return None, // changed since
+                Some("read_file") if range(&args) == range(&want) => {
+                    let call_id = c.get("id").and_then(Json::as_str)?;
+                    let out = msgs[i + 1..].iter().find(|r| r.get("tool_call_id").and_then(Json::as_str) == Some(call_id))?;
+                    let text = out.get("content").and_then(Json::as_str).unwrap_or("");
+                    if flag(out, "trimmed") || out.get("clip").is_some() || text.starts_with("Error") || text.starts_with("(Unchanged") {
+                        return None;
+                    }
+                    return Some("(Unchanged since you read these lines above: they are still in this chat, so they are not sent again. Use them from there.)".into());
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
 fn call(out: &mut Out, id: &str, name: &str, arguments: &str, chat: &Chat, reply_start: usize, checkpoint: &str, req: &Request, shared: &Shared, loaded: &Loaded) -> Result<(String, bool), String> {
+    if name == "read_file" {
+        if let Some(note) = unchanged_read(chat, id, arguments) {
+            return Ok((note, false));
+        }
+    }
     // the same call a third time in one reply: a small model going round in circles
     let same = chat.messages[reply_start..]
         .iter()
@@ -1972,7 +2191,7 @@ fn call(out: &mut Out, id: &str, name: &str, arguments: &str, chat: &Chat, reply
     if name == "use_skill" || name == "install_skill" {
         let args = Json::parse(arguments).unwrap_or(Json::Null);
         let s = |k: &str| args.get(k).and_then(Json::as_str).unwrap_or("").to_string();
-        return Ok((if name == "use_skill" { super::skills::use_skill(&s("name")) } else { super::skills::install_tool(&s("source"), &s("skill")) }, false));
+        return Ok((if name == "use_skill" { super::skills::use_skill(&s("name"), super::skills::skill_chars(loaded.ctx)) } else { super::skills::install_tool(&s("source"), &s("skill")) }, false));
     }
     if name == "search_chats" || name == "read_chat" {
         let args = Json::parse(arguments).unwrap_or(Json::Null);
@@ -2008,7 +2227,8 @@ fn call(out: &mut Out, id: &str, name: &str, arguments: &str, chat: &Chat, reply
     // the chat's own folders, its working directory first
     let settings = crate::tools::Settings { folders: req.folders.clone(), ..shared.harness.lock().unwrap().clone() };
     let t = std::time::Instant::now();
-    let result = crate::tools::run(name, &args, &settings, checkpoint).unwrap_or_else(|e| format!("Error: {e}"));
+    // whole: one too long for the context is saved to a file after (spill)
+    let result = crate::tools::run_full(name, &args, &settings, checkpoint).unwrap_or_else(|e| format!("Error: {e}"));
     RUN_SECS.with(|c| c.set(t.elapsed().as_secs_f64()));
     let result = match show_page(out, req.preview, name, &args, &settings, &result) {
         Some(note) => format!("{result}\n{note}"),
@@ -2049,6 +2269,53 @@ fn show_page(out: &mut Out, client_shows: bool, name: &str, args: &Json, setting
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_output_is_saved_to_a_file() {
+        let (chat, long) = ("spill-test-0001", "x".repeat(70) + "\n");
+        let output = long.repeat(200); // 14,200 characters: more than 8,000 in a 64K context
+        let got = spill(output.clone(), "run_command", chat, "call_1_0", 65536);
+        let path = got.split("Full output saved to: ").nth(1).and_then(|r| r.lines().next()).unwrap().to_string();
+        assert!(got.starts_with("<persisted-output>") && got.contains("14200 characters, 200 lines"), "{got}");
+        assert!(got.len() < 3000);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), output);
+        // short enough, or a file the model read: as it is (cut only past MAX_RESULT)
+        assert_eq!(spill(long.clone(), "run_command", chat, "call_1_1", 65536), long);
+        assert_eq!(spill(output.clone(), "read_file", chat, "call_1_2", 65536), output);
+        let _ = std::fs::remove_dir_all(crate::tools::outputs_dir().unwrap().join(chat));
+    }
+
+    #[test]
+    fn an_unchanged_reread_is_not_sent_again() {
+        let call = |id: &str, name: &str, args: &str| obj(vec![("role", str("assistant")), ("content", str("")), ("tool_calls", Json::Arr(vec![obj(vec![("id", str(id)), ("type", str("function")), ("function", obj(vec![("name", str(name)), ("arguments", str(args))]))])]))]);
+        let result = |id: &str, text: &str| obj(vec![("role", str("tool")), ("tool_call_id", str(id)), ("content", str(text))]);
+        let read = r#"{"path": "D:\\site\\index.html", "offset": 1, "limit": 300}"#;
+        let mut chat = Chat::new();
+        chat.messages = vec![obj(vec![("role", str("user")), ("content", str("make a page"))]), call("c1", "read_file", read), result("c1", "1\t<html>"), call("c2", "read_file", r#"{"path": "D:/site/index.html", "limit": 300}"#)];
+        // the same lines (the same path written either way, offset 1 as none), still in the prompt
+        assert!(unchanged_read(&chat, "c2", r#"{"path": "D:/site/index.html", "limit": 300}"#).is_some());
+        // other lines, or the file written since, or its output taken out: read again
+        assert!(unchanged_read(&chat, "c2", r#"{"path": "D:/site/index.html", "offset": 300}"#).is_none());
+        let mut written = chat.messages.clone();
+        written.insert(3, call("w1", "write_file", r#"{"path": "D:/site/index.html", "content": "x"}"#));
+        assert!(unchanged_read(&Chat { messages: written, ..Chat::new() }, "c2", read).is_none());
+        mark(&mut chat.messages[2], "trimmed", Json::Bool(true));
+        assert!(unchanged_read(&chat, "c2", read).is_none());
+    }
+
+    #[test]
+    fn a_cut_off_write_and_its_arguments() {
+        // the file a cut-off call was writing, in each form a model writes calls in
+        assert_eq!(cut_path("<function=write_file>\n<parameter=path>\nD:\\site\\index.html\n</parameter>\n<parameter=content>\n<!DOCTYPE").as_deref(), Some("D:\\site\\index.html"));
+        assert_eq!(cut_path("{\"name\": \"write_file\", \"arguments\": {\"path\": \"D:\\\\site\\\\a.html\", \"content\": \"<ht").as_deref(), Some("D:\\site\\a.html"));
+        assert_eq!(cut_path("write_file<arg_key>path</arg_key><arg_value>a.html</arg_value><arg_key>content"), Some("a.html".into()));
+        assert_eq!(cut_path("<function=write_file>\n<parameter=content>\n<html>"), None);
+        // its long text taken out, the rest kept
+        let args = obj(vec![("path", str("a.html")), ("content", str(&"<p>x</p>\n".repeat(100)))]).to_string();
+        let cut = Json::parse(&trimmed_args("write_file", &args)).unwrap();
+        assert_eq!(cut.get("path").and_then(Json::as_str), Some("a.html"));
+        assert!(cut.get("content").and_then(Json::as_str).unwrap().starts_with("[100 lines, taken out"));
+    }
 
     #[test]
     fn greetings_wait_for_a_request() {

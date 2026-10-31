@@ -49,6 +49,15 @@ computer. With models but none running, sending opens the model menu instead.
   writes a summary of it (what you asked, what was done, where it stopped) and works on from that; the
   chat file keeps everything, and the reply shows "Compacted the chat" with the summary. If no summary
   comes, old tool outputs, old file writes and then the oldest turns are taken out instead.
+- **Subagents, as Claude Code has them.** The model can hand a self-contained task (reviewing a long
+  file against guidelines, searching many files) to a subagent: it works in a fresh context of its own
+  with the same tools, its calls and approvals show in the reply, and only its report comes back, so its
+  reading never fills the chat's context.
+- **Big outputs go to a file.** A tool output too long for the context (an eighth of it: 8,000
+  characters at 64K) is saved under `%LOCALAPPDATA%\ghost-infer\outputs`, and the model gets its start and
+  the path, to read on in if it needs more. A file read again unchanged is not sent again either.
+- **One reply at a time.** A message in another chat waits for the reply going to end, so neither has to
+  read its whole prompt again.
 - **Progress as it works.** The ghost's line says what the model is doing, how long the reply has taken,
   the tokens written and the speed: "Writing a file · 1m 23s · 2,345 tokens · 19 tok/s".
 - **Instructions and memory.** `GHOST.md` goes into every chat: the one in `%LOCALAPPDATA%\ghost-infer`,

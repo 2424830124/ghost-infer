@@ -1161,6 +1161,16 @@ fn request_tools(body: &Json) -> &[Json] {
     body.get("tools").and_then(Json::as_array).unwrap_or(&[])
 }
 
+/// A user message that is not a new question, for the templates: the harness's own (a nudge, its "aside":
+/// the question it asks to name or compact a chat, put after it). The templates leave out the reasoning of
+/// the turns before the latest question; with one of these counted, the reply's rounds before it lost theirs
+/// and the prompt changed near its start, so all of it was read again (95 seconds for a compaction's
+/// question, 40 for a title's). A compaction's summary is the new start, so a question.
+fn aside(m: &Json) -> bool {
+    let flag = |k: &str| m.get(k).and_then(Json::as_bool).unwrap_or(false);
+    flag("aside") || (flag("auto") && !flag("compact"))
+}
+
 /// The messages in the ChatML template, ending with an open assistant turn. Tools, tool calls and
 /// tool results are written as Qwen's template writes them (`<tools>`, `<tool_call>`,
 /// `<tool_response>`), and the reasoning of turns before the latest user question is left out.
@@ -1226,9 +1236,9 @@ fn chat_prompt(body: &Json, default_system: Option<&str>, think_default: bool, s
         s.push_str(&format!("<|im_start|>system\n{sys}<|im_end|>\n"));
     }
 
-    // the latest real question (a user turn that is not a tool result)
+    // the latest real question (a user turn that is not a tool result, nor an aside: see aside)
     let is_tool_result = |c: &str| c.starts_with("<tool_response>") && c.ends_with("</tool_response>");
-    let last_query = (0..messages.len()).rev().find(|&i| roles[i] == "user" && !is_tool_result(&contents[i])).unwrap_or(messages.len() - 1);
+    let last_query = (0..messages.len()).rev().find(|&i| roles[i] == "user" && !is_tool_result(&contents[i]) && !aside(&messages[i])).unwrap_or(messages.len() - 1);
     for (i, m) in messages.iter().enumerate() {
         let content = contents[i].as_str();
         match roles[i] {
@@ -1460,7 +1470,7 @@ fn chat_prompt_glm(body: &Json, think_default: bool, switch: bool) -> Result<Str
         }
         s.push_str("</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>");
     }
-    let last_user = (0..messages.len()).rev().find(|&i| roles[i] == "user").unwrap_or(0);
+    let last_user = (0..messages.len()).rev().find(|&i| roles[i] == "user" && !aside(&messages[i])).unwrap_or(0);
     for (i, m) in messages.iter().enumerate() {
         let content = contents[i].as_str();
         match roles[i] {
@@ -1907,6 +1917,24 @@ mod tests {
         parts.extend(tc.finish());
         assert_eq!(parts.iter().map(|p| match p { Part::Text(t) | Part::Bad(t) => t.as_str(), _ => "" }).collect::<String>(), "a <tool_call>not json</tool_call> b");
         assert!(parts.contains(&Part::Bad("<tool_call>not json</tool_call>".into())));
+    }
+
+    #[test]
+    fn an_aside_keeps_the_prompt_start() {
+        // the harness's own question after a reply's rounds (to name or compact the chat): the rounds keep their
+        // reasoning, so the prompt starts as the round's did, and the server's cache still holds it
+        let chat = r#"[{"role":"user","content":"make a page"},{"role":"assistant","content":"<think>plan</think>ok","tool_calls":[{"id":"c1","type":"function","function":{"name":"list_files","arguments":"{}"}}]},{"role":"tool","tool_call_id":"c1","content":"a.html"}"#;
+        let body = |more: &str| Json::parse(&format!(r#"{{"messages":{chat}{more}],"chat_template_kwargs":{{"enable_thinking":true}}}}"#)).unwrap();
+        for (switch, coder) in [(true, true), (true, false)] {
+            let round = chat_prompt(&body(""), None, true, switch, coder).unwrap();
+            let start = round.rsplit_once("<|im_start|>assistant").unwrap().0;
+            assert!(start.contains("plan"));
+            let asked = chat_prompt(&body(r#",{"role":"user","content":"Name this chat","aside":true}"#), None, true, switch, coder).unwrap();
+            assert!(asked.starts_with(start), "{asked}");
+            // a new question: the round's reasoning goes, and the prompt changes before it
+            let plain = chat_prompt(&body(r#",{"role":"user","content":"Name this chat"}"#), None, true, switch, coder).unwrap();
+            assert!(!plain.starts_with(start));
+        }
     }
 
     #[test]

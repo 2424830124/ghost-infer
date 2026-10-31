@@ -75,7 +75,9 @@ pub fn start_server(addr: &str, extra: &[String], last: Option<&str>) {
     if let Some(path) = last.and_then(|id| dirs.iter().map(|d| d.join(format!("{id}.gguf"))).find(|p| p.exists())) {
         args.push(path.into());
     }
-    for a in ["--gpu", "--ctx", "32768", "--port", &port] {
+    // 64K: the context's memory is taken only as a chat grows (from the experts kept on the GPU), and 32K left a
+    // skill, a web page and its rewrite compacting round after round
+    for a in ["--gpu", "--ctx", "65536", "--port", &port] {
         args.push(a.into());
     }
     for d in &dirs {

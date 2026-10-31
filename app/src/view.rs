@@ -164,6 +164,7 @@ fn tool_icon(name: &str) -> char {
         "check_work" => ic::RETRY,
         "keep_going" => ic::TASKS,
         "compacted" => ic::MEMORY,
+        "subagent" => ic::CHAT,
         "schedule_task" | "list_schedules" | "cancel_schedule" => ic::CLOCK,
         n if n.starts_with("mcp__") => ic::PLUG,
         _ => ic::PC,

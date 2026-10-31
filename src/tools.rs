@@ -41,6 +41,12 @@ pub fn skills_dir() -> Option<PathBuf> {
     std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("ghost-infer").join("skills"))
 }
 
+/// Where tool outputs too long for the model's context are saved, a folder per chat
+/// (%LOCALAPPDATA%\ghost-infer\outputs): the file tools may read there, as in the skills folder.
+pub fn outputs_dir() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("ghost-infer").join("outputs"))
+}
+
 fn settings_file() -> Option<PathBuf> {
     std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("ghost-infer").join("harness.json"))
 }
@@ -132,18 +138,20 @@ impl Settings {
         Err(format!("{path} is outside the allowed folders ({})", self.folder_list()))
     }
 
-    /// `resolve`, or else an absolute path inside the skills folder: for reading and for a command's folder,
-    /// never for writing (the write tools use `resolve`).
+    /// `resolve`, or else an absolute path inside the skills folder or the saved outputs' folder: for reading
+    /// and for a command's folder, never for writing (the write tools use `resolve`).
     pub fn resolve_read(&self, path: &str) -> Result<PathBuf, String> {
         let err = match self.resolve(path) {
             Ok(p) => return Ok(p),
             Err(e) => e,
         };
         let p = Path::new(path.trim());
-        if let (true, Some(root)) = (p.is_absolute(), skills_dir()) {
-            if let (Ok(real), Ok(r)) = (std::fs::canonicalize(p), std::fs::canonicalize(root)) {
-                if real.starts_with(&r) {
-                    return Ok(real);
+        if p.is_absolute() {
+            for root in [skills_dir(), outputs_dir()].into_iter().flatten() {
+                if let (Ok(real), Ok(r)) = (std::fs::canonicalize(p), std::fs::canonicalize(root)) {
+                    if real.starts_with(&r) {
+                        return Ok(real);
+                    }
                 }
             }
         }
@@ -172,9 +180,16 @@ pub fn clip(text: &str, max: usize) -> String {
     format!("{head}\n... [{} characters cut] ...\n{tail}", n - head.chars().count() - tail.chars().count())
 }
 
-/// Runs tool `name` with its JSON arguments; Ok is the result for the model, Err an error it can act on.
-/// `checkpoint` groups file changes for undo (the chat page sends one per reply).
+/// Runs tool `name` with its JSON arguments; Ok is the result for the model (at most MAX_RESULT characters, cut
+/// in the middle), Err an error it can act on. `checkpoint` groups file changes for undo (the chat page sends
+/// one per reply).
 pub fn run(name: &str, args: &Json, s: &Settings, checkpoint: &str) -> Result<String, String> {
+    run_full(name, args, s, checkpoint).map(|out| clip(&out, MAX_RESULT))
+}
+
+/// `run`, its result not cut (only as long as each tool keeps: a command's last 1 MB): the agent saves one too
+/// long for the model's context to a file, for the model to read on in.
+pub fn run_full(name: &str, args: &Json, s: &Settings, checkpoint: &str) -> Result<String, String> {
     let text = |k: &str| args.get(k).and_then(Json::as_str);
     let need = |k: &str| text(k).ok_or_else(|| format!("{name} needs \"{k}\""));
     let count = |k: &str| args.get(k).and_then(Json::as_f64).filter(|v| *v >= 1.0).map(|v| v as usize);
@@ -200,7 +215,7 @@ pub fn run(name: &str, args: &Json, s: &Settings, checkpoint: &str) -> Result<St
         }
         _ => return Err(format!("no tool named {name}")),
     };
-    Ok(clip(&out, MAX_RESULT))
+    Ok(out)
 }
 
 /// Lines `offset..offset + limit` of a text file, numbered (cat -n style), with a note of what is left.
@@ -516,13 +531,51 @@ const BG_KEEP: usize = 256 << 10;
 /// script in its error messages, so text_of takes this line back out.
 const PREAMBLE: &str = "[Console]::OutputEncoding = [Text.Encoding]::UTF8";
 
+/// Bash's `a && b` and `a || b` as Windows PowerShell 5.1 (which has neither; 7 has) runs them: `a; if ($?) { b }`
+/// and `a; if (-not $?) { b }`, nested for a chain. Models write them out of habit (Qwen3-Coder ran
+/// `cd x && dir` three times running, a parse error each time). Only outside quotes and brackets.
+fn and_chains(command: &str) -> String {
+    let (mut parts, mut ops) = (Vec::new(), Vec::new());
+    let (b, mut depth, mut quote, mut start, mut i) = (command.as_bytes(), 0i32, None, 0, 0);
+    while i < b.len() {
+        let c = b[i];
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None => match c {
+                b'\'' | b'"' => quote = Some(c),
+                b'(' | b'{' | b'[' => depth += 1,
+                b')' | b'}' | b']' => depth -= 1,
+                b'&' | b'|' if depth == 0 && b.get(i + 1) == Some(&c) => {
+                    parts.push(command[start..i].trim());
+                    ops.push(c);
+                    i += 2;
+                    start = i;
+                    continue;
+                }
+                _ => {}
+            },
+        }
+        i += 1;
+    }
+    if ops.is_empty() {
+        return command.to_string();
+    }
+    parts.push(command[start..].trim());
+    let mut out = parts[parts.len() - 1].to_string();
+    for k in (0..ops.len()).rev() {
+        out = format!("{}; if ({}$?) {{ {out} }}", parts[k], if ops[k] == b'|' { "-not " } else { "" });
+    }
+    out
+}
+
 /// `command` in Windows PowerShell, started in `cwd`, stdout and stderr captured together.
 fn shell(command: &str, cwd: &Path) -> Result<std::process::Child, String> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"])
-        .arg(format!("{PREAMBLE}\n{command}"))
+        .arg(format!("{PREAMBLE}\n{}", and_chains(command)))
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -566,7 +619,8 @@ fn kill_tree(pid: u32) {
 /// Runs a command to completion (or `secs`), then its exit code and output.
 fn run_command(command: &str, cwd: &Path, secs: usize) -> Result<String, String> {
     let mut child = shell(command, cwd)?;
-    let buf = collect(&mut child, 4 * MAX_RESULT);
+    // up to 1 MB: an output too long for the model is saved whole to a file (the agent's spill), a shorter one cut
+    let buf = collect(&mut child, 1 << 20);
     let start = std::time::Instant::now();
     let status = loop {
         if let Some(st) = child.try_wait().map_err(|e| e.to_string())? {
@@ -989,6 +1043,20 @@ mod tests {
         assert!(done.iter().any(|d| d.contains("new.txt")), "{done:?}");
         assert_eq!(std::fs::read_to_string(&f).unwrap(), original);
         assert!(!root.join("new.txt").exists());
+    }
+
+    #[test]
+    fn and_chains_in_powershell() {
+        assert_eq!(and_chains("cd site && dir"), "cd site; if ($?) { dir }");
+        assert_eq!(and_chains("a && b && c"), "a; if ($?) { b; if ($?) { c } }");
+        assert_eq!(and_chains("npm test || echo failed"), "npm test; if (-not $?) { echo failed }");
+        // in quotes, in brackets, and a pipe: as they are
+        assert_eq!(and_chains("echo 'a && b'"), "echo 'a && b'");
+        assert_eq!(and_chains("if ($x) { a && b }"), "if ($x) { a && b }");
+        assert_eq!(and_chains("dir | select -first 3"), "dir | select -first 3");
+        // and it runs: the second part only after the first worked
+        let out = run_command("cd .. && echo ran", &std::env::temp_dir(), 30).unwrap();
+        assert!(out.starts_with("exit code 0") && out.contains("ran"), "{out}");
     }
 
     #[test]
