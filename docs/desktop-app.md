@@ -98,7 +98,48 @@ you set to always allowed, since nobody is there to ask.
 | `GHOST.md`, `memory.json` | instructions and remembered facts, for every chat |
 | `skills\`, `mcp.json` | installed skills and MCP servers |
 | `schedules.json` | scheduled tasks and loops |
-| `app.json` | the app's own settings (theme, permission mode, the folder new chats work in) |
+| `app.json` | the app's own settings (theme, permission mode, the folder new chats work in, the call model) |
+| `maya\` | Maya's persona (`persona.md`, yours to edit) and what she remembers of your calls (`memory.json`) |
+
+## Voice calls
+
+The switch at the top left turns the app into a phone call with **Maya**, a companion who talks rather than
+works: you speak (or type), she answers aloud, a sentence at a time as the model writes it.
+
+<p align="center">
+  <img src="demo-voice.gif" width="520" alt="A voice call in the desktop app: a typed question, and Maya's answer spoken while the pixel orb moves with her voice">
+  <br><sub>Real time: a call with Impish_LLAMA_3B on an RTX 2060 SUPER (8 GB), with the voice (maya1) and Whisper turbo
+  beside it on the same card. <a href="demo-voice.mp4">With sound</a>.</sub>
+</p>
+
+- **Speaking and listening.** The microphone is cut into what you say by loudness against the room's noise,
+  Whisper turns it into text, and Maya's reply is spoken as it is written. Speaking while she talks cuts her
+  off. **Type** sends text instead, answered aloud the same way; **Mute** stops the microphone.
+- **She remembers.** After each call the model thinks it back over and updates what Maya knows about you,
+  what the calls were about and moments worth bringing up, so the first call is with a stranger and later
+  ones with someone she knows. Her persona is `maya\persona.md`; the memory is `maya\memory.json`, plain JSON
+  you can edit or empty.
+- **Her own model.** "Talks with …" under her name picks the model calls use, "Same as Code" by default. A
+  small chatty one (3B to 4B) answers fastest and fits beside the voice; a coding model is often too formal.
+- **One card, two models.** When the GPU has room for the Code model, the call model and the voice together
+  (each model with a working context), all three stay loaded and a call starts at once. When it has not,
+  **Call Maya** asks before it unloads the Code model (or reloads it with a smaller context), and switching
+  back to Code brings it back.
+
+The voice needs two files the server is started with:
+
+```bash
+# speech: maya1 (a GGUF of maya-research/maya1) and the SNAC decoder in one folder
+python scripts/snac-convert.py C:\models\maya1\snac.gguf
+# listening: Whisper large-v3-turbo as one GGUF
+python scripts/whisper-convert.py C:\models\whisper-turbo.gguf
+ghost-infer serve --gpu --models C:\models --tts C:\models\maya1 --stt C:\models\whisper-turbo.gguf
+```
+
+Installed, the app finds them in its models folders by themselves: a folder with `snac.gguf` (or CSM's three
+files) and a `whisper*.gguf`. A `voice.txt` in the speech folder holds maya1's voice description (a
+fine-tune's own, if it was trained with one). Sesame's CSM works as the speech folder too (`scripts/csm-convert.py`). Together the voice and
+Whisper take about 3.5 GB of GPU memory, loaded only while calls may need them.
 
 ## The chat page
 

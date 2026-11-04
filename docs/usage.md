@@ -47,6 +47,8 @@ ghost-infer run   Qwen3-8B-Q4_K_M.gguf -p "Explain DNS." -t 0 --gpu --draft Qwen
 | `--host <addr>` | 127.0.0.1 | `serve`: address to listen on (`0.0.0.0` for other machines on your network) |
 | `--port <n>` | 8080 | `serve`: port |
 | `--models <dir>` | | `serve`: another folder of GGUF files for the model picker, besides the model's own (repeatable) |
+| `--tts <dir>` | | `serve`: a speech folder, maya1's (its GGUF and `snac.gguf`) or CSM's, for `/v1/audio/speech` and the app's voice calls ([Voice calls](desktop-app.md#voice-calls)) |
+| `--stt <file>` | | `serve`: a Whisper file for `/v1/audio/transcriptions`; with `--tts`, the app's voice calls |
 
 </details>
 
@@ -64,8 +66,10 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 | `POST /v1/chat/completions` | `messages` (system / user / assistant / tool, text content), `tools`, `tool_choice` (`"none"` hides the tools), `stream`, `max_tokens` / `max_completion_tokens`, `temperature`, `top_p`, `top_k`, `seed`, `stop`, `stream_options.include_usage`, `chat_template_kwargs.enable_thinking` |
 | `POST /v1/completions` | the same with a raw `prompt` instead of messages (no chat template) |
 | `GET /v1/models` | the loaded model (its file name) and its `context_length` |
-| `GET /api/models` | the GGUF files in the model's folder, the current model, and one being loaded |
-| `POST /api/models/load` | `{"id": "<file name without .gguf>"}`: switch to that model; answers once it is ready |
+| `GET /api/models` | the GGUF files in the model's folder, the current model, one being loaded, and for calls: `voice` (loaded), `call_model` (the model a call talks to now) and `together` (the chat and call models both loaded) |
+| `POST /api/models/load` | `{"id": "<file name without .gguf>"}`: switch to that model; answers once it is ready. `"voice": true` loads the speech and Whisper models beside it. `"call": "<model>"` keeps a call model and the voice loaded beside it when they all fit; otherwise `"for_call": true` loads the call model with the voice, else the model alone |
+| `POST /v1/audio/speech` | `input` (text), `response_format` (`wav` or streamed `pcm`): speech in the `--tts` voice, once the voice is loaded |
+| `POST /v1/audio/transcriptions` | a WAV file (raw or in a form): `text`, `language`, `duration` |
 | `GET /api/system` | this computer: CPU, RAM, GPU (VRAM, temperature, load), OS, drives, and the model and engine running (the chat page's `get_system_info` tool) |
 | `GET /api/progress` | the prompt being read: `done` and `total` tokens (`total` 0: none), and `disk`: waiting for weights to come off the disk |
 | `GET /` | the chat page |
@@ -80,6 +84,10 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
   `tool_calls` with `finish_reason: "tool_calls"`; streamed, each call is one `delta.tool_calls` chunk.
 - **Switching models** drops the running model (freeing its GPU memory) and loads the new one. Requests
   during a switch get `503`; if the new model fails to load, the server goes back to the previous one.
+- **Two models at once**: with a call model kept beside the chat model, a request goes to the model it was
+  written for (Maya's to the call model, everything else to the chat model). They are kept together only if
+  each has a working context (16K tokens for the chat model, 4K for the call model); the server checks the
+  files' sizes first, then the contexts once loaded, and remembers a pair that did not fit.
 - The agent's endpoints (`/api/agent`, `/api/tools`, `/api/chats` and the rest the app uses) are not part
   of this API: they answer only requests from this computer that carry the token written into the chat
   page. Other agent harnesses bring their own loop and tools and use `/v1`.

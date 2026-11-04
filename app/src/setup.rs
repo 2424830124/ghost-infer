@@ -84,8 +84,10 @@ pub fn start_server(addr: &str, extra: &[String], last: Option<&str>) {
         args.push("--models".into());
         args.push(d.into());
     }
-    // voice calls: a CSM voice folder and a Whisper file found in the models folders
-    if let Some(voice) = dirs.iter().flat_map(|d| std::fs::read_dir(d).into_iter().flatten().flatten()).map(|e| e.path()).find(|p| ["backbone.gguf", "decoder.gguf", "mimi.gguf"].iter().all(|f| p.join(f).is_file())) {
+    // voice calls: a voice folder (maya1's, with snac.gguf, or CSM's three files) and a Whisper file found in the
+    // models folders
+    let voice_folder = |p: &PathBuf| p.join("snac.gguf").is_file() || ["backbone.gguf", "decoder.gguf", "mimi.gguf"].iter().all(|f| p.join(f).is_file());
+    if let Some(voice) = dirs.iter().flat_map(|d| std::fs::read_dir(d).into_iter().flatten().flatten()).map(|e| e.path()).find(voice_folder) {
         args.push("--tts".into());
         args.push(voice.into());
     }

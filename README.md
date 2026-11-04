@@ -76,10 +76,19 @@ of two runs, llama.cpp with its automatic GPU split. Method and more results in 
   is using in VRAM, and an 80B model runs on an 8 GB card.
 - **A desktop app with an agent.** The model reads and edits your files and runs commands, asking first,
   with permission modes, a task list and background jobs. [More](docs/desktop-app.md)
+- **Voice calls.** Talk with Maya, a companion who answers aloud and remembers your calls, with her own
+  model beside the coding one when the GPU has room. Speech and listening run on the same card.
+  [More](docs/desktop-app.md#voice-calls)
 - **Drop-in server.** OpenAI-compatible `/v1/chat/completions` with streaming and tool calls, so editor
   plugins, chat apps and agent harnesses work unchanged. [More](docs/usage.md)
 - **Exact where it matters.** Speculative decoding gives the same output as plain greedy decoding, and
   results are checked against exact maths and llama.cpp. [More](docs/how-it-works.md)
+
+<p align="center">
+  <img src="docs/demo-voice.gif" width="520" alt="A voice call in the desktop app: Maya answers aloud while the pixel orb moves with her voice">
+  <br><sub>A voice call, real time: Impish_LLAMA_3B, the voice (maya1) and Whisper turbo together on an 8 GB RTX 2060 SUPER.
+  <a href="docs/demo-voice.mp4">With sound</a>.</sub>
+</p>
 
 ## Models
 
@@ -91,8 +100,9 @@ The app offers these on its first start:
 | Qwen3-Coder-30B-A3B | 14.7 GB | Answers at once: fast for code |
 | Qwen3-4B-Instruct-2507 | 2.5 GB | Computers with less memory |
 
-Other GGUF files of Llama, Qwen3, Qwen3-Next, Qwen3.5 / 3.6 and DeepSeek-style models such as
+Other GGUF files of Llama 3, Mistral Nemo, Qwen3, Qwen3-Next, Qwen3.5 / 3.6 and DeepSeek-style models such as
 GLM-4.7-Flash run too, in Q3_K to Q8_0 or the 2-bit IQ2 formats: [the full list](docs/building.md#supported-models).
+3-bit files stay 3-bit on the GPU, so a 12B Q3_K_M runs on an 8 GB card.
 
 ## Requirements
 
@@ -109,7 +119,7 @@ Windows 10 or 11, an NVIDIA GPU from the GTX 10 series on with a current driver,
 ## Roadmap
 
 - Linux support
-- More architectures (Gemma, Llama 3 tokenizer) and formats (Q4_0, the other IQ quants)
+- More architectures (Gemma) and formats (Q4_0, the other IQ quants)
 - Constrained decoding for tool calls
 
 ## License

@@ -70,8 +70,9 @@ OPTIONS:
         --port <n>        serve: port                        [8080]
         --no-think        serve: Qwen3 answers without thinking unless a request asks for it
         --models <dir>    serve: another folder of GGUF files for the model picker (repeatable)
-        --tts <dir>       serve: a CSM speech folder (scripts/csm-convert.py) for /v1/audio/speech and spoken
-                          replies in the chat page (GPU, about 1.7 GB of its memory)
+        --tts <dir>       serve: a speech folder, maya1's (its GGUF and snac.gguf from scripts/snac-convert.py) or
+                          CSM's (scripts/csm-convert.py), for /v1/audio/speech, spoken replies in the chat page
+                          and the app's voice calls (GPU, about 2.5 GB for maya1 Q4_K_M)
         --stt <file>      serve: a Whisper file (scripts/whisper-convert.py) for /v1/audio/transcriptions; with
                           --tts, the app's voice calls (GPU, about 1 GB)
 ";
