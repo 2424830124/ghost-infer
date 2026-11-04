@@ -1,6 +1,6 @@
 [package]
 name = "ghost-app"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "ghost-infer's native desktop app: a light window onto the local ghost-infer server"
 license = "MIT OR Apache-2.0"
