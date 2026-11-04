@@ -533,6 +533,7 @@ impl Menu {
 pub enum SettingsPage {
     General,
     Appearance,
+    Models,
     Voice,
     About,
 }
@@ -693,7 +694,8 @@ struct App {
     proc_output: std::collections::HashMap<usize, String>, // running processes' output, while the panel shows them
     polling: bool,
     own_server: bool,        // installed with its server (ghost-infer.exe beside it), which it starts itself
-    model_dirs: Vec<String>, // folders of models already on this computer, for that server
+    model_dirs: Vec<String>, // folders of models added in the app (given to the server when it starts, and when the app connects)
+    model_folders: Vec<String>, // every folder the server lists models from (its own and the app's)
     download: Json,          // a model downloading for the first run (/api/downloads)
     download_polled: u64,    // when it was last asked (the clock)
     download_polling: bool,
@@ -879,6 +881,8 @@ enum Message {
     CancelDownload,
     UseModelFolder,
     ModelFolder(Option<String>),
+    RemoveModelFolder(String),
+    ModelFolders(Result<Json, String>), // the server's models folders, after a change
     // the preview pane: the page's view made, and the pane's buttons
     PreviewMade(Result<(), String>),
     PreviewOpen,
@@ -996,6 +1000,7 @@ impl App {
             download_polling: false,
             download_rate: (0.0, None, 0.0),
             pick_model: false,
+            model_folders: Vec::new(),
             warm_up: true,
             preview_url: None,
             preview_open: false,
@@ -1079,7 +1084,18 @@ impl App {
                 } else {
                     Task::none()
                 };
-                let system = Task::batch([self.refresh_system(), self.refresh_memory(), self.refresh_extras(), self.wait_for_model(), plus, first_run, call]);
+                // the folders added in the app, given to a server started without them (the launcher's), and the list
+                let dirs = self.model_dirs.clone();
+                let folders = self.call(
+                    move |api| {
+                        for d in &dirs {
+                            let _ = api.post("/api/models/folders", &obj(vec![("add", str(d))]));
+                        }
+                        api.get("/api/models/folders")
+                    },
+                    Message::ModelFolders,
+                );
+                let system = Task::batch([self.refresh_system(), self.refresh_memory(), self.refresh_extras(), self.wait_for_model(), plus, first_run, call, folders]);
                 if let Some(id) = self.start.open.take() {
                     return Task::batch([system, self.call(move |api| api.get(&format!("/api/chats/{id}")), Message::ChatLoaded)]);
                 }
@@ -1752,30 +1768,29 @@ impl App {
                 return Task::perform(blocking(|| rfd::FileDialog::new().set_title("Choose a folder with GGUF models").pick_folder().map(|p| p.display().to_string())), Message::ModelFolder);
             }
             Message::ModelFolder(None) => {}
+            // a folder of models: listed at once, kept for the next start; added from the first-run screen with no
+            // model running, the model menu opens (from the settings, they stay open)
             Message::ModelFolder(Some(f)) => {
                 if !self.model_dirs.contains(&f) {
-                    self.model_dirs.push(f);
+                    self.model_dirs.push(f.clone());
                 }
                 self.save_settings();
-                // the server reads its folders when it starts: it starts again with this one
-                let (Some(api), addr, dirs) = (self.api.take(), self.start.addr.clone(), self.model_dirs.clone()) else { return Task::none() };
-                self.status = "Reading the folder…".into();
-                self.pick_model = true;
-                return Task::perform(
-                    blocking(move || {
-                        let _ = api.post("/api/quit", &Json::Null);
-                        for _ in 0..50 {
-                            if !setup::listening(&addr) {
-                                break;
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(200));
-                        }
-                        setup::start_server(&addr, &dirs, None);
-                        connect(&addr)
-                    }),
-                    Message::Connected,
-                );
+                self.pick_model = self.model.is_none() && self.loading.is_none() && self.menu != Some(Menu::Settings);
+                let body = obj(vec![("add", str(&f))]);
+                return self.call(move |api| api.post("/api/models/folders", &body), Message::ModelFolders);
             }
+            Message::RemoveModelFolder(f) => {
+                self.model_dirs.retain(|d| *d != f);
+                self.save_settings();
+                let body = obj(vec![("remove", str(&f))]);
+                return self.call(move |api| api.post("/api/models/folders", &body), Message::ModelFolders);
+            }
+            Message::ModelFolders(Ok(j)) => {
+                self.model_folders = j.get("folders").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(Json::as_str).map(String::from).collect();
+                let menu = if std::mem::take(&mut self.pick_model) { Task::done(Message::OpenMenu(Menu::Model)) } else { Task::none() };
+                return Task::batch([self.call(|api| api.get("/api/models"), Message::ModelLoaded), menu]);
+            }
+            Message::ModelFolders(Err(e)) => self.status = e,
             Message::AddFolder => {
                 self.menu = None;
                 // the dialog blocks, so it opens on its own thread

@@ -68,6 +68,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 | `GET /v1/models` | the loaded model (its file name) and its `context_length` |
 | `GET /api/models` | the GGUF files in the model's folder, the current model, one being loaded, and for calls: `voice` (loaded), `call_model` (the model a call talks to now) and `together` (the chat and call models both loaded) |
 | `POST /api/models/load` | `{"id": "<file name without .gguf>"}`: switch to that model; answers once it is ready. `"voice": true` loads the speech and Whisper models beside it. `"call": "<model>"` keeps a call model and the voice loaded beside it when they all fit; otherwise `"for_call": true` loads the call model with the voice, else the model alone |
+| `GET`/`POST /api/models/folders` | the folders the model list comes from; `{"add": "<folder>"}` or `{"remove": "<folder>"}` changes them while the server runs (the app's Settings, Models; local requests with the page's token only) |
 | `POST /v1/audio/speech` | `input` (text), `response_format` (`wav` or streamed `pcm`): speech in the `--tts` voice, once the voice is loaded |
 | `POST /v1/audio/transcriptions` | a WAV file (raw or in a form): `text`, `language`, `duration` |
 | `GET /api/system` | this computer: CPU, RAM, GPU (VRAM, temperature, load), OS, drives, and the model and engine running (the chat page's `get_system_info` tool) |

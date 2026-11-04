@@ -222,7 +222,7 @@ impl Status {
 /// What the connection threads share: the model's status, and where the models are.
 struct Shared {
     status: Mutex<Status>,
-    dirs: Vec<PathBuf>, // the model's folder, then any --models folders
+    dirs: Mutex<Vec<PathBuf>>, // the model's folder, then any --models folders, and those added since (/api/models/folders)
     download_dir: Option<PathBuf>, // the first --models folder: where a downloaded model goes
     defaults: (f32, usize, f32, usize),
     think_default: bool,
@@ -235,6 +235,18 @@ struct Shared {
     /// the speech and speech-to-text models (--tts, --stt), for /v1/audio/speech and /v1/audio/transcriptions:
     /// loaded only while asked for (see speech::Voice)
     voice: Mutex<speech::Voice>,
+}
+
+impl Shared {
+    /// The models folders now.
+    fn dirs(&self) -> Vec<PathBuf> {
+        self.dirs.lock().unwrap().clone()
+    }
+
+    /// The models folders, for /api/models/folders.
+    fn folders_json(&self) -> Json {
+        obj(vec![("folders", Json::Arr(self.dirs().iter().map(|d| str(&d.display().to_string())).collect()))])
+    }
 }
 
 /// What a model is, from its file: name, size label, parameters (all of them, and those one token uses
@@ -299,7 +311,7 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
     let shared = Arc::new(Shared {
         // a model given at startup shows as loading from the first request on
         status: Mutex::new(Status { loading: (!start_idle).then(|| model_id(&o.model)), ..Default::default() }),
-        dirs,
+        dirs: Mutex::new(dirs),
         download_dir: o.models.first().cloned(),
         defaults: (o.temp, o.top_k, o.top_p, o.max_new),
         think_default: !o.no_think,
@@ -1216,7 +1228,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
     if path == "/v1/audio/transcriptions" {
         return transcription_request(&mut conn, &req, shared);
     }
-    if ["/api/tools", "/api/harness", "/api/chats", "/api/agent", "/api/memory", "/api/maya", "/api/quit", "/api/skills", "/api/mcp", "/api/instructions", "/api/background", "/api/schedules", "/api/downloads"].iter().any(|p| path.starts_with(p)) {
+    if ["/api/tools", "/api/harness", "/api/chats", "/api/agent", "/api/memory", "/api/maya", "/api/quit", "/api/skills", "/api/mcp", "/api/instructions", "/api/background", "/api/schedules", "/api/downloads", "/api/models/folders"].iter().any(|p| path.starts_with(p)) {
         if let Err(e) = tools_allowed(&req, &conn, &shared.token) {
             return respond_private(&mut conn, 403, &error_body(e));
         }
@@ -1318,6 +1330,26 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
             }
             // Maya, the voice call's companion (maya.rs): what she remembers; after a call {"chat", "seconds"?}, she
             // thinks it over; reset: strangers again
+            // the folders the model picker lists GGUF files from: {"add": "<folder>"} or {"remove": "<folder>"}
+            // (for this run; the app keeps its own list and gives it again when it starts)
+            ("GET", "/api/models/folders") => respond_private(&mut conn, 200, &shared.folders_json()),
+            ("POST", "/api/models/folders") => {
+                let b = body().unwrap_or(Json::Null);
+                let path = |k: &str| b.get(k).and_then(Json::as_str).map(|p| PathBuf::from(p.trim()));
+                if let Some(add) = path("add") {
+                    if !add.is_dir() {
+                        return respond_private(&mut conn, 400, &error_body(&format!("{} is not a folder", add.display())));
+                    }
+                    let mut dirs = shared.dirs.lock().unwrap();
+                    if !dirs.contains(&add) {
+                        dirs.push(add);
+                    }
+                }
+                if let Some(remove) = path("remove") {
+                    shared.dirs.lock().unwrap().retain(|d| *d != remove);
+                }
+                respond_private(&mut conn, 200, &shared.folders_json())
+            }
             ("GET", "/api/maya") => respond_private(&mut conn, 200, &maya::status()),
             ("POST", "/api/maya/reflect") => {
                 let Some(l) = for_call.clone().filter(|_| loading.is_none()) else {
@@ -1440,7 +1472,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
                 let v = shared.voice.lock().unwrap();
                 (v.names(), v.loaded())
             };
-            let models = list_models(&shared.dirs)
+            let models = list_models(&shared.dirs())
                 .into_iter()
                 .map(|(id, _, size)| obj(vec![("id", str(&id)), ("size", num(size as f64))]))
                 .collect();
@@ -1495,10 +1527,10 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
             let b = std::str::from_utf8(&req.body).map_err(|e| e.to_string()).and_then(Json::parse).ok();
             let field = |k: &str| b.as_ref().and_then(|b| b.get(k)).cloned();
             let Some(id) = field("id").and_then(|v| v.as_str().map(String::from)) else { return respond(&mut conn, 400, &error_body("send {\"id\": \"<model>\"}")) };
-            let models = list_models(&shared.dirs);
+            let models = list_models(&shared.dirs());
             let find = |id: &str| models.iter().find(|m| m.0 == id).map(|m| m.1.clone());
             let missing = |id: &str| {
-                let dirs: Vec<String> = shared.dirs.iter().map(|d| d.display().to_string()).collect();
+                let dirs: Vec<String> = shared.dirs().iter().map(|d| d.display().to_string()).collect();
                 error_body(&format!("no {id}.gguf in {}", dirs.join(" or ")))
             };
             let Some(path) = find(&id) else { return respond(&mut conn, 404, &missing(&id)) };

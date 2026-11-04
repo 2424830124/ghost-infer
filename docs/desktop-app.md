@@ -132,13 +132,14 @@ The voice needs two files the server is started with:
 ```bash
 # speech: maya1 (a GGUF of maya-research/maya1) and the SNAC decoder in one folder
 python scripts/snac-convert.py C:\models\maya1\snac.gguf
-# listening: Whisper large-v3-turbo as one GGUF
-python scripts/whisper-convert.py C:\models\whisper-turbo.gguf
-ghost-infer serve --gpu --models C:\models --tts C:\models\maya1 --stt C:\models\whisper-turbo.gguf
+# listening: Whisper large-v3-turbo as one GGUF (in a folder of its own: in the models folder itself it would
+# show in the model menus)
+python scripts/whisper-convert.py C:\models\whisper\whisper-turbo.gguf
+ghost-infer serve --gpu --models C:\models --tts C:\models\maya1 --stt C:\models\whisper\whisper-turbo.gguf
 ```
 
-Installed, the app finds them in its models folders by themselves: a folder with `snac.gguf` (or CSM's three
-files) and a `whisper*.gguf`. A `voice.txt` in the speech folder holds maya1's voice description (a
+Installed, the app finds them in its models folders (Settings, Models) by themselves: a folder with `snac.gguf`
+(or CSM's three files), and a `whisper*.gguf` in a `whisper` folder. A `voice.txt` in the speech folder holds maya1's voice description (a
 fine-tune's own, if it was trained with one). Sesame's CSM works as the speech folder too (`scripts/csm-convert.py`). Together the voice and
 Whisper take about 3.5 GB of GPU memory, loaded only while calls may need them.
 

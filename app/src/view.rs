@@ -469,6 +469,7 @@ impl App {
             container(text("Settings").size(15).font(MEDIUM).color(s.text)).padding(Padding { top: 4.0, right: 10.0, bottom: 14.0, left: 10.0 }),
             nav_item(P::General, ic::SETTINGS, "General"),
             nav_item(P::Appearance, ic::COLOR, "Appearance"),
+            nav_item(P::Models, ic::FOLDER, "Models"),
             nav_item(P::Voice, ic::MIC, "Voice"),
             nav_item(P::About, ic::INFO, "About"),
         ]
@@ -567,6 +568,29 @@ impl App {
                     ..Default::default()
                 });
                 ("Appearance", "How ghost looks.", vec![group("Theme", vec![row_of("Colour theme", "Fog is light, Graphite dark. System follows Windows.".into(), picker.into())])])
+            }
+            P::Models => {
+                // each folder by its path; the ones added here can be removed (the server's own come back when it
+                // starts again, so they stay)
+                let mut rows: Vec<Element<'static, Message>> = self
+                    .model_folders
+                    .iter()
+                    .map(|f| {
+                        let ours = self.model_dirs.contains(f);
+                        let words = column![text(f.clone()).size(13.5).color(s.text), text(if ours { "Added in ghost" } else { "Set when ghost started" }).size(12.5).color(s.faint)].spacing(3).width(Fill);
+                        let control: Element<'static, Message> = if ours { action("Remove", Message::RemoveModelFolder(f.clone()), false) } else { Space::new().width(0).into() };
+                        row![words, control].spacing(24).align_y(Alignment::Center).padding([14, 18]).into()
+                    })
+                    .collect();
+                rows.push(row_of("Add a folder", "Its GGUF files show in the model menus at once, and from then on.".into(), action("Add folder…", Message::UseModelFolder, false)));
+                (
+                    "Models",
+                    "Where ghost finds models.",
+                    vec![
+                        group("Folders", rows),
+                        text("Voice calls find their files in these folders too: a speech folder (a maya1 GGUF with snac.gguf) and a whisper folder with a whisper*.gguf. They are read when ghost starts.").size(12.5).color(s.faint).into(),
+                    ],
+                )
             }
             P::Voice => {
                 let (speech, listen) = &self.voice_models;
