@@ -108,8 +108,9 @@ works: you speak (or type), she answers aloud, a sentence at a time as the model
 
 <p align="center">
   <img src="demo-voice.gif" width="520" alt="A voice call in the desktop app: a typed question, and Maya's answer spoken while the pixel orb moves with her voice">
-  <br><sub>Real time: a call with Impish_LLAMA_3B on an RTX 2060 SUPER (8 GB), with the voice (maya1) and Whisper turbo
-  beside it on the same card. <a href="demo-voice.mp4">With sound</a>.</sub>
+  <br><sub>Real time: a call with Impish_LLAMA_3B on an RTX 2060 SUPER (8 GB), with the voice (maya1 with a voice fine-tune
+  of our own, not included: plain maya1 sounds different) and Whisper turbo beside it on the same card.
+  <a href="demo-voice.mp4">With sound</a>.</sub>
 </p>
 
 - **Speaking and listening.** The microphone is cut into what you say by loudness against the room's noise,

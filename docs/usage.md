@@ -86,7 +86,7 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
   during a switch get `503`; if the new model fails to load, the server goes back to the previous one.
 - **Two models at once**: with a call model kept beside the chat model, a request goes to the model it was
   written for (Maya's to the call model, everything else to the chat model). They are kept together only if
-  each has a working context (16K tokens for the chat model, 4K for the call model); the server checks the
+  each has a working context (8K tokens for the chat model, 4K for the call model); the server checks the
   files' sizes first, then the contexts once loaded, and remembers a pair that did not fit.
 - The agent's endpoints (`/api/agent`, `/api/tools`, `/api/chats` and the rest the app uses) are not part
   of this API: they answer only requests from this computer that carry the token written into the chat

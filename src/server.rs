@@ -56,10 +56,12 @@ impl Plan {
 }
 
 /// The call model's context when it is kept beside the chat model (a call's prompt and its turns), the least it
-/// may get, and the least the chat model keeps beside them both (the agent's prompt and a working chat).
+/// may get, and the least the chat model keeps beside them both (the agent's prompt and a working chat; a chat
+/// that outgrows it is compacted). A 3B with the voice on an 8 GB card gets about 13K: kept together then, so a
+/// call starts at once.
 const CALL_CTX: usize = 8192;
 const MIN_CALL_CTX: usize = 4096;
-const MIN_CHAT_CTX: usize = 16384;
+const MIN_CHAT_CTX: usize = 8192;
 /// A model's GPU memory beside its file and its session (whose size counts the activations): the kernels and the
 /// conversion scratch. Its file is a little more than its GPU weights (a big embedding table stays in RAM).
 const MODEL_WORK: usize = 64 << 20;

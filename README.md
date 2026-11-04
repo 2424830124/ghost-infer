@@ -86,8 +86,8 @@ of two runs, llama.cpp with its automatic GPU split. Method and more results in 
 
 <p align="center">
   <img src="docs/demo-voice.gif" width="520" alt="A voice call in the desktop app: Maya answers aloud while the pixel orb moves with her voice">
-  <br><sub>A voice call, real time: Impish_LLAMA_3B, the voice (maya1) and Whisper turbo together on an 8 GB RTX 2060 SUPER.
-  <a href="docs/demo-voice.mp4">With sound</a>.</sub>
+  <br><sub>A voice call, real time: Impish_LLAMA_3B, the voice (maya1 with a voice fine-tune of our own, not included; plain
+  maya1 sounds different) and Whisper turbo together on an 8 GB RTX 2060 SUPER. <a href="docs/demo-voice.mp4">With sound</a>.</sub>
 </p>
 
 ## Models
