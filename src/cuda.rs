@@ -18,12 +18,19 @@ const MAX_BATCH: usize = 1024; // prompt tokens per GPU pass: big batches keep t
 /// even RAM: every pass streams nearly all of them, so a pass of 4096 tokens reads a long prompt's experts once
 /// where 1024 would read them several times (for about 400 MB more activations).
 fn max_batch(cfg: &Config) -> usize {
-    if cfg.delta.is_some() {
-        4096
-    } else {
-        MAX_BATCH
+    let b = if cfg.delta.is_some() { 4096 } else { MAX_BATCH };
+    match BATCH_CAP.load(Ordering::Relaxed) {
+        0 => b,
+        cap => b.min(cap),
     }
 }
+/// A smaller prompt batch fit_ctx chose when the weights leave little memory (0: none). Only ever lowered: a
+/// session made before keeps scratch for the bigger batch and just runs its prompts in smaller pieces.
+static BATCH_CAP: AtomicUsize = AtomicUsize::new(0);
+/// The smallest prompt batch fit_ctx goes down to for more context.
+const MIN_FIT_BATCH: usize = 256;
+/// fit_ctx makes prompt batches smaller (down to MIN_FIT_BATCH) while the context is shorter than this.
+const FIT_SHORT_CTX: usize = 8192;
 const MATMUL_TB: usize = 8; // tokens per matmul block row (must match TB in the kernel source)
 /// Rows per warp in the K-quant generation matmuls (passed to the kernels as -DRPW).
 /// GHOST_INFER_RPW overrides it for tuning.
@@ -283,7 +290,7 @@ __global__ void embed(int fmt, const unsigned char* __restrict__ w, const float*
 __global__ void qk_norm_rope(float* __restrict__ qkv, const float* __restrict__ qn, const float* __restrict__ kn,
                              kv_t* __restrict__ kc, kv_t* __restrict__ vc, float* __restrict__ ks, float* __restrict__ vs,
                              int pos0, const int* __restrict__ posp, int n_heads,
-                             int n_kv, int hd, int rope_dim, float base, int neox, float eps) {
+                             int n_kv, int hd, int rope_dim, float base, const float* __restrict__ ff, int neox, float eps) {
     __shared__ float sh[32];
     if (posp) pos0 = *posp; // CUDA graphs: the position comes from device memory
     int b = blockIdx.x, h = blockIdx.y, pos = pos0 + b;
@@ -307,6 +314,7 @@ __global__ void qk_norm_rope(float* __restrict__ qkv, const float* __restrict__ 
     int half = rope_dim / 2;
     for (int i = threadIdx.x; i < half; i += blockDim.x) {
         float freq = powf(base, -2.0f * (float)i / (float)rope_dim);
+        if (ff) freq /= ff[i]; // Llama 3 frequency scaling
         float s, c;
         sincosf((float)pos * freq, &s, &c);
         int ia = neox ? i : 2 * i, ib = neox ? i + half : 2 * i + 1;
@@ -1153,6 +1161,8 @@ __global__ void matmul_q6k_dp4a(DP4A_PARAMS) { q6k_dp4a<1, RPW>(DP4A_ARGS); }
 __global__ void __launch_bounds__(256, DP4A_BATCH_MINB) matmul_q6k_dp4a8(DP4A_PARAMS) { q6k_dp4a<8, DP4A_BATCH_RPW>(DP4A_ARGS); }
 __global__ void matmul_q8_dp4a(DP4A_PARAMS) { q8_dp4a<1>(DP4A_ARGS); }
 __global__ void __launch_bounds__(256, DP4A_BATCH_MINB) matmul_q8_dp4a8(DP4A_PARAMS) { q8_dp4a<8>(DP4A_ARGS); }
+__global__ void matmul_q3k_dp4a(DP4A_PARAMS) { q3k_dp4a<1, RPW>(DP4A_ARGS); }
+__global__ void __launch_bounds__(256, DP4A_BATCH_MINB) matmul_q3k_dp4a8(DP4A_PARAMS) { q3k_dp4a<8, DP4A_BATCH_RPW>(DP4A_ARGS); }
 // verify batches of up to 8, 16 and 32 tokens (128 threads: 4 warps of 8 rows)
 __global__ void __launch_bounds__(128) matmul_q4k_vfy1(DP4A_PARAMS) { q4k_vfy<1>(DP4A_ARGS); }
 __global__ void __launch_bounds__(128) matmul_q4k_vfy2(DP4A_PARAMS) { q4k_vfy<2>(DP4A_ARGS); }
@@ -3523,6 +3533,166 @@ __global__ void iq2_to_q8(const unsigned char* __restrict__ w, signed char* __re
     if (lane == 0) d[b] = dd;
 }
 
+// ---- CSM speech (see CsmFrames) ----
+
+__device__ __forceinline__ unsigned long long splitmix(unsigned long long z) {
+    z += 0x9E3779B97F4A7C15ull;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
+
+// One code from n <= 4096 logits: temperature and top-k, drawn with the Gumbel-max trick (the largest
+// logit / temperature + Gumbel noise among the k largest is a draw from their softmax). The k-th largest
+// value is found by a radix select over order-preserving keys; ties with it stay in, as top-k filters do.
+// p: [k, 1 / temperature (0: greedy)]; rng: [seed, draws so far], moved on. One block of 1024 threads.
+__global__ void csm_sample(const float* __restrict__ logits, int n, const float* __restrict__ p, unsigned long long* rng,
+                           int* __restrict__ codes, int slot) {
+    __shared__ unsigned int keys[4096];
+    __shared__ int count;
+    __shared__ float sv[32];
+    __shared__ int si[32];
+    int k = (int)p[0];
+    float inv_t = p[1];
+    unsigned long long seed = rng[0], draw = rng[1];
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        unsigned int u = __float_as_uint(logits[i]);
+        keys[i] = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+    }
+    unsigned int th = 0;
+    if (inv_t > 0.f && k > 0 && k < n) {
+        for (int b = 31; b >= 0; b--) {
+            unsigned int cand = th | (1u << b);
+            if (threadIdx.x == 0) count = 0;
+            __syncthreads();
+            int c = 0;
+            for (int i = threadIdx.x; i < n; i += blockDim.x) c += keys[i] >= cand;
+            for (int o = 16; o > 0; o >>= 1) c += __shfl_xor_sync(0xffffffff, c, o);
+            if ((threadIdx.x & 31) == 0 && c) atomicAdd(&count, c);
+            __syncthreads();
+            if (count >= k) th = cand;
+            __syncthreads(); // everyone has read count before it is reset
+        }
+    }
+    __syncthreads();
+    float bv = NEG_INF;
+    int bi = 0x7FFFFFFF;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        if (keys[i] < th) continue;
+        float v = logits[i];
+        if (inv_t > 0.f) {
+            unsigned long long h = splitmix(seed ^ splitmix(draw * 4096ull + (unsigned long long)i));
+            float u = ((float)(h >> 40) + 0.5f) * (1.f / 16777216.f);
+            v = v * inv_t - logf(-logf(u));
+        }
+        if (v > bv) { bv = v; bi = i; }
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        float ov = __shfl_xor_sync(0xffffffff, bv, o);
+        int oi = __shfl_xor_sync(0xffffffff, bi, o);
+        if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+    }
+    int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    if (lane == 0) { sv[wid] = bv; si[wid] = bi; }
+    __syncthreads();
+    if (wid == 0) {
+        int nw = blockDim.x >> 5;
+        bv = lane < nw ? sv[lane] : NEG_INF;
+        bi = lane < nw ? si[lane] : 0x7FFFFFFF;
+        for (int o = 16; o > 0; o >>= 1) {
+            float ov = __shfl_xor_sync(0xffffffff, bv, o);
+            int oi = __shfl_xor_sync(0xffffffff, bi, o);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        if (lane == 0) {
+            codes[slot] = bi == 0x7FFFFFFF ? 0 : bi;
+            rng[1] = draw + 1;
+        }
+    }
+}
+
+// out = the sum over codebooks first .. first + m - 1 of the f16 table row (codebook * vocab + its code).
+__global__ void csm_embed(const unsigned short* __restrict__ table, int cols, const int* __restrict__ codes, int first, int m,
+                          int vocab, float* __restrict__ out) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= cols) return;
+    float acc = 0.f;
+    for (int j = first; j < first + m; j++) acc += h2f(table[((size_t)j * vocab + codes[j]) * cols + c]);
+    out[c] = acc;
+}
+
+// ---- Whisper (see GpuWhisper) ----
+
+// LayerNorm with a bias over rows of `dim`: one block per row.
+__global__ void wh_layernorm(const float* __restrict__ x, const float* __restrict__ w, const float* __restrict__ b, float* __restrict__ out, int dim, float eps) {
+    __shared__ float sh[32];
+    const float* r = x + (size_t)blockIdx.x * dim;
+    float* o = out + (size_t)blockIdx.x * dim;
+    float s = 0.f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) s += r[i];
+    float mean = block_sum(s, sh) / dim;
+    float v = 0.f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) { float d = r[i] - mean; v += d * d; }
+    float inv = rsqrtf(block_sum(v, sh) / dim + eps);
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) o[i] = (r[i] - mean) * inv * w[i] + b[i];
+}
+
+// x[i] += b[i % dim] over n rows, then the exact GELU if `gelu`.
+__global__ void wh_bias(float* __restrict__ x, const float* __restrict__ b, int dim, int n, int gelu) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)n * dim) return;
+    float v = x[i] + b[i % dim];
+    if (gelu) v = 0.5f * v * (1.f + erff(v * 0.70710678f));
+    x[i] = v;
+}
+
+__global__ void wh_add(float* __restrict__ x, const float* __restrict__ y, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] += y[i];
+}
+
+// Rows for a 3-tap convolution with one zero of padding each side: output row t is [x(t*s-1) | x(t*s) | x(t*s+1)]
+// over `c` channels each (zeros outside the nin input rows).
+__global__ void wh_im2col(const float* __restrict__ x, float* __restrict__ out, int nin, int nout, int c, int stride) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)nout * 3 * c) return;
+    int t = (int)(i / (3 * c)), r = (int)(i % (3 * c)), j = r / c, ch = r % c;
+    int src = t * stride - 1 + j;
+    out[i] = (src >= 0 && src < nin) ? x[(size_t)src * c + ch] : 0.f;
+}
+
+// Attention with heads of 64: query row qi (stride qs) of head h against nk key and value rows (stride ks);
+// causal >= 0: query qi sees keys below causal + qi + 1. grid (queries, heads), 128 threads, nk floats of
+// dynamic shared memory.
+__global__ void wh_attention(const float* __restrict__ q, const float* __restrict__ k, const float* __restrict__ v, float* __restrict__ out,
+                             int nk, int qs, int ks, int heads, int causal, float scale) {
+    extern __shared__ float sc[];
+    __shared__ float qv[64];
+    __shared__ float sh[32];
+    int qi = blockIdx.x, h = blockIdx.y;
+    if (threadIdx.x < 64) qv[threadIdx.x] = q[(size_t)qi * qs + h * 64 + threadIdx.x];
+    __syncthreads();
+    int lim = causal >= 0 ? min(nk, causal + qi + 1) : nk;
+    float mx = NEG_INF;
+    for (int j = threadIdx.x; j < lim; j += blockDim.x) {
+        const float* kr = k + (size_t)j * ks + h * 64;
+        float s = 0.f;
+        for (int d = 0; d < 64; d++) s += qv[d] * kr[d];
+        s *= scale;
+        sc[j] = s;
+        mx = fmaxf(mx, s);
+    }
+    mx = block_max(mx, sh);
+    float sum = 0.f;
+    for (int j = threadIdx.x; j < lim; j += blockDim.x) { float e = __expf(sc[j] - mx); sc[j] = e; sum += e; }
+    sum = block_sum(sum, sh);
+    if (threadIdx.x < 64) {
+        float acc = 0.f;
+        for (int j = 0; j < lim; j++) acc += sc[j] * v[(size_t)j * ks + h * 64 + threadIdx.x];
+        out[(size_t)qi * heads * 64 + h * 64 + threadIdx.x] = acc / sum;
+    }
+}
+
 }
 "#);
 
@@ -3648,6 +3818,14 @@ api! {
     cuMemAlloc_v2: fn(*mut u64, usize) -> CuResult;
     cuMemFree_v2: fn(u64) -> CuResult;
     cuMemGetInfo_v2: fn(*mut usize, *mut usize) -> CuResult;
+    cuMemGetAllocationGranularity: fn(*mut usize, *const MemProp, i32) -> CuResult;
+    cuMemAddressReserve: fn(*mut u64, usize, usize, u64, u64) -> CuResult;
+    cuMemAddressFree: fn(u64, usize) -> CuResult;
+    cuMemCreate: fn(*mut u64, usize, *const MemProp, u64) -> CuResult;
+    cuMemRelease: fn(u64) -> CuResult;
+    cuMemMap: fn(u64, usize, usize, u64, u64) -> CuResult;
+    cuMemUnmap: fn(u64, usize) -> CuResult;
+    cuMemSetAccess: fn(u64, usize, *const MemAccess, usize) -> CuResult;
     cuMemcpyHtoD_v2: fn(u64, *const c_void, usize) -> CuResult;
     cuMemcpyDtoH_v2: fn(*mut c_void, u64, usize) -> CuResult;
     cuMemcpyDtoD_v2: fn(u64, u64, usize) -> CuResult;
@@ -3661,6 +3839,7 @@ api! {
     cuMemAllocHost_v2: fn(*mut *mut c_void, usize) -> CuResult;
     cuMemFreeHost: fn(*mut c_void) -> CuResult;
     cuMemcpyHtoDAsync_v2: fn(u64, *const c_void, usize, Ptr) -> CuResult;
+    cuMemcpyDtoHAsync_v2: fn(*mut c_void, u64, usize, Ptr) -> CuResult;
     cuEventCreate: fn(*mut Ptr, u32) -> CuResult;
     cuEventRecord: fn(Ptr, Ptr) -> CuResult;
     cuEventSynchronize: fn(Ptr) -> CuResult;
@@ -3771,6 +3950,7 @@ fn api() -> Result<&'static Api, String> {
 struct DeviceBuf {
     ptr: u64,
     bytes: usize,
+    owned: bool, // false: a part of an Arena's range, freed with it
 }
 
 impl DeviceBuf {
@@ -3778,7 +3958,7 @@ impl DeviceBuf {
         let a = api()?;
         let mut ptr = 0u64;
         a.check(unsafe { (a.f.cuMemAlloc_v2)(&mut ptr, bytes.max(4)) }, &format!("alloc {} MB", bytes >> 20))?;
-        Ok(DeviceBuf { ptr, bytes })
+        Ok(DeviceBuf { ptr, bytes, owned: true })
     }
 
     fn write<T: Copy>(&self, data: &[T]) -> Result<(), String> {
@@ -3796,8 +3976,104 @@ impl DeviceBuf {
 
 impl Drop for DeviceBuf {
     fn drop(&mut self) {
+        if !self.owned {
+            return;
+        }
         if let Ok(a) = api() {
             unsafe { (a.f.cuMemFree_v2)(self.ptr) };
+        }
+    }
+}
+
+/// CUmemAllocationProp: pinned device memory on the device.
+#[repr(C)]
+struct MemProp {
+    ty: i32,
+    handle_types: i32,
+    loc_type: i32,
+    loc_id: i32,
+    win32_meta: *mut c_void,
+    compression: u8,
+    rdma: u8,
+    usage: u16,
+    reserved: [u8; 4],
+}
+
+/// CUmemAccessDesc
+#[repr(C)]
+struct MemAccess {
+    loc_type: i32,
+    loc_id: i32,
+    flags: i32,
+}
+
+const ON_DEVICE: MemProp = MemProp { ty: 1, handle_types: 0, loc_type: 1, loc_id: 0, win32_meta: std::ptr::null_mut(), compression: 0, rdma: 0, usage: 0, reserved: [0; 4] };
+
+/// A model's weights one after another in one range of addresses, given memory as it fills. cuMemAlloc rounds
+/// every buffer up to 2 MB: over a 12B model's ~300 matrices and scale arrays that was 250 MB, a quarter of
+/// what an 8 GB card has left for the context.
+struct Arena {
+    base: u64,
+    reserved: usize,
+    used: usize,
+    mapped: usize,
+    gran: usize,
+    chunks: Vec<(u64, usize)>, // physical memory handles and their sizes, mapped in order from base
+}
+
+impl Arena {
+    fn new() -> Result<Arena, String> {
+        let a = api()?;
+        let (mut gran, mut free, mut total, mut base) = (0usize, 0usize, 0usize, 0u64);
+        unsafe {
+            a.check((a.f.cuMemGetAllocationGranularity)(&mut gran, &ON_DEVICE, 0), "allocation granularity")?;
+            a.check((a.f.cuMemGetInfo_v2)(&mut free, &mut total), "memory info")?;
+            let reserved = total.next_multiple_of(gran);
+            a.check((a.f.cuMemAddressReserve)(&mut base, reserved, 0, 0, 0), "address reserve")?;
+            Ok(Arena { base, reserved, used: 0, mapped: 0, gran, chunks: Vec::new() })
+        }
+    }
+
+    fn alloc(&mut self, bytes: usize) -> Result<DeviceBuf, String> {
+        let start = self.used.next_multiple_of(256);
+        let end = start + bytes.max(4);
+        if end > self.reserved {
+            return DeviceBuf::alloc(bytes);
+        }
+        if end > self.mapped {
+            let a = api()?;
+            let size = (end - self.mapped).next_multiple_of(self.gran);
+            let at = self.base + self.mapped as u64;
+            let mut h = 0u64;
+            unsafe {
+                a.check((a.f.cuMemCreate)(&mut h, size, &ON_DEVICE, 0), &format!("alloc {} MB", size >> 20))?;
+                if let Err(e) = a.check((a.f.cuMemMap)(at, size, 0, h, 0), "map") {
+                    (a.f.cuMemRelease)(h);
+                    return Err(e);
+                }
+                self.chunks.push((h, size));
+                self.mapped += size;
+                let rw = MemAccess { loc_type: 1, loc_id: 0, flags: 3 };
+                a.check((a.f.cuMemSetAccess)(at, size, &rw, 1), "memory access")?;
+            }
+        }
+        self.used = end;
+        Ok(DeviceBuf { ptr: self.base + start as u64, bytes, owned: false })
+    }
+}
+
+impl Drop for Arena {
+    fn drop(&mut self) {
+        if let Ok(a) = api() {
+            let mut at = self.base;
+            unsafe {
+                for &(h, size) in &self.chunks {
+                    (a.f.cuMemUnmap)(at, size);
+                    (a.f.cuMemRelease)(h);
+                    at += size as u64;
+                }
+                (a.f.cuMemAddressFree)(self.base, self.reserved);
+            }
         }
     }
 }
@@ -3819,6 +4095,13 @@ struct Kernels {
     matmul_q6k: [Ptr; 2],
     matmul_dp4a: [[Ptr; 2]; 3], // decode, int8 activations: [Q8_0 | Q4_K | Q6_K][1 token | up to 8]
     argmax_rows: Ptr,
+    csm_sample: Ptr,
+    csm_embed: Ptr,
+    wh_layernorm: Ptr,
+    wh_bias: Ptr,
+    wh_add: Ptr,
+    wh_im2col: Ptr,
+    wh_attention: Ptr,
     matmul_tiled: Ptr,
     matmul_mma: Option<Ptr>, // int8 tensor cores, sm_75 and newer
     matmul_mma_k: Option<[Ptr; 2]>, // the same for Q4_K / Q6_K with per-256 activation scales
@@ -3864,9 +4147,14 @@ struct Kernels {
     moe_down_iq2: Ptr,
     iq2_to_q8: Ptr,
     matmul_iq2_dp4a: Ptr,
+    matmul_q3k_dp4a: [Ptr; 2], // decode, Fmt::Q3K: [1 token | up to 8]
     /// every launch goes here (a blocking stream: the synchronous copies still order against it); CUDA
     /// graphs need a stream other than the legacy default one
     stream: Ptr,
+    /// a non-blocking stream that copies go through too (`h2d`, `d2h`), never the legacy one: for models that run
+    /// on threads of their own beside the language model (the voice, Whisper). Otherwise a synchronous copy on one
+    /// thread synchronises with the other thread's blocking stream, and spoils a CUDA graph it is capturing.
+    private: bool,
 }
 
 unsafe impl Send for Kernels {}
@@ -3941,7 +4229,8 @@ impl Kernels {
         Ok(bin)
     }
 
-    fn compile() -> Result<Kernels, String> {
+    /// The kernels, on a stream of their own (`private`: see Kernels::private).
+    fn compile_on(private: bool) -> Result<Kernels, String> {
         let a = api()?;
         let f = &a.f;
         let bin = Self::binary(a)?;
@@ -3978,6 +4267,13 @@ impl Kernels {
                     [get("matmul_q6k_dp4a")?, get("matmul_q6k_dp4a8")?],
                 ],
                 argmax_rows: get("argmax_rows")?,
+                csm_sample: get("csm_sample")?,
+                csm_embed: get("csm_embed")?,
+                wh_layernorm: get("wh_layernorm")?,
+                wh_bias: get("wh_bias")?,
+                wh_add: get("wh_add")?,
+                wh_im2col: get("wh_im2col")?,
+                wh_attention: get("wh_attention")?,
                 matmul_tiled: get("matmul_tiled")?,
                 matmul_mma: if a.compute >= (7, 5) && std::env::var_os("GHOST_INFER_NO_MMA").is_none() { Some(get("matmul_mma")?) } else { None },
                 // GHOST_INFER_NO_Q8K=1 keeps K-quant prompts on matmul_mma (per-32 activation scales)
@@ -4052,12 +4348,39 @@ impl Kernels {
                 moe_down_iq2: get("moe_down_iq2")?,
                 iq2_to_q8: get("iq2_to_q8")?,
                 matmul_iq2_dp4a: get("matmul_iq2_dp4a")?,
+                matmul_q3k_dp4a: [get("matmul_q3k_dp4a")?, get("matmul_q3k_dp4a8")?],
                 stream: {
                     let mut st: Ptr = std::ptr::null_mut();
-                    a.check((f.cuStreamCreate)(&mut st, 0), "stream")?;
+                    const NON_BLOCKING: u32 = 1;
+                    a.check((f.cuStreamCreate)(&mut st, if private { NON_BLOCKING } else { 0 }), "stream")?;
                     st
                 },
+                private,
             })
+        }
+    }
+
+    /// Copies `data` to device address `dst`: in this stream's order (private), or synchronously.
+    fn h2d<T: Copy>(&self, dst: u64, data: &[T]) -> Result<(), String> {
+        let a = api()?;
+        let bytes = std::mem::size_of_val(data);
+        if self.private {
+            // from pageable memory: returns once the data is staged, so it may be dropped then
+            a.check(unsafe { (a.f.cuMemcpyHtoDAsync_v2)(dst, data.as_ptr() as *const c_void, bytes, self.stream) }, "copy to GPU")
+        } else {
+            a.check(unsafe { (a.f.cuMemcpyHtoD_v2)(dst, data.as_ptr() as *const c_void, bytes) }, "copy to GPU")
+        }
+    }
+
+    /// Copies from device address `src` into `out`, after the work queued before it.
+    fn d2h<T: Copy>(&self, out: &mut [T], src: u64) -> Result<(), String> {
+        let a = api()?;
+        let bytes = std::mem::size_of_val(out);
+        if self.private {
+            // to pageable memory: returns once the copy is done
+            a.check(unsafe { (a.f.cuMemcpyDtoHAsync_v2)(out.as_mut_ptr() as *mut c_void, src, bytes, self.stream) }, "copy from GPU")
+        } else {
+            a.check(unsafe { (a.f.cuMemcpyDtoH_v2)(out.as_mut_ptr() as *mut c_void, src, bytes) }, "copy from GPU")
         }
     }
 
@@ -4099,6 +4422,7 @@ struct Uploader {
     file_secs: f64,            // reading (and repacking) tensors
     alloc_secs: f64,
     bytes: usize,
+    arena: Option<Arena>, // where alloc places buffers (None: each its own cuMemAlloc)
 }
 
 const STAGE_BYTES: usize = 32 << 20;
@@ -4127,11 +4451,13 @@ fn read_exact_at(file: &std::fs::File, mut buf: &mut [u8], mut offset: u64) -> R
 }
 const GPU_Q6K_BYTES: usize = 208; // a Q6_K block on the GPU, without its d (must match Q6K_BYTES in the kernels)
 const Q3K_GPU_BYTES: usize = 112; // a Q3_K block repacked for the GPU (must match Q3K_GPU_BYTES in the kernels)
+/// Values of 3-bit weights converted to Q8 at a time for a prompt batch (16 MB of scratch).
+const Q3K_CONV: usize = 16 << 20;
 
 impl Uploader {
     fn new() -> Result<Uploader, String> {
         let a = api()?;
-        let mut up = Uploader { pinned: [std::ptr::null_mut(); 2], events: [std::ptr::null_mut(); 2], stream: std::ptr::null_mut(), next: 0, files: Vec::new(), wait_secs: 0.0, bytes: 0, file_secs: 0.0, alloc_secs: 0.0 };
+        let mut up = Uploader { pinned: [std::ptr::null_mut(); 2], events: [std::ptr::null_mut(); 2], stream: std::ptr::null_mut(), next: 0, files: Vec::new(), wait_secs: 0.0, bytes: 0, file_secs: 0.0, alloc_secs: 0.0, arena: None };
         unsafe {
             for i in 0..2 {
                 let mut p: *mut c_void = std::ptr::null_mut();
@@ -4247,9 +4573,17 @@ impl Uploader {
         Ok(())
     }
 
+    /// Device memory for an upload: in the arena if there is one.
+    fn alloc(&mut self, bytes: usize) -> Result<DeviceBuf, String> {
+        match &mut self.arena {
+            Some(arena) => arena.alloc(bytes),
+            None => DeviceBuf::alloc(bytes),
+        }
+    }
+
     fn put_vec<T: Copy>(&mut self, data: &[T]) -> Result<DeviceBuf, String> {
         let bytes = std::mem::size_of_val(data);
-        let buf = DeviceBuf::alloc(bytes)?;
+        let buf = self.alloc(bytes)?;
         self.put(buf.ptr, unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, bytes) })?;
         Ok(buf)
     }
@@ -4300,6 +4634,9 @@ enum Fmt {
     /// 2-bit i-quant blocks as in the file (GpuMatrix::iq says which); decoding reads them as they are, prompt
     /// batches convert them to Q8 first
     Iq2 = 3,
+    /// Q3_K in 112-byte blocks (Q3K_GPU_BYTES); decoding reads them as they are, prompt batches convert them
+    /// to Q8 a slice of rows at a time
+    Q3K = 4,
 }
 
 /// A weight matrix on the GPU, repacked from its GGUF blocks so every field is naturally aligned and
@@ -4323,7 +4660,7 @@ impl GpuMatrix {
 
     /// A matrix in memory owned elsewhere (an expert slot, a scratch buffer); never freed through this.
     fn view(fmt: Fmt, q: u64, d: Option<u64>, rows: usize, cols: usize) -> std::mem::ManuallyDrop<GpuMatrix> {
-        std::mem::ManuallyDrop::new(GpuMatrix { fmt, q: DeviceBuf { ptr: q, bytes: 0 }, d: d.map(|ptr| DeviceBuf { ptr, bytes: 0 }), rows, cols, coarse: false, iq: -1 })
+        std::mem::ManuallyDrop::new(GpuMatrix { fmt, q: DeviceBuf { ptr: q, bytes: 0, owned: false }, d: d.map(|ptr| DeviceBuf { ptr, bytes: 0, owned: false }), rows, cols, coarse: false, iq: -1 })
     }
 }
 
@@ -4366,8 +4703,9 @@ fn upload_parts_as(g: &Gguf, names: &[String], up: &mut Uploader, keep_iq2: bool
         let iq = iq2_kernel_fmt(ty).filter(|_| keep_iq2 && cols % 256 == 0);
         let (fmt, gpu_bytes) = match ty {
             _ if iq.is_some() => (Fmt::Iq2, run.iter().map(|t| t.n_bytes).sum()),
-            // no 3- or 5-bit GPU kernels yet: requantised to int8 (about 2.4x / 1.5x the memory), as are
-            // the rarer formats (Q5_0, IQ4_NL, ...)
+            GgmlType::Q3K if keep_iq2 => (Fmt::Q3K, rows * (cols / 256) * Q3K_GPU_BYTES),
+            // no 5-bit GPU kernels yet: requantised to int8 (about 1.5x the memory), as are the rarer formats
+            // (Q5_0, IQ4_NL, ...) and Q3_K in the embedding table
             GgmlType::Q8_0 | GgmlType::Q3K | GgmlType::Q5K => (Fmt::Q8, rows * cols),
             t if t.dequant_only() => (Fmt::Q8, rows * cols),
             GgmlType::Q4K => (Fmt::Q4K, run.iter().map(|t| t.n_bytes).sum()),
@@ -4375,7 +4713,7 @@ fn upload_parts_as(g: &Gguf, names: &[String], up: &mut Uploader, keep_iq2: bool
             other => return Err(format!("GPU backend does not handle {} weights yet", other.name())),
         };
         let ta = std::time::Instant::now();
-        let q = DeviceBuf::alloc(gpu_bytes)?;
+        let q = up.alloc(gpu_bytes)?;
         up.alloc_secs += ta.elapsed().as_secs_f64();
         let mut off = 0;
         let mut d = Vec::new();
@@ -4389,6 +4727,11 @@ fn upload_parts_as(g: &Gguf, names: &[String], up: &mut Uploader, keep_iq2: bool
                 Fmt::Q6K => up.put_repacked(dst, &g.path, t.offset as u64, t.n_bytes, (210, GPU_Q6K_BYTES), &mut d, |i, o| {
                     o.copy_from_slice(&i[..GPU_Q6K_BYTES]);
                     f16_to_f32(u16::from_le_bytes([i[GPU_Q6K_BYTES], i[GPU_Q6K_BYTES + 1]]))
+                })?,
+                // 110-byte blocks reordered: header (scales, d) first, then the high bits and the 2-bit pairs
+                Fmt::Q3K => up.put_repacked(dst, &g.path, t.offset as u64, t.n_bytes, (110, Q3K_GPU_BYTES), &mut d, |i, o| {
+                    q3k_repack(i, o);
+                    0.0
                 })?,
                 Fmt::Q8 if t.ty != GgmlType::Q8_0 => {
                     let (qb, ds) = requant_q8(g, t);
@@ -4404,12 +4747,16 @@ fn upload_parts_as(g: &Gguf, names: &[String], up: &mut Uploader, keep_iq2: bool
             off += match fmt {
                 Fmt::Q4K | Fmt::Iq2 => t.n_bytes,
                 Fmt::Q6K => t.n_bytes / 210 * GPU_Q6K_BYTES,
+                Fmt::Q3K => t.n_bytes / 110 * Q3K_GPU_BYTES,
                 Fmt::Q8 => t.n_elements() as usize,
             };
             up.file_secs += tf.elapsed().as_secs_f64();
         }
-        let d = if !matches!(fmt, Fmt::Q4K | Fmt::Iq2) { Some(up.put_vec(&d)?) } else { None };
-        parts.push((GpuMatrix { fmt, q, d, rows, cols, coarse: ty.is_iquant(), iq: iq.unwrap_or(-1) }, row_off));
+        let d = if !matches!(fmt, Fmt::Q4K | Fmt::Iq2 | Fmt::Q3K) { Some(up.put_vec(&d)?) } else { None };
+        // requantised 3- and 5-bit weights decode with int8 activations like 2-bit ones (Q3_K_M keeps a few
+        // Q5_K matrices beside its Q3_K ones: else those layers' decoding would leave the dp4a path)
+        let coarse = ty.is_iquant() || matches!(ty, GgmlType::Q3K | GgmlType::Q5K);
+        parts.push((GpuMatrix { fmt, q, d, rows, cols, coarse, iq: iq.unwrap_or(-1) }, row_off));
         row_off += rows;
     }
     Ok(parts)
@@ -4439,6 +4786,15 @@ fn requant_q8(g: &Gguf, t: &TensorInfo) -> (Vec<u8>, Vec<f32>) {
         },
     );
     (q, d)
+}
+
+/// A GGUF Q3_K block (110 bytes) as the GPU's 112: scales, d and 2 pad bytes, then the high bits and the 2-bit pairs.
+fn q3k_repack(blk: &[u8], o: &mut [u8]) {
+    o[..12].copy_from_slice(&blk[96..108]); // scales
+    o[12..14].copy_from_slice(&blk[108..110]); // d
+    o[14..16].fill(0);
+    o[16..48].copy_from_slice(&blk[..32]); // high bits
+    o[48..112].copy_from_slice(&blk[32..96]); // 2-bit pairs
 }
 
 fn upload_one(g: &Gguf, name: &str, up: &mut Uploader) -> Result<GpuMatrix, String> {
@@ -4477,7 +4833,7 @@ fn upload_vec(g: &Gguf, name: &str, up: &mut Uploader) -> Result<DeviceBuf, Stri
     if t.ty != GgmlType::F32 {
         return Err(format!("GPU backend expects F32 norm weights ({name} is {})", t.ty.name()));
     }
-    let buf = DeviceBuf::alloc(t.n_bytes)?;
+    let buf = up.alloc(t.n_bytes)?;
     up.put(buf.ptr, &g.mmap[t.offset..t.offset + t.n_bytes])?;
     Ok(buf)
 }
@@ -5064,11 +5420,7 @@ impl ExpertCache {
         }
         for (m, dst) in [(gate, 0), (up, gate_bytes)] {
             for (blk, o) in m.chunks_exact(110).zip(out[dst..dst + gate_bytes].chunks_exact_mut(Q3K_GPU_BYTES)) {
-                o[..12].copy_from_slice(&blk[96..108]); // scales
-                o[12..14].copy_from_slice(&blk[108..110]); // d
-                o[14..16].fill(0);
-                o[16..48].copy_from_slice(&blk[..32]); // high bits
-                o[48..112].copy_from_slice(&blk[32..96]); // 2-bit pairs
+                q3k_repack(blk, o);
             }
         }
         out[2 * gate_bytes..2 * gate_bytes + down.len()].copy_from_slice(down);
@@ -5198,14 +5550,460 @@ impl ExpertCache {
 enum Embd {
     Gpu(GpuMatrix),
     Host { map: memmap2::Mmap, offset: usize, bytes: usize, ty: GgmlType, rows: usize, cols: usize },
+    /// no table: the model is fed vectors (forward_vectors), as CSM's transformers are
+    Vectors,
+}
+
+/// An extra output projection beside a model's own (CSM's per-codebook heads), applied to the final-normed
+/// hidden state of the last pass (`GpuModel::head_logits`).
+pub struct GpuHead(GpuMatrix);
+
+/// The GPU side of CSM speech (csm.rs): a whole frame as one CUDA graph. From the backbone's last pass (its
+/// logits and final-normed state) it samples the first code, runs the depth decoder on the projected state and
+/// then on each code's row, with a head and a sampler per codebook, sums the frame's 32 rows into the
+/// backbone's next input and runs the backbone on it. The host only reads the codes back. The two models
+/// must share their kernels (GpuModel::share_kernels).
+pub struct CsmFrames {
+    proj: GpuHead,
+    heads: Vec<GpuHead>,
+    audio_embd: DeviceBuf, // backbone input rows (codebook, code), f16
+    proj_embd: DeviceBuf,  // decoder input rows, already through its input projection, f16
+    codes: DeviceBuf,      // the frame's codes (i32)
+    params: DeviceBuf,     // [top-k, 1 / temperature] (f32)
+    rng: DeviceBuf,        // [seed, draws so far] (u64)
+    vocab: usize,
+    codebooks: usize,
+}
+
+/// A captured frame, for one pair of sessions (it holds their addresses).
+pub struct CsmGraph(Ptr);
+
+impl Drop for CsmGraph {
+    fn drop(&mut self) {
+        if let Ok(a) = api() {
+            unsafe { (a.f.cuGraphExecDestroy)(self.0) };
+        }
+    }
+}
+
+/// One attention block of Whisper: LayerNorm, q (with bias), k (without), v (with), and the output projection.
+struct WhAttn {
+    norm: (DeviceBuf, DeviceBuf),
+    q: GpuMatrix,
+    qb: DeviceBuf,
+    k: GpuMatrix,
+    v: GpuMatrix,
+    vb: DeviceBuf,
+    o: GpuMatrix,
+    ob: DeviceBuf,
+}
+
+/// LayerNorm, then fc1, GELU, fc2 (each with a bias).
+struct WhMlp {
+    norm: (DeviceBuf, DeviceBuf),
+    fc1: GpuMatrix,
+    fc1b: DeviceBuf,
+    fc2: GpuMatrix,
+    fc2b: DeviceBuf,
+}
+
+/// Whisper speech-to-text on the GPU (whisper.rs). The encoder reads a clip's log-mel frames (two 3-tap
+/// convolutions, then pre-norm transformer layers over half as many positions); the decoder reads tokens a
+/// few at a time, attending to its own earlier ones and, through keys and values worked out once per clip, to
+/// the encoder's output. Matrices run through the engine's matmuls (a bare GpuModel and a session for their
+/// scratch); the rest is Whisper's own small kernels.
+pub struct GpuWhisper {
+    mm: GpuModel,
+    s: GpuSession,
+    dim: usize,
+    heads: usize,
+    ffn: usize,
+    n_mels: usize,
+    pub max_audio: usize, // encoder positions (1500: 30 s)
+    pub max_text: usize,  // decoder positions (448)
+    conv1: (GpuMatrix, DeviceBuf),
+    conv2: (GpuMatrix, DeviceBuf),
+    enc_pos: DeviceBuf,
+    enc: Vec<(WhAttn, WhMlp)>,
+    enc_norm: (DeviceBuf, DeviceBuf),
+    dec: Vec<(WhAttn, WhAttn, WhMlp)>,
+    dec_norm: (DeviceBuf, DeviceBuf),
+    embd: GpuMatrix,
+    // working buffers (rows of floats)
+    inp: DeviceBuf,  // mel frames, then decoder input rows
+    col: DeviceBuf,  // convolution rows
+    x: DeviceBuf,    // the residual stream
+    hn: DeviceBuf,   // normed rows
+    q: DeviceBuf,
+    k: DeviceBuf,
+    v: DeviceBuf,
+    att: DeviceBuf,
+    big: DeviceBuf,  // conv1's output, the MLP's hidden rows
+    cross: Vec<(DeviceBuf, DeviceBuf)>, // per decoder layer: the clip's keys and values
+    selfkv: Vec<(DeviceBuf, DeviceBuf)>, // per decoder layer: its tokens' keys and values
+    n_enc: usize,
+    pub pos: usize, // decoder tokens read
+}
+
+impl GpuWhisper {
+    pub fn load(g: &Gguf) -> Result<GpuWhisper, String> {
+        let u = |k: &str| g.get(&format!("whisper.{k}")).and_then(|v| v.as_u64()).map(|v| v as usize).ok_or_else(|| format!("missing whisper.{k}"));
+        let (dim, heads, ffn, n_mels, vocab) = (u("dim")?, u("heads")?, u("ffn")?, u("n_mels")?, u("vocab")?);
+        let (max_audio, max_text) = (u("audio_positions")?, u("text_positions")?);
+        if dim / heads != 64 {
+            return Err(format!("Whisper heads of {} values are not supported (64)", dim / heads));
+        }
+        let cfg = Config {
+            dim,
+            n_layers: 0,
+            n_heads: heads,
+            n_kv_heads: heads,
+            head_dim: 64,
+            ffn_dim: ffn.max(3 * dim),
+            vocab,
+            max_ctx: 32,
+            rope_dim: 64,
+            rope_base: 10_000.0,
+            rope_neox: false,
+            rope_freqs: None,
+            norm_eps: 1e-5,
+            n_experts: 0,
+            n_experts_used: 0,
+            expert_ffn_dim: 0,
+            mla: None,
+            n_dense_lead: 0,
+            n_shared_experts: 0,
+            gating_sigmoid: false,
+            expert_weights_norm: false,
+            expert_weights_scale: 1.0,
+            delta: None,
+            attn_gated: false,
+        };
+        // its own non-blocking stream: it runs beside the language model, on a thread of its own
+        let k = Arc::new(Kernels::compile_on(true)?);
+        let mut up = Uploader::new()?;
+        let up = &mut up;
+        let one = |name: &str, up: &mut Uploader| upload_one(g, name, up);
+        let vec = |name: &str, up: &mut Uploader| upload_vec(g, name, up);
+        let norm = |name: &str, up: &mut Uploader| -> Result<(DeviceBuf, DeviceBuf), String> { Ok((vec(&format!("{name}.weight"), up)?, vec(&format!("{name}.bias"), up)?)) };
+        let attn = |p: &str, up: &mut Uploader| -> Result<WhAttn, String> {
+            Ok(WhAttn {
+                norm: norm(&format!("{p}_norm"), up)?,
+                q: one(&format!("{p}_q.weight"), up)?,
+                qb: vec(&format!("{p}_q.bias"), up)?,
+                k: one(&format!("{p}_k.weight"), up)?,
+                v: one(&format!("{p}_v.weight"), up)?,
+                vb: vec(&format!("{p}_v.bias"), up)?,
+                o: one(&format!("{p}_o.weight"), up)?,
+                ob: vec(&format!("{p}_o.bias"), up)?,
+            })
+        };
+        let mlp = |p: &str, up: &mut Uploader| -> Result<WhMlp, String> {
+            Ok(WhMlp { norm: norm(&format!("{p}ffn_norm"), up)?, fc1: one(&format!("{p}fc1.weight"), up)?, fc1b: vec(&format!("{p}fc1.bias"), up)?, fc2: one(&format!("{p}fc2.weight"), up)?, fc2b: vec(&format!("{p}fc2.bias"), up)? })
+        };
+        let enc = (0..u("encoder_layers")?).map(|i| Ok((attn(&format!("enc.blk.{i}.attn"), up)?, mlp(&format!("enc.blk.{i}."), up)?))).collect::<Result<Vec<_>, String>>()?;
+        let dec = (0..u("decoder_layers")?)
+            .map(|i| Ok((attn(&format!("dec.blk.{i}.attn"), up)?, attn(&format!("dec.blk.{i}.cross"), up)?, mlp(&format!("dec.blk.{i}."), up)?)))
+            .collect::<Result<Vec<_>, String>>()?;
+        // the cross-attention norms are named cross_norm, the self-attention ones attn_norm: as `attn` reads them
+        let rows = 2 * max_audio; // mel frames
+        let f = |n: usize| DeviceBuf::alloc(4 * n);
+        let w = GpuWhisper {
+            conv1: (one("enc.conv1.weight", up)?, vec("enc.conv1.bias", up)?),
+            conv2: (one("enc.conv2.weight", up)?, vec("enc.conv2.bias", up)?),
+            enc_pos: vec("enc.pos", up)?,
+            enc_norm: norm("enc.norm", up)?,
+            dec_norm: norm("dec.norm", up)?,
+            embd: one("dec.embd", up)?,
+            inp: f(rows * n_mels.max(dim))?,
+            col: f(rows * 3 * n_mels.max(dim / 2).max(dim))?,
+            x: f(max_audio * dim)?,
+            hn: f(max_audio * dim)?,
+            q: f(max_audio * dim)?,
+            k: f(max_audio * dim)?,
+            v: f(max_audio * dim)?,
+            att: f(max_audio * dim)?,
+            big: f((rows * dim).max(max_audio * ffn))?,
+            cross: (0..dec.len()).map(|_| Ok((f(max_audio * dim)?, f(max_audio * dim)?))).collect::<Result<_, String>>()?,
+            selfkv: (0..dec.len()).map(|_| Ok((f(max_text * dim)?, f(max_text * dim)?))).collect::<Result<_, String>>()?,
+            s: GpuSession::new(&cfg, 32)?,
+            mm: GpuModel {
+                cfg,
+                k,
+                embd: Embd::Vectors,
+                output: None,
+                output_norm: DeviceBuf::alloc(4)?,
+                rope_freqs: None,
+                layers: Vec::new(),
+                cache: Default::default(),
+                moe: None,
+                prefill_shared: None,
+                device: String::new(),
+                int8_q8: false,
+                iq_scratch: None,
+                _weights: None,
+            },
+            enc,
+            dec,
+            dim,
+            heads,
+            ffn,
+            n_mels,
+            max_audio,
+            max_text,
+            n_enc: 0,
+            pos: 0,
+        };
+        up.finish()?;
+        Ok(w)
+    }
+
+    /// `m` over `n` rows of `x` into rows of `out` (in chunks the matmul scratch holds).
+    fn mm(&self, m: &GpuMatrix, x: u64, out: u64, n: usize, accumulate: bool) -> Result<(), String> {
+        for c0 in (0..n).step_by(MAX_BATCH) {
+            let c = (n - c0).min(MAX_BATCH);
+            self.mm.matmul_one(m, x + (4 * c0 * m.cols) as u64, out + (4 * c0 * m.rows) as u64, c, accumulate, &self.s)?;
+        }
+        Ok(())
+    }
+
+    fn bias(&self, x: &DeviceBuf, b: &DeviceBuf, cols: usize, n: usize, gelu: bool) -> Result<(), String> {
+        let k = &self.mm.k;
+        k.launch(k.wh_bias, ((n * cols).div_ceil(256) as u32, 1), 256, 0, &[Arg::P(x.ptr), Arg::P(b.ptr), Arg::I(cols as i32), Arg::I(n as i32), Arg::I(gelu as i32)])
+    }
+
+    fn layernorm(&self, x: u64, (w, b): &(DeviceBuf, DeviceBuf), out: u64, n: usize) -> Result<(), String> {
+        let k = &self.mm.k;
+        k.launch(k.wh_layernorm, (n as u32, 1), 256, 0, &[Arg::P(x), Arg::P(w.ptr), Arg::P(b.ptr), Arg::P(out), Arg::I(self.dim as i32), Arg::F(1e-5)])
+    }
+
+    fn attention(&self, q: u64, keys: u64, values: u64, nq: usize, nk: usize, causal: i32) -> Result<(), String> {
+        let k = &self.mm.k;
+        let d = self.dim as i32;
+        k.launch(k.wh_attention, (nq as u32, self.heads as u32), 128, (4 * nk) as u32, &[Arg::P(q), Arg::P(keys), Arg::P(values), Arg::P(self.att.ptr), Arg::I(nk as i32), Arg::I(d), Arg::I(d), Arg::I(self.heads as i32), Arg::I(causal), Arg::F(0.125)])
+    }
+
+    /// x += the attention block on `n` rows; `kv`: the keys and values to read (None: from these rows) and how
+    /// many; `store`: where this block's own keys and values go (the decoder's cache, at row `at`).
+    fn attn_block(&self, a: &WhAttn, n: usize, kv: Option<(u64, u64, usize)>, store: Option<(u64, u64, usize)>, causal: i32) -> Result<(), String> {
+        let d = self.dim;
+        self.layernorm(self.x.ptr, &a.norm, self.hn.ptr, n)?;
+        self.mm(&a.q, self.hn.ptr, self.q.ptr, n, false)?;
+        self.bias(&self.q, &a.qb, d, n, false)?;
+        let (keys, values, nk) = match (kv, store) {
+            (Some(kv), _) => kv,
+            (None, Some((kc, vc, at))) => {
+                let (kr, vr) = (kc + (4 * at * d) as u64, vc + (4 * at * d) as u64);
+                self.mm(&a.k, self.hn.ptr, kr, n, false)?;
+                self.mm(&a.v, self.hn.ptr, vr, n, false)?;
+                let k = &self.mm.k;
+                k.launch(k.wh_bias, ((n * d).div_ceil(256) as u32, 1), 256, 0, &[Arg::P(vr), Arg::P(a.vb.ptr), Arg::I(d as i32), Arg::I(n as i32), Arg::I(0)])?;
+                (kc, vc, at + n)
+            }
+            (None, None) => {
+                self.mm(&a.k, self.hn.ptr, self.k.ptr, n, false)?;
+                self.mm(&a.v, self.hn.ptr, self.v.ptr, n, false)?;
+                self.bias(&self.v, &a.vb, d, n, false)?;
+                (self.k.ptr, self.v.ptr, n)
+            }
+        };
+        self.attention(self.q.ptr, keys, values, n, nk, causal)?;
+        self.mm(&a.o, self.att.ptr, self.x.ptr, n, true)?;
+        self.bias(&self.x, &a.ob, d, n, false)
+    }
+
+    fn mlp_block(&self, m: &WhMlp, n: usize) -> Result<(), String> {
+        self.layernorm(self.x.ptr, &m.norm, self.hn.ptr, n)?;
+        self.mm(&m.fc1, self.hn.ptr, self.big.ptr, n, false)?;
+        self.bias(&self.big, &m.fc1b, self.ffn, n, true)?;
+        self.mm(&m.fc2, self.big.ptr, self.x.ptr, n, true)?;
+        self.bias(&self.x, &m.fc2b, self.dim, n, false)
+    }
+
+    /// Encodes a clip: `mel` is rows of `n_mels` (frames, 100 a second; at most 2 * max_audio). Leaves the
+    /// cross-attention keys and values for the decoder, and starts it afresh.
+    pub fn encode(&mut self, mel: &[f32]) -> Result<(), String> {
+        let (d, k) = (self.dim, self.mm.k.clone());
+        let t = (mel.len() / self.n_mels).min(2 * self.max_audio);
+        let n = t.div_ceil(2);
+        if n == 0 {
+            return Err("no audio".into());
+        }
+        self.mm.k.h2d(self.inp.ptr, &mel[..t * self.n_mels])?;
+        let im2col = |x: u64, out: u64, nin: usize, nout: usize, c: usize, stride: usize| {
+            k.launch(k.wh_im2col, ((nout * 3 * c).div_ceil(256) as u32, 1), 256, 0, &[Arg::P(x), Arg::P(out), Arg::I(nin as i32), Arg::I(nout as i32), Arg::I(c as i32), Arg::I(stride as i32)])
+        };
+        im2col(self.inp.ptr, self.col.ptr, t, t, self.n_mels, 1)?;
+        self.mm(&self.conv1.0, self.col.ptr, self.big.ptr, t, false)?;
+        self.bias(&self.big, &self.conv1.1, d, t, true)?;
+        im2col(self.big.ptr, self.col.ptr, t, n, d, 2)?;
+        self.mm(&self.conv2.0, self.col.ptr, self.x.ptr, n, false)?;
+        self.bias(&self.x, &self.conv2.1, d, n, true)?;
+        k.launch(k.wh_add, ((n * d).div_ceil(256) as u32, 1), 256, 0, &[Arg::P(self.x.ptr), Arg::P(self.enc_pos.ptr), Arg::I((n * d) as i32)])?;
+        for (a, m) in &self.enc {
+            self.attn_block(a, n, None, None, -1)?;
+            self.mlp_block(m, n)?;
+        }
+        self.layernorm(self.x.ptr, &self.enc_norm, self.hn.ptr, n)?;
+        for ((_, cross, _), (kc, vc)) in self.dec.iter().zip(&self.cross) {
+            self.mm(&cross.k, self.hn.ptr, kc.ptr, n, false)?;
+            self.mm(&cross.v, self.hn.ptr, vc.ptr, n, false)?;
+            self.bias(vc, &cross.vb, d, n, false)?;
+        }
+        self.n_enc = n;
+        self.pos = 0;
+        Ok(())
+    }
+
+    /// Reads decoder input rows (token embedding + position, `dim` floats each) at positions `pos..`; returns the
+    /// last one's logits.
+    pub fn decode(&mut self, rows: &[f32], logits: &mut Vec<f32>) -> Result<(), String> {
+        let d = self.dim;
+        let n = rows.len() / d;
+        if self.pos + n > self.max_text {
+            return Err("the transcript is longer than Whisper's 448 tokens".into());
+        }
+        self.mm.k.h2d(self.x.ptr, rows)?;
+        for ((own, cross, m), ((kc, vc), (ck, cv))) in self.dec.iter().zip(self.selfkv.iter().zip(&self.cross)) {
+            self.attn_block(own, n, None, Some((kc.ptr, vc.ptr, self.pos)), self.pos as i32)?;
+            self.attn_block(cross, n, Some((ck.ptr, cv.ptr, self.n_enc)), None, -1)?;
+            self.mlp_block(m, n)?;
+        }
+        self.pos += n;
+        let last = self.x.ptr + (4 * (n - 1) * d) as u64;
+        self.layernorm(last, &self.dec_norm, self.hn.ptr, 1)?;
+        self.mm(&self.embd, self.hn.ptr, self.big.ptr, 1, false)?;
+        logits.resize(self.embd.rows, 0.0);
+        self.mm.k.d2h(logits, self.big.ptr)
+    }
+}
+
+/// Makes the GPU context current on this thread (a thread other than the one that loaded a model).
+pub fn bind_thread() -> Result<(), String> {
+    let a = api()?;
+    a.check(unsafe { (a.f.cuCtxSetCurrent)(a.ctx as Ptr) }, "bind the GPU context")
+}
+
+impl CsmFrames {
+    pub fn load(bg: &Gguf, dg: &Gguf, codebooks: usize, vocab: usize) -> Result<CsmFrames, String> {
+        let mut up = Uploader::new()?;
+        let f16 = |g: &Gguf, name: &str, up: &mut Uploader| -> Result<DeviceBuf, String> {
+            let t = g.tensor(name).ok_or_else(|| format!("missing tensor {name}"))?;
+            if t.ty != GgmlType::F16 {
+                return Err(format!("{name} is {}, not F16", t.ty.name()));
+            }
+            let buf = DeviceBuf::alloc(t.n_bytes)?;
+            up.put(buf.ptr, &g.mmap[t.offset..t.offset + t.n_bytes])?;
+            Ok(buf)
+        };
+        let frames = CsmFrames {
+            proj: GpuHead(upload_one(dg, "csm.proj.weight", &mut up)?),
+            heads: (1..codebooks).map(|i| upload_one(dg, &format!("csm.head.{i}.weight"), &mut up).map(GpuHead)).collect::<Result<_, _>>()?,
+            audio_embd: f16(bg, "csm.audio_embd.weight", &mut up)?,
+            proj_embd: f16(dg, "csm.proj_embd.weight", &mut up)?,
+            codes: DeviceBuf::alloc(4 * codebooks)?,
+            params: DeviceBuf::alloc(8)?,
+            rng: DeviceBuf::alloc(16)?,
+            vocab,
+            codebooks,
+        };
+        up.finish()?;
+        if frames.heads.iter().any(|h| h.0.rows != vocab) {
+            return Err("a codebook head does not have one row per code".into());
+        }
+        Ok(frames)
+    }
+
+    /// The decoder's input projection, as a head of the backbone.
+    pub fn proj(&self) -> &GpuHead {
+        &self.proj
+    }
+
+    /// The head of codebook `cb` (1 ..).
+    pub fn head(&self, cb: usize) -> &GpuHead {
+        &self.heads[cb - 1]
+    }
+
+    /// Sampling for the next frames: temperature (0: greedy), top-k, and a seed.
+    pub fn set_sampling(&self, backbone: &GpuModel, temperature: f32, top_k: usize, seed: u64) -> Result<(), String> {
+        backbone.k.h2d(self.params.ptr, &[top_k as f32, if temperature > 0.0 { 1.0 / temperature } else { 0.0 }])?;
+        backbone.k.h2d(self.rng.ptr, &[seed, 0u64])
+    }
+
+    /// The next frame's codes, after a backbone pass that left its logits on the GPU (forward_vectors with
+    /// logits); the backbone has run on the frame when this returns, ready for the one after.
+    pub fn step(&self, backbone: &GpuModel, decoder: &GpuModel, bb: &mut GpuSession, dec: &mut GpuSession, graph: &mut Option<CsmGraph>) -> Result<Vec<u32>, String> {
+        if !Arc::ptr_eq(&backbone.k, &decoder.k) {
+            return Err("CSM's two models must share their kernels".into());
+        }
+        if bb.pos >= bb.ctx {
+            return Err(format!("context full ({} frames)", bb.ctx));
+        }
+        let (a, k) = (api()?, &backbone.k);
+        k.h2d(bb.pos_dev.ptr, &[bb.pos as i32])?;
+        if graph.is_none() {
+            const RELAXED: i32 = 2; // CU_STREAM_CAPTURE_MODE_RELAXED
+            a.check(unsafe { (a.f.cuStreamBeginCapture_v2)(k.stream, RELAXED) }, "begin graph capture")?;
+            let launched = self.launches(backbone, decoder, bb, dec);
+            let mut g: Ptr = std::ptr::null_mut();
+            let ended = unsafe { (a.f.cuStreamEndCapture)(k.stream, &mut g) };
+            dec.pos = 0;
+            launched?;
+            a.check(ended, "end graph capture")?;
+            let mut exec: Ptr = std::ptr::null_mut();
+            let made = unsafe { (a.f.cuGraphInstantiateWithFlags)(&mut exec, g, 0) };
+            unsafe { (a.f.cuGraphDestroy)(g) };
+            a.check(made, "instantiate graph")?;
+            *graph = Some(CsmGraph(exec));
+        }
+        a.check(unsafe { (a.f.cuGraphLaunch)(graph.as_ref().unwrap().0, k.stream) }, "graph launch")?;
+        let mut codes = vec![0i32; self.codebooks];
+        k.d2h(&mut codes, self.codes.ptr)?;
+        bb.pos += 1;
+        Ok(codes.into_iter().map(|c| c as u32).collect())
+    }
+
+    /// The frame's kernels (see the type); the decoder's positions (0 ..) are the same every frame, so they go
+    /// into the graph as they are, while the backbone reads its position from `bb.pos_dev`.
+    fn launches(&self, backbone: &GpuModel, decoder: &GpuModel, bb: &mut GpuSession, dec: &mut GpuSession) -> Result<(), String> {
+        let k = &backbone.k;
+        let (v, dd, cb) = (self.vocab, decoder.cfg.dim, self.codebooks);
+        let sample = |logits: u64, slot: usize| {
+            k.launch(k.csm_sample, (1, 1), 1024, 0, &[Arg::P(logits), Arg::I(v as i32), Arg::P(self.params.ptr), Arg::P(self.rng.ptr), Arg::P(self.codes.ptr), Arg::I(slot as i32)])
+        };
+        let embed = |table: &DeviceBuf, cols: usize, first: usize, m: usize, out: u64| {
+            k.launch(k.csm_embed, (cols.div_ceil(256) as u32, 1), 256, 0, &[Arg::P(table.ptr), Arg::I(cols as i32), Arg::P(self.codes.ptr), Arg::I(first as i32), Arg::I(m as i32), Arg::I(v as i32), Arg::P(out)])
+        };
+        bb.exact.set(false);
+        dec.exact.set(false);
+        sample(bb.logits_dev.ptr, 0)?;
+        backbone.matmul_one(&self.proj.0, bb.xb.ptr, dec.x.ptr, 1, false, bb)?;
+        embed(&self.proj_embd, dd, 0, 1, dec.x.at(dd * 4))?;
+        dec.pos = 0;
+        decoder.launches(2, dec, Out::Hidden, 0, false)?;
+        dec.pos = 2;
+        for i in 1..cb {
+            decoder.matmul_one(&self.heads[i - 1].0, dec.xb.ptr, dec.logits_dev.ptr, 1, false, dec)?;
+            sample(dec.logits_dev.ptr, i)?;
+            if i + 1 < cb {
+                embed(&self.proj_embd, dd, i, 1, dec.x.ptr)?;
+                decoder.launches(1, dec, Out::Hidden, 0, false)?;
+                dec.pos += 1;
+            }
+        }
+        // the frame as the backbone's next input, and its pass
+        embed(&self.audio_embd, backbone.cfg.dim, 0, cb, bb.x.ptr)?;
+        backbone.launches(1, bb, Out::Last, bb.pos_dev.ptr, true)
+    }
 }
 
 pub struct GpuModel {
     pub cfg: Config,
     k: Arc<Kernels>,
     embd: Embd,
-    output: Option<GpuMatrix>, // None = tied to the embedding (then on the GPU)
+    output: Option<GpuMatrix>, // None = tied to the embedding (then on the GPU), or none (Embd::Vectors)
     output_norm: DeviceBuf,
+    rope_freqs: Option<DeviceBuf>,
     layers: Vec<GpuLayer>,
     /// the GPU-resident experts, made on the first forward pass from the memory left then (before `moe`:
     /// its upload thread reads the mapping, so it stops first)
@@ -5217,10 +6015,18 @@ pub struct GpuModel {
     pub int8_q8: bool,
     /// 2-bit weights (Fmt::Iq2) as Q8 for prompt batches: int8 values, f32 scales
     iq_scratch: Option<(DeviceBuf, DeviceBuf)>,
+    /// the weights' memory (dropped after the buffers pointing into it, which free nothing)
+    _weights: Option<Arena>,
 }
 
 impl GpuModel {
     pub fn load(g: &Gguf, cfg: Config) -> Result<GpuModel, String> {
+        Self::load_with(g, cfg, false)
+    }
+
+    /// load, with private: its kernels on a non-blocking stream of their own (see Kernels::private), for a
+    /// model that runs on another thread beside the language model.
+    pub fn load_with(g: &Gguf, cfg: Config, private: bool) -> Result<GpuModel, String> {
         if let Some(m) = cfg.mla {
             if m.kv_lora != 512 || cfg.n_heads > 32 || (m.kv_lora + cfg.rope_dim) % 32 != 0 || m.kv_lora + cfg.rope_dim > 32 * 24 {
                 return Err(format!("GPU backend: latent attention with {} heads and a {}-wide cache row is not supported (512 + RoPE, up to 32 heads)", cfg.n_heads, m.kv_lora + cfg.rope_dim));
@@ -5239,9 +6045,10 @@ impl GpuModel {
         let t0 = std::time::Instant::now();
         let a = api()?;
         let t_api = t0.elapsed();
-        let k = Arc::new(Kernels::compile()?);
+        let k = Arc::new(Kernels::compile_on(private)?);
         let t_kernels = t0.elapsed();
         let mut up = Uploader::new()?;
+        up.arena = Arena::new().ok();
         let up = &mut up;
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
@@ -5302,17 +6109,35 @@ impl GpuModel {
         }
         let moe = if cfg.is_moe() { Some(CpuMoe::load(g, &cfg)?) } else { None };
         let output = if g.tensor("output.weight").is_some() { Some(upload_one(g, "output.weight", up)?) } else { None };
+        // in RAM, a row read per token: a mixture of experts' (its GPU memory goes to the expert cache), a model
+        // whose loader asks (ghost.embd_on_host, as maya1.rs does: it only ever reads its prompt's rows), or a
+        // big table (Mistral Nemo's 131k rows are 360 MB at Q4_K: on an 8 GB card, 2300 more tokens of context)
+        let big = g.tensor("token_embd.weight").is_some_and(|t| t.n_bytes >= 256 << 20);
+        let host = cfg.is_moe() || big || matches!(g.get("ghost.embd_on_host"), Some(crate::gguf::Value::Bool(true)));
         let embd = match g.tensor("token_embd.weight") {
-            Some(t) if cfg.is_moe() && output.is_some() && t.dims.len() == 2 && t.ty.block().is_some() => {
+            Some(t) if host && output.is_some() && t.dims.len() == 2 && t.ty.block().is_some() => {
                 let file = std::fs::File::open(&g.path).map_err(|e| format!("cannot open {}: {e}", g.path.display()))?;
                 let map = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| format!("cannot map {}: {e}", g.path.display()))?;
                 Embd::Host { map, offset: t.offset, bytes: t.n_bytes, ty: t.ty, rows: t.dims[1] as usize, cols: t.dims[0] as usize }
             }
-            _ => Embd::Gpu(upload_parts_as(g, &["token_embd.weight".to_string()], up, false)?.pop().unwrap().0),
+            Some(_) => Embd::Gpu(upload_parts_as(g, &["token_embd.weight".to_string()], up, false)?.pop().unwrap().0),
+            None => Embd::Vectors,
         };
-        // the conversion scratch of 2-bit weights: the most any one matmul converts
-        let iq2 = |parts: &[(GpuMatrix, usize)]| parts.iter().filter(|(m, _)| m.fmt == Fmt::Iq2).map(|(m, _)| m.rows * m.cols).sum::<usize>();
-        let one = |m: &GpuMatrix| if m.fmt == Fmt::Iq2 { m.rows * m.cols } else { 0 };
+        let rope_freqs = match &cfg.rope_freqs {
+            Some(f) => Some(up.put_vec(f)?),
+            None => None,
+        };
+        // the conversion scratch of 2-bit weights (the most any one matmul converts) and of 3-bit ones (a matrix,
+        // Q3K_CONV values at most)
+        let one = |m: &GpuMatrix| match m.fmt {
+            Fmt::Iq2 => m.rows * m.cols,
+            Fmt::Q3K => (m.rows * m.cols).min(Q3K_CONV),
+            _ => 0,
+        };
+        let iq2 = |parts: &[(GpuMatrix, usize)]| {
+            let all = parts.iter().filter(|(m, _)| m.fmt == Fmt::Iq2).map(|(m, _)| m.rows * m.cols).sum::<usize>();
+            parts.iter().map(|(m, _)| one(m)).fold(all, usize::max)
+        };
         let most = layers
             .iter()
             .map(|l| {
@@ -5344,16 +6169,17 @@ impl GpuModel {
         let device = format!("{} (sm_{}{}, NVRTC {})", a.device_name, a.compute.0, a.compute.1, std::path::Path::new(&a.nvrtc_path).file_name().and_then(|n| n.to_str()).unwrap_or("?"));
         // the logits buffer is sized from cfg.vocab; a mismatch would write past it
         let out_rows = match (&output, &embd) {
-            (Some(o), _) => o.rows,
-            (None, Embd::Gpu(e)) => e.rows,
+            (Some(o), _) => Some(o.rows),
+            (None, Embd::Gpu(e)) => Some(e.rows),
             (None, Embd::Host { .. }) => unreachable!("a tied output keeps the embedding on the GPU"),
+            (None, Embd::Vectors) => None, // hidden states only
         };
-        if out_rows != cfg.vocab {
-            return Err(format!("output layer has {out_rows} rows but the vocabulary has {} tokens", cfg.vocab));
+        if let Some(rows) = out_rows.filter(|&r| r != cfg.vocab) {
+            return Err(format!("output layer has {rows} rows but the vocabulary has {} tokens", cfg.vocab));
         }
         let output_norm = upload_vec(g, "output_norm.weight", up)?;
         up.finish()?;
-        let model = GpuModel { output_norm, cfg, k, embd, output, layers, moe, cache: Default::default(), prefill_shared, device, int8_q8: false, iq_scratch };
+        let model = GpuModel { output_norm, rope_freqs, cfg, k, embd, output, layers, moe, cache: Default::default(), prefill_shared, device, int8_q8: false, iq_scratch, _weights: up.arena.take() };
         if std::env::var_os("GHOST_INFER_LOAD_TIMES").is_some() {
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
             eprintln!(
@@ -5372,6 +6198,7 @@ impl GpuModel {
             (Some(o), _) => o,
             (None, Embd::Gpu(e)) => e,
             (None, Embd::Host { .. }) => unreachable!("a tied output keeps the embedding on the GPU"),
+            (None, Embd::Vectors) => unreachable!("a model without an output gives hidden states only"),
         }
     }
 
@@ -5405,6 +6232,27 @@ impl GpuModel {
             let mut vs = views.iter();
             let conv: Vec<(&GpuMatrix, usize)> = parts.iter().map(|&(m, off)| if m.fmt == Fmt::Iq2 { (&**vs.next().unwrap(), off) } else { (m, off) }).collect();
             return self.matmul(&conv, x, out, out_stride, n, accumulate, s);
+        }
+        // 3-bit weights likewise, a slice of rows at a time through the scratch (a 12B's [gate | up] whole would be
+        // 150 MB); the launches queue in order, so a slice is converted only after the last one's matmul read it
+        if parts.iter().any(|(m, _)| m.fmt == Fmt::Q3K) && !self.dp4a_path(parts, n, s) {
+            let (sq, sd) = self.iq_scratch.as_ref().ok_or("no scratch for 3-bit weights")?;
+            for &(m, off) in parts {
+                if m.fmt != Fmt::Q3K {
+                    self.matmul(&[(m, off)], x, out, out_stride, n, accumulate, s)?;
+                    continue;
+                }
+                let slice = (sq.bytes / m.cols / TILE * TILE).max(TILE);
+                for r0 in (0..m.rows).step_by(slice) {
+                    let rows = slice.min(m.rows - r0);
+                    let blocks = rows * m.cols / 32;
+                    let w = m.q.ptr + (r0 * (m.cols / 256) * Q3K_GPU_BYTES) as u64;
+                    k.launch(k.q3k_to_q8, (blocks.div_ceil(8) as u32, 1), 256, 0, &[Arg::P(w), Arg::P(sq.ptr), Arg::P(sd.ptr), Arg::I(blocks as i32)])?;
+                    let v = GpuMatrix::view(Fmt::Q8, sq.ptr, Some(sd.ptr), rows, m.cols);
+                    self.matmul(&[(&*v, off + r0)], x, out, out_stride, n, accumulate, s)?;
+                }
+            }
+            return Ok(());
         }
         if n >= TILED_MIN_BATCH && !self.dp4a_path(parts, n, s) {
             if let Some(mk) = k.matmul_mma_k.filter(|_| parts.iter().all(|(m, _)| m.fmt != Fmt::Q8)) {
@@ -5456,7 +6304,7 @@ impl GpuModel {
                 Fmt::Q8 => k.launch(k.matmul_q8, (m.rows.div_ceil(8) as u32, n.div_ceil(MATMUL_TB) as u32), 256, 0, &[&[Arg::P(m.q.ptr), Arg::P(m.d_ptr())][..], &tail].concat())?,
                 Fmt::Q4K => k.launch(k.matmul_q4k[variant], kq_grid, 256, 0, &[&[Arg::P(m.q.ptr), Arg::P(0)][..], &tail].concat())?,
                 Fmt::Q6K => k.launch(k.matmul_q6k[variant], kq_grid, 256, 0, &[&[Arg::P(m.q.ptr), Arg::P(m.d_ptr())][..], &tail].concat())?,
-                Fmt::Iq2 => return Err("2-bit weights reached the f32 matmul unconverted".into()),
+                Fmt::Iq2 | Fmt::Q3K => return Err("2- or 3-bit weights reached the f32 matmul unconverted".into()),
             }
         }
         Ok(())
@@ -5489,7 +6337,7 @@ impl GpuModel {
                 )?;
                 continue;
             }
-            if let Some(vfy) = k.matmul_vfy.filter(|_| m.fmt != Fmt::Q8 && n >= vfy_min() && (s.exact.get() || n > DECODE_MAX_BATCH)) {
+            if let Some(vfy) = k.matmul_vfy.filter(|_| !matches!(m.fmt, Fmt::Q8 | Fmt::Q3K) && n >= vfy_min() && (s.exact.get() || n > DECODE_MAX_BATCH)) {
                 // 32 tokens per launch at most (the kernels' tiles and shared memory)
                 let nb = m.cols / 32;
                 for t0 in (0..n).step_by(32) {
@@ -5512,8 +6360,9 @@ impl GpuModel {
                 continue;
             }
             let rpw = if m.fmt == Fmt::Q8 { 1 } else if n > 1 { batch_rpw() } else { kq_rpw() };
+            let func = if m.fmt == Fmt::Q3K { k.matmul_q3k_dp4a[(n > 1) as usize] } else { k.matmul_dp4a[m.fmt as usize][(n > 1) as usize] };
             k.launch(
-                k.matmul_dp4a[m.fmt as usize][(n > 1) as usize],
+                func,
                 (m.rows.div_ceil(8 * rpw) as u32, 1),
                 256,
                 0,
@@ -5707,7 +6556,7 @@ impl GpuModel {
 
     /// Runs `tokens` at positions `s.pos..`; copies next-token logits into `s.logits` if asked.
     pub fn forward_batch(&self, tokens: &[u32], s: &mut GpuSession, want_logits: bool) -> Result<(), String> {
-        self.forward(tokens, s, if want_logits { Out::Last } else { Out::None }).map(|_| ())
+        self.forward(Input::Tokens(tokens), s, if want_logits { Out::Last } else { Out::None }).map(|_| ())
     }
 
     /// Runs up to `verify_max()` `tokens` and returns the greedy next token after each of them (argmax on
@@ -5717,7 +6566,7 @@ impl GpuModel {
         if tokens.len() > self.verify_max() {
             return Err(format!("argmax batch of {} exceeds {}", tokens.len(), self.verify_max()));
         }
-        self.forward(tokens, s, Out::Argmax)
+        self.forward(Input::Tokens(tokens), s, Out::Argmax)
     }
 
     /// Runs up to `verify_max()` `tokens` and copies the next-token logits after each of them into
@@ -5727,11 +6576,58 @@ impl GpuModel {
         if tokens.len() > self.verify_max() {
             return Err(format!("logits batch of {} exceeds {}", tokens.len(), self.verify_max()));
         }
-        self.forward(tokens, s, Out::All).map(|_| ())
+        self.forward(Input::Tokens(tokens), s, Out::All).map(|_| ())
     }
 
-    fn forward(&self, tokens: &[u32], s: &mut GpuSession, want: Out) -> Result<Vec<u32>, String> {
-        let n = tokens.len();
+    /// Runs rows of `dim` floats (a model without an embedding table: CSM's transformers) at positions
+    /// `s.pos..`. With `logits`, the last row's go to `s.logits`; either way its final-normed hidden state is
+    /// kept for `hidden` and `head_logits`.
+    pub fn forward_vectors(&self, xs: &[f32], s: &mut GpuSession, logits: bool) -> Result<(), String> {
+        if !matches!(self.embd, Embd::Vectors) {
+            return Err("this model reads tokens, not vectors".into());
+        }
+        if logits && self.output.is_none() {
+            return Err("this model has no output layer (hidden states only)".into());
+        }
+        self.forward(Input::Vectors(xs), s, if logits { Out::Last } else { Out::Hidden }).map(|_| ())
+    }
+
+    /// The last pass's last row after the final norm (`dim` floats).
+    pub fn hidden(&self, s: &GpuSession, out: &mut [f32]) -> Result<(), String> {
+        let n = out.len().min(self.cfg.dim);
+        self.k.d2h(&mut out[..n], s.xb.ptr)
+    }
+
+    /// `head` applied to the last pass's final-normed hidden state, into `s.logits[..head.rows()]`.
+    pub fn head_logits(&self, head: &GpuHead, s: &mut GpuSession) -> Result<(), String> {
+        let rows = head.0.rows;
+        if rows > s.logits.len() || head.0.cols != self.cfg.dim {
+            return Err(format!("a head of {rows} x {} does not fit this model", head.0.cols));
+        }
+        self.matmul_one(&head.0, s.xb.ptr, s.logits_dev.ptr, 1, false, s)?;
+        self.k.d2h(&mut s.logits[..rows], s.logits_dev.ptr)
+    }
+
+    /// Runs this model on `other`'s kernels and stream (the same code: the compile options are global), so one
+    /// CUDA graph can hold both models' passes (CsmFrames).
+    pub fn share_kernels(&mut self, other: &GpuModel) -> Result<(), String> {
+        // prompt attention's shared memory is a per-kernel limit: the larger of the two models' needs
+        if let Some(bytes) = self.prefill_shared.filter(|&b| b > 48 * 1024 && other.prefill_shared.is_none_or(|o| b > o)) {
+            let a = api()?;
+            const MAX_DYNAMIC_SHARED: i32 = 8;
+            if unsafe { (a.f.cuFuncSetAttribute)(other.k.attention_prefill, MAX_DYNAMIC_SHARED, bytes as i32) } != 0 {
+                self.prefill_shared = None;
+            }
+        }
+        self.k = other.k.clone();
+        Ok(())
+    }
+
+    fn forward(&self, input: Input, s: &mut GpuSession, want: Out) -> Result<Vec<u32>, String> {
+        let n = match input {
+            Input::Tokens(t) => t.len(),
+            Input::Vectors(xs) => xs.len() / self.cfg.dim,
+        };
         if n == 0 {
             return Ok(Vec::new());
         }
@@ -5746,8 +6642,21 @@ impl GpuModel {
         }
         let k = &self.k;
         let a = api()?;
-        let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-        s.tokens.write(&ids)?;
+        let tokens = match input {
+            Input::Tokens(t) if matches!(self.embd, Embd::Vectors) => return Err(format!("this model reads vectors, not tokens ({} given)", t.len())),
+            Input::Tokens(t) => t,
+            Input::Vectors(xs) => {
+                if xs.len() != n * self.cfg.dim {
+                    return Err(format!("{} floats are not rows of {}", xs.len(), self.cfg.dim));
+                }
+                self.k.h2d(s.x.ptr, xs)?; // ordered before the pass's kernels
+                &[]
+            }
+        };
+        if !tokens.is_empty() {
+            let ids: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+            self.k.h2d(s.tokens.ptr, &ids)?;
+        }
         if let Embd::Host { map, offset, bytes, ty, rows, cols } = &self.embd {
             if let Some(&bad) = tokens.iter().find(|&&t| t as usize >= *rows) {
                 return Err(format!("token id {bad} out of range"));
@@ -5757,7 +6666,7 @@ impl GpuModel {
             for (&t, row) in tokens.iter().zip(xs.chunks_exact_mut(*cols)) {
                 m.row_f32(t as usize, row);
             }
-            s.x.write(&xs)?; // a blocking copy: ordered before the pass's kernels
+            self.k.h2d(s.x.ptr, &xs)?; // ordered before the pass's kernels
         }
         // checking a draft: every token as a one-token step would compute it
         s.exact.set(matches!(want, Out::Argmax | Out::All));
@@ -5765,8 +6674,12 @@ impl GpuModel {
         // plain launches); the kernels then read the position from s.pos_dev
         // (not for a mixture of experts: its experts run on the CPU between the kernels)
         if n == 1 && want != Out::None && graphs_enabled() && !self.cfg.is_moe() {
-            s.pos_dev.write(&[s.pos as i32])?;
-            let slot = (want == Out::Argmax) as usize;
+            self.k.h2d(s.pos_dev.ptr, &[s.pos as i32])?;
+            let slot = match want {
+                Out::Argmax => 1,
+                Out::Hidden => 2,
+                _ => 0,
+            };
             if s.graphs[slot].is_null() {
                 const RELAXED: i32 = 2; // CU_STREAM_CAPTURE_MODE_RELAXED
                 a.check(unsafe { (a.f.cuStreamBeginCapture_v2)(k.stream, RELAXED) }, "begin graph capture")?;
@@ -5787,13 +6700,13 @@ impl GpuModel {
         }
         let mut picks = Vec::new();
         if want == Out::Last {
-            a.check(unsafe { (a.f.cuMemcpyDtoH_v2)(s.logits.as_mut_ptr() as *mut c_void, s.logits_dev.ptr, s.logits.len() * 4) }, "copy logits")?;
+            self.k.d2h(&mut s.logits, s.logits_dev.ptr)?;
         } else if want == Out::All {
             s.rows.resize(n * s.logits.len(), 0.0);
-            a.check(unsafe { (a.f.cuMemcpyDtoH_v2)(s.rows.as_mut_ptr() as *mut c_void, s.logits_dev.ptr, s.rows.len() * 4) }, "copy logits")?;
+            self.k.d2h(&mut s.rows, s.logits_dev.ptr)?;
         } else if want == Out::Argmax {
             let mut ids = vec![0i32; n];
-            a.check(unsafe { (a.f.cuMemcpyDtoH_v2)(ids.as_mut_ptr() as *mut c_void, s.picks.ptr, n * 4) }, "copy argmax")?;
+            self.k.d2h(&mut ids, s.picks.ptr)?;
             picks = ids.into_iter().map(|i| i as u32).collect();
         }
         s.pos += n;
@@ -6257,7 +7170,7 @@ impl GpuModel {
                     (n as u32, (c.n_heads + 2 * c.n_kv_heads) as u32),
                     64,
                     0,
-                    &[Arg::P(s.qkv.ptr), Arg::P(qn), Arg::P(kn), Arg::P(kc), Arg::P(vc), Arg::P(ks), Arg::P(vs), Arg::I(s.pos as i32), Arg::P(posp), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::I(hd as i32), Arg::I(c.rope_dim as i32), Arg::F(c.rope_base), Arg::I(c.rope_neox as i32), Arg::F(c.norm_eps)],
+                    &[Arg::P(s.qkv.ptr), Arg::P(qn), Arg::P(kn), Arg::P(kc), Arg::P(vc), Arg::P(ks), Arg::P(vs), Arg::I(s.pos as i32), Arg::P(posp), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::I(hd as i32), Arg::I(c.rope_dim as i32), Arg::F(c.rope_base), Arg::P(self.rope_freqs.as_ref().map_or(0, |b| b.ptr)), Arg::I(c.rope_neox as i32), Arg::F(c.norm_eps)],
                 )
             })?;
             if hd > ATT_MAX_HD {
@@ -6285,10 +7198,14 @@ impl GpuModel {
 
         if want != Out::None {
             self.timed(7, || {
-                // Last: the last token's logits; All: every token's; Argmax: every token's, reduced on the GPU
-                let rows = if want == Out::Last { 1 } else { n };
+                // Last: the last token's logits; All: every token's; Argmax: every token's, reduced on the GPU;
+                // Hidden: the last token's normed state only (left in s.xb)
+                let rows = if matches!(want, Out::Last | Out::Hidden) { 1 } else { n };
                 let first = s.x.at((n - rows) * dim * 4);
                 k.launch(k.rmsnorm, (rows as u32, 1), 256, 0, &[Arg::P(first), Arg::P(self.output_norm.ptr), Arg::P(s.xb.ptr), Arg::I(dim as i32), Arg::F(c.norm_eps)])?;
+                if want == Out::Hidden {
+                    return Ok(());
+                }
                 self.matmul_one(self.output_matrix(), s.xb.ptr, s.logits_dev.ptr, rows, false, s)?;
                 if want == Out::Argmax {
                     k.launch(k.argmax_rows, (rows as u32, 1), 1024, 0, &[Arg::P(s.logits_dev.ptr), Arg::I(c.vocab as i32), Arg::P(s.picks.ptr)])?;
@@ -6310,6 +7227,15 @@ enum Out {
     Argmax,
     /// every token's logits, copied to `GpuSession::rows`
     All,
+    /// the last token's final-normed state, left on the GPU (GpuModel::hidden, head_logits)
+    Hidden,
+}
+
+/// What a forward pass reads: token ids, or rows of `dim` floats (Embd::Vectors).
+#[derive(Clone, Copy)]
+enum Input<'a> {
+    Tokens(&'a [u32]),
+    Vectors(&'a [f32]),
 }
 
 pub struct GpuSession {
@@ -6337,7 +7263,7 @@ pub struct GpuSession {
     pos_dev: DeviceBuf,    // the position, for CUDA graphs
     moe: std::cell::RefCell<MoeHost>, // host scratch of the CPU expert path
     moe_tab: DeviceBuf,               // a token's GPU-resident experts: matrix addresses, then weights
-    graphs: [Ptr; 2],      // captured one-token steps: Last, Argmax
+    graphs: [Ptr; 3],      // captured one-token steps: Last, Argmax, Hidden
     att_scr: DeviceBuf,    // the tiled verify attention's scores and weights (vfy_attention_fits models)
     exact: std::cell::Cell<bool>, // this pass checks a draft: verify kernels, no prompt kernels
     /// Gated DeltaNet layers: every layer's convolution state, then every layer's recurrent state (f32); and
@@ -6391,7 +7317,7 @@ impl GpuModel {
         let sized = fixed_expert_cache().is_none();
         if let (Some(cache), Some(moe), true) = (cache.as_mut(), self.moe.as_ref(), sized) {
             let more = GpuSession::bytes(c, cap).saturating_sub(GpuSession::bytes(c, s.cap));
-            let short = (more + GpuSession::resize_peak(c, cap) + FIT_RESERVE).saturating_sub(free_memory()?);
+            let short = (more + GpuSession::resize_peak(c, cap) + reserve()).saturating_sub(free_memory()?);
             if short > 0 {
                 cache.free_blocks(moe, short);
             }
@@ -6399,7 +7325,7 @@ impl GpuModel {
         let from = s.cap;
         s.resize(c, cap)?;
         if let (Some(cache), true) = (cache.as_mut(), sized) {
-            cache.add_blocks(free_memory()?.saturating_sub(FIT_RESERVE));
+            cache.add_blocks(free_memory()?.saturating_sub(reserve()));
         }
         let slots = cache.as_ref().map_or(String::new(), |c| format!(", expert cache {} slots", c.slots()));
         eprintln!("[context memory {from} -> {cap} tokens{slots}]");
@@ -6495,7 +7421,7 @@ impl GpuSession {
             pos_dev: pos_dev?,
             moe: Default::default(),
             moe_tab: DeviceBuf::alloc(4096)?,
-            graphs: [std::ptr::null_mut(); 2],
+            graphs: [std::ptr::null_mut(); 3],
             att_scr: att_scr?,
             exact: Default::default(),
             logits: vec![0.0; cfg.vocab],
@@ -6676,12 +7602,26 @@ impl GpuSession {
 /// the driver quietly moves memory to the much slower system RAM.
 const FIT_RESERVE: usize = 384 << 20;
 
+/// More kept free beside FIT_RESERVE (set while the voice is loaded: a call's app window, a browser or a screen
+/// recorder opened meanwhile must fit without pushing the call's memory out to system RAM, where its speech
+/// ran about seven times slower and stuttered).
+static EXTRA_RESERVE: AtomicUsize = AtomicUsize::new(0);
+
+pub fn set_extra_reserve(bytes: usize) {
+    EXTRA_RESERVE.store(bytes, Ordering::Relaxed);
+}
+
+/// The GPU memory kept free: FIT_RESERVE and any extra.
+fn reserve() -> usize {
+    FIT_RESERVE + EXTRA_RESERVE.load(Ordering::Relaxed)
+}
+
 /// GPU memory for the expert cache: what is free when it is made (after the weights and the session),
-/// less FIT_RESERVE. GHOST_INFER_EXPERT_CACHE_MB sets it instead (0: every expert on the CPU).
+/// less the reserve. GHOST_INFER_EXPERT_CACHE_MB sets it instead (0: every expert on the CPU).
 fn expert_cache_budget() -> Result<usize, String> {
     match fixed_expert_cache() {
         Some(bytes) => Ok(bytes),
-        None => Ok(free_memory()?.saturating_sub(FIT_RESERVE)),
+        None => Ok(free_memory()?.saturating_sub(reserve())),
     }
 }
 
@@ -6695,6 +7635,20 @@ fn free_memory() -> Result<usize, String> {
     let (mut free, mut _total) = (0usize, 0usize);
     a.check(unsafe { (a.f.cuMemGetInfo_v2)(&mut free, &mut _total) }, "memory info")?;
     Ok(free)
+}
+
+/// For deciding what fits before loading it: the GPU memory free now, what stays free beside the models, and
+/// what a session of `ctx` positions takes.
+pub fn gpu_free() -> Result<usize, String> {
+    free_memory()
+}
+
+pub fn kept_free() -> usize {
+    reserve()
+}
+
+pub fn session_bytes(cfg: &Config, ctx: usize) -> usize {
+    GpuSession::bytes(cfg, ctx)
 }
 
 /// Experts' slots per block of GPU memory (the expert cache grows and shrinks a block at a time).
@@ -6725,7 +7679,7 @@ const CTX_STEP: usize = 4096;
 
 /// Sessions that grow with the conversation: a mixture of experts' (on the GPU, its expert cache wants every
 /// byte), unless GHOST_INFER_FULL_CTX is set.
-fn session_grows(cfg: &Config) -> bool {
+pub fn session_grows(cfg: &Config) -> bool {
     static FULL: OnceLock<bool> = OnceLock::new();
     cfg.is_moe() && !*FULL.get_or_init(|| std::env::var_os("GHOST_INFER_FULL_CTX").is_some())
 }
@@ -6791,12 +7745,28 @@ pub fn fit_ctx(cfgs: &[&Config]) -> Result<usize, String> {
     let a = api()?;
     let (mut free, mut _total) = (0usize, 0usize);
     a.check(unsafe { (a.f.cuMemGetInfo_v2)(&mut free, &mut _total) }, "memory info")?;
-    let need = |ctx: usize| cfgs.iter().map(|c| GpuSession::bytes(c, ctx)).sum::<usize>() + FIT_RESERVE;
+    let need = |ctx: usize| cfgs.iter().map(|c| GpuSession::bytes(c, ctx)).sum::<usize>() + reserve();
     let limit = cfgs.iter().map(|c| c.max_ctx).min().unwrap_or(2048);
-    let mut ctx = 1024.min(limit);
-    while ctx + 1024 <= limit && need(ctx + 1024) <= free {
-        ctx += 1024;
-    }    if need(ctx) > free {
+    let longest = || {
+        let mut ctx = 1024.min(limit);
+        while ctx + 1024 <= limit && need(ctx + 1024) <= free {
+            ctx += 1024;
+        }
+        ctx
+    };
+    let mut ctx = longest();
+    // a big model on a small card (Mistral Nemo 12B on 8 GB: 1024 positions): prompt batches of 1024 tokens keep
+    // about 280 MB of activations, worth 3000 positions of int8 cache; smaller batches read the prompt a little slower
+    let batch = || cfgs.iter().map(|c| max_batch(c)).max().unwrap_or(MAX_BATCH);
+    // (not a mixture of experts: each prompt pass streams its experts, so more passes cost far more)
+    while ctx < FIT_SHORT_CTX.min(limit) && batch() > MIN_FIT_BATCH && !cfgs.iter().any(|c| c.is_moe()) {
+        BATCH_CAP.store(batch() / 2, Ordering::Relaxed);
+        ctx = longest();
+    }
+    if BATCH_CAP.load(Ordering::Relaxed) != 0 {
+        eprintln!("[note: prompts run {} tokens at a time to leave room for a {ctx}-token context]", batch());
+    }
+    if need(ctx) > free {
         eprintln!("[note: only {} MB of GPU memory is free; a {ctx}-token context will partly live in system RAM and run slowly]", free >> 20);
     }
     Ok(ctx)

@@ -94,6 +94,12 @@ fn local(ms: f64) -> Local {
     Local { day, minute: (t.rem_euclid(86_400_000) / 60_000) as u32, weekday: (day + 4).rem_euclid(7) as usize }
 }
 
+/// A moment as local time: its day (days since 1970), minute of the day and weekday (0 Sunday).
+pub(super) fn day_minute(ms: f64) -> (i64, u32, usize) {
+    let at = local(ms);
+    (at.day, at.minute, at.weekday)
+}
+
 /// Today's local date, as the agent's opening line says it: Thursday 30 October 2026.
 pub fn today() -> String {
     const NAMES: [&str; 7] = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];

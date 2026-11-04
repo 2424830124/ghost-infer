@@ -5,10 +5,10 @@
 use iced::widget::canvas::{self, Frame, Geometry};
 use iced::{mouse, Color, Point, Rectangle, Renderer, Size, Theme};
 
-const W: usize = 24;
-const H: usize = 22;
-const OX: usize = 3;
-const OY: usize = 6;
+pub(crate) const W: usize = 24;
+pub(crate) const H: usize = 22;
+pub(crate) const OX: usize = 3;
+pub(crate) const OY: usize = 6;
 
 const TOP: [&str; 12] = [
     "....wwwwww....",
@@ -40,7 +40,7 @@ pub enum Mood {
     Sleepy,
 }
 
-fn color(c: u8, accent: Color) -> Color {
+pub(crate) fn color(c: u8, accent: Color) -> Color {
     let rgb = |r: u8, g: u8, b: u8| Color::from_rgb8(r, g, b);
     match c {
         b'o' => rgb(0x0b, 0x0e, 0x17),
@@ -69,7 +69,7 @@ impl Ghost {
         Ghost { pixel, mood: Mood::Idle, t: 1, talk: false, accent }
     }
 
-    fn grid(&self) -> [[u8; W]; H] {
+    pub(crate) fn grid(&self) -> [[u8; W]; H] {
         let t = self.t;
         let step = (t / 420) as usize;
         let mut dy: isize = (t / if self.mood == Mood::Sleepy { 1100 } else { 420 }) as isize % 2;

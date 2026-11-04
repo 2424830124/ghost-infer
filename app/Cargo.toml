@@ -15,6 +15,9 @@ path = "src/main.rs"
 iced = { version = "0.14", default-features = false, features = ["tiny-skia", "crisp", "thread-pool", "markdown", "highlighter", "canvas", "selector", "advanced"] }
 # Windows' own folder dialog, for the folders the model may use
 rfd = "0.17"
+# voice calls: the microphone and the speaker (WASAPI on Windows)
+cpal = "0.15"
+# Maya's portrait frames for the call's face (assets/maya), decoded once
 
 # the preview pane: Edge's WebView2 (part of Windows 10 and 11) as a child of the app's window, made only
 # when a page is shown

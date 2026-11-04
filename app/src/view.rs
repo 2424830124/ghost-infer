@@ -108,7 +108,6 @@ mod ic {
     pub const CLOSE: char = '\u{E8BB}';
     pub const DOCK_RIGHT: char = '\u{E90D}';
     pub const CHIP: char = '\u{E950}';
-    pub const POWER: char = '\u{E7E8}';
     pub const SKILL: char = '\u{E8F1}';
     pub const PLUG: char = '\u{E71B}';
     pub const TASKS: char = '\u{E9D5}';
@@ -133,14 +132,20 @@ mod ic {
     pub const CHECK: char = '\u{E73E}';
     pub const CANCEL: char = '\u{E711}';
     pub const CHAT: char = '\u{E8BD}';
-    pub const SUN: char = '\u{E706}';
-    pub const MOON: char = '\u{E708}';
     pub const CLOCK: char = '\u{E916}';
     pub const UNDO: char = '\u{E7A7}';
     pub const DOWNLOAD: char = '\u{E896}';
     pub const OPEN_NEW: char = '\u{E8A7}';
     pub const FLAG: char = '\u{E7C1}';
     pub const REPEAT: char = '\u{E8EE}';
+    pub const PHONE: char = '\u{E717}';
+    pub const CODE: char = '\u{E943}';
+    pub const MIC: char = '\u{E720}';
+    pub const MIC_OFF: char = '\u{EC54}';
+    pub const HANG_UP: char = '\u{E778}';
+    pub const INFO: char = '\u{E946}';
+    pub const COLOR: char = '\u{E790}';
+    pub const KEYBOARD: char = '\u{E765}';
 }
 
 fn icon<'a>(c: char, size: impl Into<Pixels>) -> text::Text<'a> {
@@ -273,6 +278,9 @@ impl App {
         }
         let body: Element<'_, Message> = body.into();
         let Some(menu) = self.menu else { return self.framed(self.with_slash(body)) };
+        if menu == Menu::Settings {
+            return self.framed(stack![body, self.settings()].into());
+        }
         // an open menu: a click anywhere else closes it
         let shade = mouse_area(container(Space::new()).width(Fill).height(Fill)).on_press(Message::Menu(None));
         let item = |c: char, label: &str, msg: Message| Item { icon: Some(c), label: label.to_string(), detail: None, hint: None, msg, danger: false, check: None };
@@ -290,19 +298,7 @@ impl App {
                 232.0,
                 false,
             ),
-            Menu::Settings => (
-                None,
-                vec![
-                    item(if s.dark { ic::SUN } else { ic::MOON }, if s.dark { "Light theme (Fog)" } else { "Dark theme (Graphite)" }, Message::ToggleTheme),
-                    item(ic::SETTINGS, "Follow Windows' theme", Message::SystemTheme),
-                    Item { check: Some(self.load_last), ..item(ic::BOLT, "Start with the last model", Message::ToggleLoadLast) },
-                    Item { check: Some(self.warm_up), ..item(ic::NOW, "Warm up after loading", Message::ToggleWarmUp) },
-                    item(ic::POWER, "Quit and stop the model", Message::Quit),
-                ],
-                Padding { left: 12.0, bottom: 60.0, ..Padding::ZERO },
-                232.0,
-                false,
-            ),
+            Menu::Settings => unreachable!("the settings are a window of their own"),
             // adding things; the tools themselves are always there, and the mode decides what needs an OK
             Menu::Plus => (
                 None,
@@ -315,6 +311,18 @@ impl App {
                 let current = self.model.as_ref().map(|m| m.id.as_str());
                 let items = self.models.iter().map(|m| Item { icon: None, check: Some(current == Some(m.id.as_str())), ..item(ic::BOLT, &m.label, Message::PickModel(m.clone())) }).collect();
                 (Some("Model"), items, above(true), 260.0, true)
+            }
+            Menu::CallModel => {
+                let same = Item { icon: None, detail: self.code_model().map(|m| m.label), check: Some(self.call_choice.is_none()), ..item(ic::BOLT, "Same as Code", Message::PickCallModel(None)) };
+                let items = std::iter::once(same)
+                    .chain(self.models.iter().map(|m| Item { icon: None, check: Some(self.call_choice.as_deref() == Some(m.id.as_str())), ..item(ic::BOLT, &m.label, Message::PickCallModel(Some(m.id.clone()))) }))
+                    .collect();
+                // under its chip, which sits near the top of the call screen
+                let below = match self.menu_at {
+                    Some(at) => Padding { left: (at.x + at.width / 2.0 - 130.0).max(0.0), top: at.y + at.height + 6.0, ..Padding::ZERO },
+                    None => Padding { top: 140.0, ..Padding::ZERO },
+                };
+                (Some("Maya talks with"), items, below, 260.0, false)
             }
             Menu::Mode => {
                 let items = crate::MODES
@@ -371,7 +379,7 @@ impl App {
             .width(Fill)
             .height(Fill)
             .align_x(if right { Alignment::End } else { Alignment::Start })
-            .align_y(if matches!(menu, Menu::Chat) { Alignment::Start } else { Alignment::End });
+            .align_y(if matches!(menu, Menu::Chat | Menu::CallModel) { Alignment::Start } else { Alignment::End });
         self.framed(stack![body, opaque(shade), placed].into())
     }
 
@@ -436,6 +444,202 @@ impl App {
         let middle = row![edge(E, Fill, D::West, I::ResizingHorizontally), Space::new().width(Fill).height(Fill), edge(E, Fill, D::East, I::ResizingHorizontally)];
         let bottom = row![edge(E, E, D::SouthWest, I::ResizingDiagonallyUp), edge(Fill, E, D::South, I::ResizingVertically), edge(E, E, D::SouthEast, I::ResizingDiagonallyDown)];
         stack![body, column![top, middle, bottom]].into()
+    }
+
+    /// The settings window, over the app dimmed: its sections down the left, the one open on the right as
+    /// groups of rows (a name, a line on what it does, its control at the right). Esc, the X or a click
+    /// outside closes it.
+    fn settings(&self) -> Element<'_, Message> {
+        use crate::{SettingsPage as P, ThemeMode};
+        let s = self.skin();
+        let page = self.settings_page;
+        let shade = mouse_area(container(Space::new()).width(Fill).height(Fill).style(move |_| container::Style {
+            background: Some(Background::Color(Color { a: if s.dark { 0.55 } else { 0.28 }, ..Color::BLACK })),
+            ..Default::default()
+        }))
+        .on_press(Message::Menu(None));
+
+        // the sections
+        let nav_item = |p: P, c: char, label: &'static str| -> Element<'static, Message> {
+            let on = page == p;
+            let line = row![icon(c, 14).color(if on { s.text } else { s.muted }).width(18), text(label).size(13.5).font(if on { MEDIUM } else { BODY }).color(if on { s.text } else { s.muted })].spacing(10).align_y(Alignment::Center);
+            button(line).on_press(Message::SettingsPage(p)).width(Fill).padding([8, 10]).style(move |_, st| row_style(s, st, on)).into()
+        };
+        let nav = column![
+            container(text("Settings").size(15).font(MEDIUM).color(s.text)).padding(Padding { top: 4.0, right: 10.0, bottom: 14.0, left: 10.0 }),
+            nav_item(P::General, ic::SETTINGS, "General"),
+            nav_item(P::Appearance, ic::COLOR, "Appearance"),
+            nav_item(P::Voice, ic::MIC, "Voice"),
+            nav_item(P::About, ic::INFO, "About"),
+        ]
+        .spacing(2);
+        let nav = container(nav).width(208).height(Fill).padding([18, 12]).style(move |_| container::Style {
+            background: Some(Background::Color(s.side)),
+            border: Border { radius: iced::border::Radius { top_left: 14.0, bottom_left: 14.0, ..Default::default() }, ..Default::default() },
+            ..Default::default()
+        });
+
+        // a row: its name and what it does, the control at the right
+        let row_of = |name: &'static str, about: String, control: Element<'static, Message>| -> Element<'static, Message> {
+            let words = column![text(name).size(14).color(s.text), text(about).size(12.5).color(s.faint)].spacing(3).width(Fill);
+            row![words, control].spacing(24).align_y(Alignment::Center).padding([14, 18]).into()
+        };
+        // rows in a group, a hairline between them
+        let group = |title: &'static str, rows: Vec<Element<'static, Message>>| -> Element<'static, Message> {
+            let mut list = column![];
+            let n = rows.len();
+            for (i, r) in rows.into_iter().enumerate() {
+                list = list.push(r);
+                if i + 1 < n {
+                    list = list.push(container(Space::new().height(1)).width(Fill).padding(Padding { left: 18.0, right: 18.0, ..Padding::ZERO }).style(move |_| container::Style { background: Some(Background::Color(s.line)), ..Default::default() }));
+                }
+            }
+            let card = container(list).width(Fill).style(move |_| container::Style {
+                background: Some(Background::Color(s.raise)),
+                border: Border { radius: 12.0.into(), width: 1.0, color: s.line2 },
+                ..Default::default()
+            });
+            column![text(title).size(12.5).font(MEDIUM).color(s.muted), card].spacing(8).into()
+        };
+        // a switch: a track that fills with the accent when on, its knob at that end
+        let switch = |on: bool, msg: Message| -> Element<'static, Message> {
+            let knob = container(Space::new().width(14).height(14)).style(move |_| container::Style {
+                background: Some(Background::Color(if on { s.ink } else { s.muted })),
+                border: border::rounded(7),
+                ..Default::default()
+            });
+            let track = container(knob).width(38).height(22).padding(4).align_x(if on { Alignment::End } else { Alignment::Start }).align_y(Alignment::Center).style(move |_| container::Style {
+                background: Some(Background::Color(if on { s.accent } else { Color::TRANSPARENT })),
+                border: Border { radius: 11.0.into(), width: if on { 0.0 } else { 1.0 }, color: s.line2 },
+                ..Default::default()
+            });
+            button(track).on_press(msg).padding(0).style(move |_, _| button::Style { background: None, ..Default::default() }).into()
+        };
+        // an outlined button, red for one that ends something
+        let action = |label: &'static str, msg: Message, danger: bool| -> Element<'static, Message> {
+            let c = if danger { s.bad } else { s.text };
+            button(text(label).size(13).color(c))
+                .on_press(msg)
+                .padding([6, 14])
+                .style(move |_, st| button::Style {
+                    background: Some(Background::Color(if hovered(st) { s.hover } else { Color::TRANSPARENT })),
+                    border: Border { radius: 8.0.into(), width: 1.0, color: if danger { Color { a: 0.5, ..s.bad } } else { s.line2 } },
+                    ..Default::default()
+                })
+                .into()
+        };
+        // a value shown, not changed
+        let value = |v: String| -> Element<'static, Message> { text(v).size(13).color(s.muted).into() };
+
+        let (title, about, groups): (&str, &str, Vec<Element<'static, Message>>) = match page {
+            P::General => (
+                "General",
+                "How ghost starts and stops.",
+                vec![
+                    group(
+                        "Startup",
+                        vec![
+                            row_of("Open with the last model", "Loads the model you used last when ghost starts.".into(), switch(self.load_last, Message::ToggleLoadLast)),
+                            row_of("Warm up after loading", "Runs a few short replies after a model loads, so the first real answer comes quickly.".into(), switch(self.warm_up, Message::ToggleWarmUp)),
+                        ],
+                    ),
+                    group(
+                        "Quitting",
+                        vec![row_of("Quit ghost", "Closing the window keeps ghost in the tray. This stops it and frees the model's memory.".into(), action("Quit", Message::Quit, true))],
+                    ),
+                ],
+            ),
+            P::Appearance => {
+                let choice = |label: &'static str, m: ThemeMode| -> Element<'static, Message> {
+                    let on = self.mode == m;
+                    button(text(label).size(13).color(if on { s.text } else { s.muted }).font(if on { MEDIUM } else { BODY }))
+                        .on_press(Message::SetTheme(m))
+                        .padding([5, 14])
+                        .style(move |_, st| button::Style {
+                            background: Some(Background::Color(if on { s.raise2 } else if hovered(st) { s.hover } else { Color::TRANSPARENT })),
+                            border: border::rounded(7),
+                            ..Default::default()
+                        })
+                        .into()
+                };
+                let picker = container(row![choice("Light", ThemeMode::Light), choice("Dark", ThemeMode::Dark), choice("System", ThemeMode::System)].spacing(2)).padding(3).style(move |_| container::Style {
+                    border: Border { radius: 10.0.into(), width: 1.0, color: s.line2 },
+                    ..Default::default()
+                });
+                ("Appearance", "How ghost looks.", vec![group("Theme", vec![row_of("Colour theme", "Fog is light, Graphite dark. System follows Windows.".into(), picker.into())])])
+            }
+            P::Voice => {
+                let (speech, listen) = &self.voice_models;
+                let named = |v: &Option<String>| v.clone().unwrap_or_else(|| "Not set up".into());
+                (
+                    "Voice",
+                    "Voice calls with Maya.",
+                    vec![
+                        group(
+                            "Models",
+                            vec![
+                                row_of("Voice", "What Maya speaks with.".into(), value(named(speech))),
+                                row_of("Listening", "What turns your speech into text.".into(), value(named(listen))),
+                                row_of(
+                                    "Call model",
+                                    "Picked on the call screen. Kept loaded beside the Code model when your graphics card has room for both and the voice; otherwise a call asks before swapping them.".into(),
+                                    value(match (&self.call_choice, self.call_target()) {
+                                        (None, _) => "Same as Code".into(),
+                                        (Some(_), Some(m)) => m.label,
+                                        (Some(id), None) => crate::short_model(id),
+                                    }),
+                                ),
+                            ],
+                        ),
+                        group("During a call", vec![row_of("Show response timings", "How long each reply took to start: for checking speed.".into(), switch(self.call_timings, Message::ToggleCallTimings))]),
+                        text("The voice models are chosen when the server starts (its --tts and --stt options).").size(12.5).color(s.faint).into(),
+                    ],
+                )
+            }
+            P::About => {
+                let sys = &self.system;
+                let gpu = sys.get("gpus").and_then(Json::as_array).and_then(|g| g.first()).and_then(|g| g.get("name")).and_then(Json::as_str).map(|n| n.trim_start_matches("NVIDIA ").to_string()).unwrap_or_else(|| "None found".into());
+                let model = self.model.as_ref().map(|m| m.label.clone()).unwrap_or_else(|| "None loaded".into());
+                let head = row![
+                    canvas(Ghost::still(2.0, s.accent)).width(48).height(44),
+                    column![text("ghost").size(18).font(MEDIUM).color(s.text), text(format!("Version {}", env!("CARGO_PKG_VERSION"))).size(12.5).color(s.faint)].spacing(2),
+                ]
+                .spacing(14)
+                .align_y(Alignment::Center);
+                (
+                    "About",
+                    "This copy of ghost and the computer it runs on.",
+                    vec![
+                        head.into(),
+                        group(
+                            "Running",
+                            vec![
+                                row_of("Engine", "Runs the models on this computer.".into(), value("ghost-infer".into())),
+                                row_of("Model", "The model loaded now.".into(), value(model)),
+                                row_of("Graphics", "Where the model runs.".into(), value(gpu)),
+                            ],
+                        ),
+                    ],
+                )
+            }
+        };
+        let close = button(icon(ic::CANCEL, 11).color(s.muted)).on_press(Message::Menu(None)).padding(8).style(move |_, st| bare(s, st));
+        let header = row![column![text(title).size(20).font(MEDIUM).color(s.text), text(about).size(13).color(s.faint)].spacing(4).width(Fill), close].align_y(Alignment::Start);
+        let mut content = column![header].spacing(22);
+        for g in groups {
+            content = content.push(g);
+        }
+        let content = scrollable(container(content).padding(Padding { top: 22.0, right: 26.0, bottom: 26.0, left: 28.0 })).height(Fill).style(move |t, st| scroll_style(s, t, st));
+
+        let (w, h) = ((self.window.width - 64.0).clamp(560.0, 860.0), (self.window.height - 64.0).clamp(420.0, 600.0));
+        let card = container(row![nav, content]).width(w).height(h).style(move |_| container::Style {
+            background: Some(Background::Color(s.bg)),
+            // no shadow: the CPU renderer's redraw of what changed leaves a blurred one (and the card over it)
+            // stale and black
+            border: Border { radius: 14.0.into(), width: 1.0, color: s.line2 },
+            ..Default::default()
+        });
+        stack![shade, container(opaque(card)).width(Fill).height(Fill).center_x(Fill).center_y(Fill)].into()
     }
 
     /// The session rail on the right: this computer and model, how full the context is, and the files this
@@ -862,7 +1066,7 @@ impl App {
     fn sidebar(&self) -> Element<'_, Message> {
         let s = self.skin();
         // the title bar's left part: drag the window by it, double-click to maximize
-        let chrome = drag_area(container(icon_button(s, ic::CLOSE_PANE, Message::ToggleSidebar)).width(Fill).height(44).align_y(Alignment::Center));
+        let chrome = drag_area(container(row![icon_button(s, ic::CLOSE_PANE, Message::ToggleSidebar), Space::new().width(Fill), self.mode_switch()].align_y(Alignment::Center)).width(Fill).height(44).align_y(Alignment::Center));
         let nav = |c: char, label: &'static str, msg: Message| {
             button(row![icon(c, 14).color(s.muted), text(label).size(14).color(s.text)].spacing(12).align_y(Alignment::Center))
                 .on_press(msg)
@@ -937,7 +1141,7 @@ impl App {
         let s = self.skin();
         let mut top = row![].spacing(8).align_y(Alignment::Center).padding(Padding { top: 6.0, right: 14.0, bottom: 6.0, left: 14.0 }).height(44);
         if !self.sidebar {
-            top = top.push(icon_button(s, ic::OPEN_PANE, Message::ToggleSidebar));
+            top = top.push(icon_button(s, ic::OPEN_PANE, Message::ToggleSidebar)).push(self.mode_switch());
         }
         if let (Some(title), false) = (&self.title, self.messages.is_empty()) {
             // a long title clips rather than running under what is beside the chat
@@ -959,6 +1163,9 @@ impl App {
         top = top.push(button(icon(ic::DOCK_RIGHT, 13).color(if on { s.text } else { s.muted })).on_press(Message::ToggleRail).padding(8).style(move |_, st| row_style(s, st, on)));
         // the window's buttons at the window's top right: here, unless the preview pane or the rail is to the right
         let top: Element<'_, Message> = if self.rail || self.preview_shown() { drag_area(top) } else { row![drag_area(top), self.window_controls()].into() };
+        if self.voice {
+            return container(column![top, self.call_view()]).style(move |_| container::Style { background: Some(Background::Color(s.bg)), ..Default::default() }).into();
+        }
 
         if self.messages.is_empty() {
             // a new chat: the greeting, the ghost on the message box, recent chats; on the first run, with no
@@ -999,6 +1206,157 @@ impl App {
             .style(move |t, st| scroll_style(s, t, st));
         let dock = container(column![self.dock_parts()].max_width(740)).center_x(Fill).padding(Padding { top: 0.0, right: 24.0, bottom: 12.0, left: 24.0 });
         container(column![top, transcript, dock]).style(move |_| container::Style { background: Some(Background::Color(s.bg)), ..Default::default() }).into()
+    }
+
+    /// The top-left switch between the app's two modes, as Claude Desktop's: a voice call, or the chat that
+    /// works with code and files.
+    fn mode_switch(&self) -> Element<'_, Message> {
+        let s = self.skin();
+        let seg = |c: char, tip: &'static str, on: bool, msg: Message| {
+            let b = button(container(icon(c, 13).color(if on { s.text } else { s.muted })).width(30).height(26).align_x(Alignment::Center).align_y(Alignment::Center))
+                .on_press(msg)
+                .padding(0)
+                .style(move |_, st| button::Style {
+                    background: Some(Background::Color(if on { s.raise2 } else if hovered(st) { s.hover } else { Color::TRANSPARENT })),
+                    border: border::rounded(7),
+                    ..Default::default()
+                });
+            tooltip(b, container(text(tip).size(12).color(s.text)).padding([4, 8]).style(move |_| container::Style { background: Some(Background::Color(s.raise)), border: border::rounded(6), ..Default::default() }), tooltip::Position::Bottom)
+        };
+        container(row![seg(ic::PHONE, "Voice call", self.voice, Message::SetVoice(true)), seg(ic::CODE, "Code", !self.voice, Message::SetVoice(false))].spacing(2))
+            .padding(2)
+            .style(move |_| container::Style { background: Some(Background::Color(s.hover)), border: border::rounded(9), ..Default::default() })
+            .into()
+    }
+
+    /// The Voice call mode: the call's face (the pixel orb, Maya or the ghost in its core, the microphone's level
+    /// and the voice in its rings), where the call is, its last turns, and the call's buttons.
+    fn call_view(&self) -> Element<'_, Message> {
+        let s = self.skin();
+        let in_call = self.call.is_some();
+        let talking = self.call.as_ref().is_some_and(|c| c.talking());
+        let muted = self.call.as_ref().is_some_and(|c| c.muted());
+
+        // who and how long, as a phone shows a call
+        let since = self.call_started.filter(|_| in_call).map(|t| t.elapsed().as_secs()).map(|t| format!("{:02}:{:02}", t / 60, t % 60));
+        let header = column![text("Maya").size(22).font(MEDIUM).color(s.text), text(since.unwrap_or_else(|| "Voice call".into())).size(13).color(s.faint)].spacing(4).align_x(Alignment::Center);
+
+        // where the call is: a dot of colour and a word; anything else (loading, an error) as a plain line
+        let (dot, word) = match (in_call, self.call_state.as_str()) {
+            (true, _) if muted => (Some(s.faint), "Muted".to_string()),
+            (true, _) if talking => (Some(s.accent), "Speaking".to_string()),
+            (true, "Thinking") => (Some(s.warn), "Thinking".to_string()),
+            (true, "Hearing you") => (Some(s.ok), "Hearing you".to_string()),
+            (true, "Listening") | (true, "") => (Some(s.ok), "Listening".to_string()),
+            (false, "") => (None, "Ready when you are".to_string()),
+            (_, st) => (None, st.to_string()),
+        };
+        let status: Element<'_, Message> = match dot {
+            Some(c) => container(
+                row![container(Space::new().width(7).height(7)).style(move |_| container::Style { background: Some(Background::Color(c)), border: border::rounded(4), ..Default::default() }), text(word).size(13).color(s.muted)]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+            )
+            .padding([5, 12])
+            .style(move |_| container::Style { background: Some(Background::Color(s.raise)), border: Border { radius: 999.0.into(), width: 1.0, color: s.line }, ..Default::default() })
+            .into(),
+            None => text(word).size(13).color(s.muted).into(),
+        };
+
+        let face = canvas(crate::orb::Orb { sim: &self.orb, skin: s, cell: 6.0 }).width(288).height(288);
+
+        // live captions: the last thing you said, small, and her reply under it
+        let last = |you: bool| self.call_lines.iter().rev().find(|l| l.0 == you && !l.1.is_empty()).map(|l| l.1.clone());
+        let mut captions = column![].spacing(10).align_x(Alignment::Center).max_width(560);
+        if let Some(t) = last(true) {
+            captions = captions.push(text(t).size(13.5).color(s.faint).align_x(Alignment::Center));
+        }
+        if let Some(t) = last(false) {
+            captions = captions.push(text(t).size(16).color(s.text).align_x(Alignment::Center));
+        }
+
+        // the controls: round buttons with a word under each
+        let control = |c: char, label: &'static str, msg: Message, bg: Color, fg: Color, size: f32| -> Element<'_, Message> {
+            let disc = button(container(icon(c, size * 0.32).color(fg)).center_x(size).center_y(size))
+                .on_press(msg)
+                .padding(0)
+                .style(move |_, st| button::Style { background: Some(Background::Color(if hovered(st) { Color { a: 0.82, ..bg } } else { bg })), border: border::rounded(size / 2.0), ..Default::default() });
+            column![disc, text(label).size(12).color(s.faint)].spacing(8).align_x(Alignment::Center).into()
+        };
+        let controls: Element<'_, Message> = if in_call {
+            let (mic_bg, mic_fg) = if muted { (s.text, s.bg) } else { (s.raise2, s.text) };
+            let (key_bg, key_fg) = if self.call_typing { (s.text, s.bg) } else { (s.raise2, s.text) };
+            row![
+                control(if muted { ic::MIC_OFF } else { ic::MIC }, if muted { "Unmute" } else { "Mute" }, Message::ToggleMute, mic_bg, mic_fg, 56.0),
+                control(ic::KEYBOARD, "Type", Message::ToggleCallTyping, key_bg, key_fg, 56.0),
+                control(ic::HANG_UP, "End", Message::EndCall, s.bad, Color::WHITE, 56.0),
+            ]
+            .spacing(28)
+            .into()
+        } else {
+            control(ic::PHONE, "Call Maya", Message::StartCall, s.ok, Color::WHITE, 64.0)
+        };
+
+        // who she talks with: the call model, picked here (its menu opens above it)
+        let talks: Element<'_, Message> = match self.call_target() {
+            Some(m) if !in_call => {
+                let line = row![text(format!("Talks with {}", m.label)).size(12.5).color(s.muted), icon(ic::DOWN, 9).color(s.faint)].spacing(6).align_y(Alignment::Center);
+                container(button(line).on_press(Message::OpenMenu(Menu::CallModel)).padding([4, 10]).style(move |_, st| row_style(s, st, false))).id("call_model").into()
+            }
+            _ => Space::new().height(0).into(),
+        };
+        let mut col = column![Space::new().height(Fill), header, Space::new().height(6), talks, Space::new().height(8), status, face, captions].align_x(Alignment::Center).width(Fill);
+        col = col.push(Space::new().height(28)).push(controls);
+        // typing instead of speaking, answered aloud the same way: a box with a send button, when asked for
+        if in_call && self.call_typing {
+            let field = text_input("Type a message", &self.call_text)
+                .on_input(Message::CallText)
+                .on_submit(Message::SendCallText)
+                .size(14)
+                .padding([10, 14])
+                .style(move |t, st| input_style(s, t, st));
+            let send = button(icon(ic::UP, 12).color(s.bg)).on_press(Message::SendCallText).padding([8, 10]).style(move |_, st| button::Style {
+                background: Some(Background::Color(if hovered(st) { Color { a: 0.85, ..s.text } } else { s.text })),
+                border: border::rounded(999),
+                ..Default::default()
+            });
+            col = col.push(Space::new().height(20)).push(container(row![field, send].spacing(8).align_y(Alignment::Center)).max_width(460).width(Fill));
+        }
+        if in_call && self.call_timings && !self.call_timing.is_empty() {
+            col = col.push(Space::new().height(14)).push(text(self.call_timing.as_str()).size(11).color(s.faint));
+        }
+        // a line under the call only when calls cannot work yet
+        if self.voice_models.0.is_none() || self.voice_models.1.is_none() {
+            let note = "Voice calls need the server started with --tts (a voice folder) and --stt (a Whisper file).";
+            col = col.push(Space::new().height(14)).push(container(text(note).size(12).color(s.faint)).max_width(520).center_x(Fill));
+        }
+        col = col.push(Space::new().height(Fill));
+        let screen = container(col).width(Fill).height(Fill).padding([0, 24]);
+        let Some((question, yes)) = &self.call_confirm else { return screen.into() };
+
+        // asked before a call that unloads the Code model: a card over the dimmed screen
+        let shade = mouse_area(container(Space::new()).width(Fill).height(Fill).style(move |_| container::Style {
+            background: Some(Background::Color(Color { a: if s.dark { 0.55 } else { 0.28 }, ..Color::BLACK })),
+            ..Default::default()
+        }))
+        .on_press(Message::ConfirmCall(false));
+        let choice = |label: &'static str, msg: Message, primary: bool| -> Element<'_, Message> {
+            button(text(label).size(13).color(if primary { Color::WHITE } else { s.text }))
+                .on_press(msg)
+                .padding([7, 16])
+                .style(move |_, st| button::Style {
+                    background: Some(Background::Color(if primary { if hovered(st) { Color { a: 0.85, ..s.ok } } else { s.ok } } else if hovered(st) { s.hover } else { Color::TRANSPARENT })),
+                    border: Border { radius: 8.0.into(), width: if primary { 0.0 } else { 1.0 }, color: s.line2 },
+                    ..Default::default()
+                })
+                .into()
+        };
+        let buttons = row![Space::new().width(Fill), choice("Cancel", Message::ConfirmCall(false), false), choice(yes, Message::ConfirmCall(true), true)].spacing(8);
+        let card = container(column![text("Not enough graphics memory for both").size(16).font(MEDIUM).color(s.text), text(question.clone()).size(13.5).color(s.muted), buttons].spacing(14))
+            .padding(22)
+            .max_width(440)
+            .style(move |_| container::Style { background: Some(Background::Color(s.bg)), border: Border { radius: 14.0.into(), width: 1.0, color: s.line2 }, ..Default::default() });
+        stack![screen, shade, container(opaque(card)).width(Fill).height(Fill).center_x(Fill).center_y(Fill)].into()
     }
 
     /// The first run: the models to download, the download under way, and, for an installed app, a folder of

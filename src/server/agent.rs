@@ -4,7 +4,7 @@
 //! in %LOCALAPPDATA%\ghost-infer\chats, so every client sees the same chats.
 //!
 //! A request: {"chat"?, "message"?, "mode"?, "cwd"?, "thinking"?, "max_tokens"?, "tools"?, "keep_going"?,
-//! "preview"?}. "mode" is the permission mode (auto, manual, accept_edits, plan, bypass; default manual), "cwd"
+//! "preview"?, "persona"?}. "persona": "maya" has Maya answer (maya.rs) instead of ghost. "mode" is the permission mode (auto, manual, accept_edits, plan, bypass; default manual), "cwd"
 //! a new chat's working directory (kept with the chat), "tools" the tool groups (default: all of them),
 //! "preview" true from a client that shows the web pages the model writes (the "preview" event). A message
 //! may be a command: /goal <what done looks like> (or /goal clear), /loop <interval> <prompt> (or /loop stop),
@@ -46,7 +46,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use super::{chat_prompt, chat_prompt_glm, sse, Event, Job, Kind, Loaded, Part, Shared, ToolCalls, Work};
+use super::{chat_prompt_for, sse, Event, Job, Kind, Loaded, Part, Style, Shared, ToolCalls, Work};
 use crate::json::{num, obj, str, Json};
 
 /// Model turns one reply may take (each tool round is one).
@@ -404,7 +404,7 @@ fn check_goal(req: &Request, chat: &Chat, work: &mpsc::Sender<Work>, shared: &Sh
     history.push(obj(vec![("role", str("user")), ("content", str(&ask)), ("aside", Json::Bool(true))]));
     let Ok(prompt) = prompt_for(req, &history, &tools, false, shared, loaded) else { return (false, "the check could not be made".into()) };
     let (tx, events) = mpsc::channel();
-    let job = Job { model: loaded.id.clone(), kind: Kind::Chat, prompt, max_tokens: Some(120), temperature: 0.0, top_k: shared.defaults.1, top_p: shared.defaults.2, seed: 1, stop: Vec::new(), lead: "", events: tx };
+    let job = Job { model: loaded.id.clone(), kind: Kind::Chat, prompt, max_tokens: Some(120), temperature: 0.0, top_k: shared.defaults.1, top_p: shared.defaults.2, seed: 1, style: Style::default(), stop: Vec::new(), lead: "", events: tx };
     if work.send(Work::Job(job)).is_err() {
         return (false, "the check could not be made".into());
     }
@@ -765,7 +765,7 @@ fn compact(out: &mut Out, req: &Request, chat: &mut Chat, tools: &[Json], work: 
     }
     let Some(prompt) = asked else { return Ok(false) };
     let (tx, events) = mpsc::channel();
-    let job = Job { model: loaded.id.clone(), kind: Kind::Chat, prompt, max_tokens: Some(budget), temperature: 0.3, top_k: shared.defaults.1, top_p: shared.defaults.2, seed: 1, stop: vec!["</summary>".into()], lead: "", events: tx };
+    let job = Job { model: loaded.id.clone(), kind: Kind::Chat, prompt, max_tokens: Some(budget), temperature: 0.3, top_k: shared.defaults.1, top_p: shared.defaults.2, seed: 1, style: Style::default(), stop: vec!["</summary>".into()], lead: "", events: tx };
     work.send(Work::Job(job)).map_err(|_| "the model thread stopped")?;
     let mut text = String::new();
     for ev in events {
@@ -885,7 +885,7 @@ pub fn add_fact(fact: &str) -> Result<Vec<String>, String> {
 // ---- earlier chats: search_chats and read_chat
 
 /// A chat's text as the model reads it: what the user and the assistant said, without tool calls or thinking.
-fn chat_text(c: &Json) -> Vec<(String, String)> {
+pub(super) fn chat_text(c: &Json) -> Vec<(String, String)> {
     c.get("messages")
         .and_then(Json::as_array)
         .unwrap_or(&[])
@@ -1322,6 +1322,15 @@ impl Chat {
 
 // ---- the run
 
+/// Maya's DRY penalty: on a 4B model her replies were built from her earlier ones, sentence by sentence ("It's a
+/// bit of a joke, but I like that you noticed", "the fact that I'm a voice on someone's computer"). A presence
+/// penalty on words made it worse: she kept the sentences and swapped words for tags and filler.
+const MAYA_DRY: f32 = 0.8;
+
+/// The most sentences a reply of Maya's has (her prompt asks for one or two; the 4B wrote four or five, the
+/// later ones saying again what she had said before in other words).
+const MAYA_SENTENCES: usize = 3;
+
 /// What the client asks for: the chat (none: a new one), a new user message (none: answer the last one
 /// again), and the reply's settings.
 #[derive(Clone)]
@@ -1331,6 +1340,7 @@ struct Request {
     system: String,
     thinking: bool,
     temperature: f32,
+    style: Style, // against repeating itself (Maya's calls: a small model rebuilds its earlier replies)
     max_tokens: usize,
     groups: Vec<String>,
     goal: bool,           // keep going until the task list is done (the goal loop)
@@ -1342,18 +1352,28 @@ struct Request {
     skills: String, // the installed skills, likewise
     preview: bool,  // the client shows web pages the model writes itself (the app's preview pane)
     sub: String,    // a subagent's: the id of the call that started it, its own calls' ids begun with it ("" for a reply)
+    persona: String, // who answers instead of ghost ("persona": "maya", the voice call's companion): her prompt (maya.rs)
 }
 
 impl Request {
     fn parse(b: &Json, shared: &Shared) -> Request {
         let f = |k: &str| b.get(k).and_then(Json::as_f64);
         let folders = shared.harness.lock().unwrap().folders.clone();
+        // Maya has her own memory, and no use for ghost's, its GHOST.md files or its skills
+        let maya = b.get("persona").and_then(Json::as_str) == Some("maya");
         Request {
             chat: b.get("chat").and_then(Json::as_str).map(String::from),
             message: b.get("message").and_then(Json::as_str).map(String::from),
             system: b.get("system").and_then(Json::as_str).unwrap_or("").to_string(),
             thinking: b.get("thinking").and_then(Json::as_bool).unwrap_or(shared.think_default),
             temperature: f("temperature").map(|t| t as f32).unwrap_or(shared.defaults.0),
+            style: Style {
+                presence: f("presence_penalty").map(|p| p as f32).unwrap_or(0.0),
+                dry: f("dry_multiplier").map(|d| d as f32).unwrap_or(if maya { MAYA_DRY } else { 0.0 }),
+                sentences: f("max_sentences").map(|n| n as usize).unwrap_or(if maya { MAYA_SENTENCES } else { 0 }),
+                spoken: maya,
+                repetition: 1.0,
+            },
             max_tokens: f("max_tokens").map(|n| n.max(1.0) as usize).unwrap_or(shared.defaults.3),
             groups: match b.get("tools").and_then(Json::as_array) {
                 Some(a) => a.iter().filter_map(Json::as_str).map(String::from).collect(),
@@ -1362,19 +1382,21 @@ impl Request {
             goal: b.get("keep_going").and_then(Json::as_bool).unwrap_or(false),
             mode: b.get("mode").and_then(Json::as_str).filter(|m| MODES.contains(m)).unwrap_or("manual").to_string(),
             cwd: b.get("cwd").and_then(Json::as_str).map(str::trim).filter(|c| !c.is_empty()).map(String::from),
-            instructions: instructions_prompt(&folders),
+            instructions: if maya { String::new() } else { instructions_prompt(&folders) },
             folders,
-            memory: memory_prompt(),
-            skills: super::skills::prompt(),
+            memory: if maya { String::new() } else { memory_prompt() },
+            skills: if maya { String::new() } else { super::skills::prompt() },
             preview: b.get("preview").and_then(Json::as_bool).unwrap_or(false),
             sub: String::new(),
+            persona: if maya { super::maya::prompt() } else { String::new() },
         }
     }
 
     /// For a reply in `chat`: its working directory, then the other allowed folders, and their GHOST.md files.
     fn in_chat(&self, chat: &Chat, shared: &Shared) -> Request {
         let folders = run_folders(&chat.cwd, &shared.harness.lock().unwrap().folders);
-        Request { instructions: instructions_prompt(&folders), folders, ..self.clone() }
+        let instructions = if self.persona.is_empty() { instructions_prompt(&folders) } else { String::new() };
+        Request { instructions, folders, ..self.clone() }
     }
 }
 
@@ -1647,6 +1669,7 @@ pub fn run_away(w: &Wakeup, keep: impl Fn(&str) -> bool, work: &mpsc::Sender<Wor
         system: String::new(),
         thinking: w.thinking,
         temperature: shared.defaults.0,
+        style: Style::default(),
         max_tokens: shared.defaults.3.max(ROUND_TOKENS),
         groups: w.groups.to_vec(),
         goal: true,                // nobody is there to say "go on"
@@ -1658,6 +1681,7 @@ pub fn run_away(w: &Wakeup, keep: impl Fn(&str) -> bool, work: &mpsc::Sender<Wor
         skills: super::skills::prompt(),
         preview: false,
         sub: String::new(),
+        persona: String::new(),
     };
     let before = chat.messages.len();
     chat.messages.push(obj(vec![("role", str("user")), ("content", str(w.text)), ("shown", str(w.shown))]));
@@ -1680,7 +1704,11 @@ pub fn run_away(w: &Wakeup, keep: impl Fn(&str) -> bool, work: &mpsc::Sender<Wor
 
 /// The prompt for these messages: the client's system text plus where tools may work, then the chat.
 fn prompt_for(req: &Request, history: &[Json], tools: &[Json], thinking: bool, shared: &Shared, loaded: &Loaded) -> Result<String, String> {
-    let me = format!("You are ghost, an assistant running on the user's own computer through ghost-infer, with the {} model. Today is {}.", loaded.id, super::schedule::today());
+    let me = if req.persona.is_empty() {
+        format!("You are ghost, an assistant running on the user's own computer through ghost-infer, with the {} model. Today is {}.", loaded.id, super::schedule::today())
+    } else {
+        req.persona.clone()
+    };
     let system = [me, req.system.trim().to_string(), req.instructions.clone(), req.memory.clone(), if tools.is_empty() { String::new() } else { tool_prompt(&req.folders, tools.iter().any(|t| tool_name(t) == "run_command"), &deferred_tools(&req.groups)) },if tools.is_empty() { String::new() } else { req.skills.clone() }].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join("\n\n");
     let mut messages = Vec::new();
     if !system.is_empty() {
@@ -1692,7 +1720,7 @@ fn prompt_for(req: &Request, history: &[Json], tools: &[Json], thinking: bool, s
         fields.push(("tools", Json::Arr(tools.to_vec())));
     }
     let body = obj(fields);
-    if loaded.glm { chat_prompt_glm(&body, shared.think_default, loaded.thinking) } else { chat_prompt(&body, loaded.default_system.as_deref(), shared.think_default, loaded.thinking, loaded.coder) }
+    chat_prompt_for(loaded, &body, shared.think_default)
 }
 
 /// How an agent prompt begins with these tool groups: everything before the first message (the server reads
@@ -1731,7 +1759,7 @@ fn name_chat(req: &Request, chat: &Chat, work: &mpsc::Sender<Work>, shared: &Sha
     history.push(obj(vec![("role", str("user")), ("content", str(ask)), ("aside", Json::Bool(true))]));
     let prompt = prompt_for(req, &history, &tools, false, shared, loaded).ok()?;
     let (tx, events) = mpsc::channel();
-    let job = Job { model: loaded.id.clone(), kind: Kind::Chat, prompt, max_tokens: Some(48), temperature: 0.0, top_k: shared.defaults.1, top_p: shared.defaults.2, seed: 1, stop: Vec::new(), lead: "", events: tx };
+    let job = Job { model: loaded.id.clone(), kind: Kind::Chat, prompt, max_tokens: Some(48), temperature: 0.0, top_k: shared.defaults.1, top_p: shared.defaults.2, seed: 1, style: Style::default(), stop: Vec::new(), lead: "", events: tx };
     work.send(Work::Job(job)).ok()?;
     let mut out = String::new();
     for ev in events {
@@ -1801,7 +1829,7 @@ fn rounds(out: &mut Out, req: &Request, chat: &mut Chat, checkpoint: &str, work:
 
         let (tx, events) = mpsc::channel();
         let seed = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1);
-        let job = Job { model: loaded.id.clone(), kind: Kind::Chat, prompt, max_tokens: Some(req.max_tokens), temperature: req.temperature, top_k: shared.defaults.1, top_p: shared.defaults.2, seed, stop: Vec::new(), lead, events: tx };
+        let job = Job { model: loaded.id.clone(), kind: Kind::Chat, prompt, max_tokens: Some(req.max_tokens), temperature: req.temperature, top_k: shared.defaults.1, top_p: shared.defaults.2, seed, style: req.style, stop: Vec::new(), lead, events: tx };
         work.send(Work::Job(job)).map_err(|_| "the model thread stopped")?;
 
         // stream it: text to the client as it comes, tool calls split out

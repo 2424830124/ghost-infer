@@ -4,14 +4,17 @@
 #![windows_subsystem = "windows"]
 
 mod api;
+mod call;
 mod ghost;
 #[path = "../../src/json.rs"]
 #[allow(dead_code)]
 mod json;
+mod orb;
 mod preview;
 mod setup;
 mod tray;
 mod view;
+mod voice;
 
 use std::time::Instant;
 
@@ -26,14 +29,15 @@ use json::{num, obj, str, Json};
 /// app's main memory cost, so it stays bounded however long a chat gets).
 pub const SHOWN: usize = 30;
 
-/// Command line: `ghost-app [host:port] [--open <chat id>] [--send <message>] [--menu plus|chat|settings|skill-link]` (the last three
-/// for testing).
+/// Command line: `ghost-app [host:port] [--open <chat id>] [--send <message>] [--menu plus|chat|settings|skill-link] [--call]`
+/// (the last four for testing; --call opens the Voice call mode and starts a call).
 #[derive(Debug, Clone, Default)]
 struct Args {
     addr: String,
     open: Option<String>,
     send: Option<String>,
     menu: Option<String>,
+    call: bool,
 }
 
 fn main() -> iced::Result {
@@ -44,6 +48,7 @@ fn main() -> iced::Result {
             "--open" => args.open = it.next(),
             "--send" => args.send = it.next(),
             "--menu" => args.menu = it.next(),
+            "--call" => args.call = true,
             _ => args.addr = a,
         }
     }
@@ -467,7 +472,13 @@ fn short(v: &str) -> String {
 pub struct ModelChoice {
     pub id: String,
     pub label: String,
+    pub size: u64, // the file's bytes (0: not known)
 }
+
+/// The largest model file a voice call runs on: what fits in an 8 GB GPU beside the voice and Whisper (about
+/// 2.7 GB together) with room for its context. A bigger one (a 30B mixture of experts) is swapped for the largest
+/// model under this for the call, and back after it.
+const CALL_MAX: u64 = 3_500_000_000;
 
 impl std::fmt::Display for ModelChoice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -498,6 +509,7 @@ pub enum Menu {
     Settings,
     Plus,
     Model,  // under the message box: the models to switch to
+    CallModel, // on the call screen: the model calls talk to
     Mode,   // the permission modes
     Folder, // a new chat's working directory
 }
@@ -508,11 +520,21 @@ impl Menu {
         match self {
             Menu::Plus => Some("plus"),
             Menu::Model => Some("model"),
+            Menu::CallModel => Some("call_model"),
             Menu::Mode => Some("mode"),
             Menu::Folder => Some("folder"),
             Menu::Chat | Menu::Settings => None,
         }
     }
+}
+
+/// A section of the settings window.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SettingsPage {
+    General,
+    Appearance,
+    Voice,
+    About,
 }
 
 /// Light or dark: Windows' own setting unless the user picked one (kept in %LOCALAPPDATA%\ghost-infer\app.json).
@@ -537,6 +559,8 @@ struct Saved {
     load_last: bool,            // the launcher starts the server with the last picked model
     last_model: Option<String>, // the model last picked in the app
     model_dirs: Vec<String>,    // folders of models already on this computer (an installed app's server reads them)
+    call_timings: bool,         // a call shows how long each reply took (Settings, Voice)
+    call_model: Option<String>, // the model calls talk to (None: the Code model's)
 }
 
 fn load_settings() -> Saved {
@@ -559,6 +583,8 @@ fn load_settings() -> Saved {
         load_last: j.get("load_last").and_then(Json::as_bool).unwrap_or(false),
         last_model: j.get("last_model").and_then(Json::as_str).map(String::from),
         model_dirs: j.get("model_dirs").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(Json::as_str).map(String::from).collect(),
+        call_timings: j.get("call_timings").and_then(Json::as_bool).unwrap_or(false),
+        call_model: j.get("call_model").and_then(Json::as_str).map(String::from),
     }
 }
 
@@ -680,6 +706,28 @@ struct App {
     slash_pick: usize,       // the / list's highlighted line
     slash_shut: Option<String>, // the text the / list was closed at (Esc): shut until the text changes
     composer_at: Option<iced::Rectangle>, // the message box on screen, for the / list above it
+    voice: bool,             // the Voice call mode (the top-left switch) instead of Code
+    voice_models: (Option<String>, Option<String>), // the server's speech and speech-to-text models (--tts, --stt)
+    call: Option<call::Call>, // a voice call going on
+    call_state: String,      // listening, thinking, speaking, or what went wrong
+    settings_page: SettingsPage, // the section the settings window shows
+    call_lines: Vec<(bool, String)>, // the call's turns: (the user's, the text)
+    call_chat: Option<String>, // the chat the call writes in
+    call_pending: bool,      // a call asked for while the model loads: it starts once the model runs
+    call_timing: String,     // how long the last turn took, step by step
+    call_timings: bool,      // ...shown under the call (app.json's call_timings)
+    call_typing: bool,       // the call's message box is open
+    call_task: Option<task::Handle>, // the call's events (stopped when it is hung up)
+    call_choice: Option<String>, // the model calls talk to (None: the Code model's; app.json's call_model)
+    call_ready: Option<String>, // the model a call would talk to now, loaded with the voice
+    together: bool,          // the Code model and the call model (with the voice) both loaded: no switch either way
+    call_confirm: Option<(String, &'static str)>, // the question before a call that unloads the Code model, and its yes
+    asked_pair: bool,        // the server was asked for the Code and call models together (once a model runs)
+    voice_on: bool,          // the server has its voice models loaded (they load with a model, for calls)
+    call_wait: Option<String>, // the model a call switched to, with the voice: it starts once that runs
+    call_text: String,       // a message being typed during a call
+    orb: orb::Sim,           // the call's face: the pixel orb's motion
+    call_started: Option<std::time::Instant>, // when the call going on began (Maya is told how long it was)
 }
 
 /// A line of the / list: a command of the server's, or an installed skill.
@@ -750,8 +798,10 @@ enum Message {
     Copy(usize),
     Tick,
     Menu(Option<Menu>),
-    ToggleTheme,
-    SystemTheme,
+    SetTheme(ThemeMode),
+    SettingsPage(SettingsPage),
+    ToggleCallTimings,
+    ToggleCallTyping,
     ToggleSearch,
     Filter(String),
     ToggleRecents,
@@ -836,6 +886,17 @@ enum Message {
     PreviewReload,
     PreviewExternal,
     FocusApp, // a click in the app: the keyboard comes back from the page
+    // voice calls
+    SetVoice(bool), // the top-left switch: Voice call (true) or Code
+    PickCallModel(Option<String>), // the model calls talk to (None: the Code model's)
+    ConfirmCall(bool), // the answer to call_confirm: unload the Code model and call, or not
+    StartCall,
+    EndCall,
+    Reflected(Result<Json, String>), // Maya has thought the call over (her memory now)
+    ToggleMute,
+    Call(call::CallEvent),
+    CallText(String), // the call's text box changed
+    SendCallText,     // Enter in it: a typed turn
 }
 
 impl App {
@@ -844,7 +905,7 @@ impl App {
         if let Some((rgba, side)) = ghost::icon_rgba(view::GRAPHITE.accent) {
             tray::install(rgba, side);
         }
-        let Saved { mode, perm, workdir, rail, rail_open, load_last, last_model, model_dirs } = load_settings();
+        let Saved { mode, perm, workdir, rail, rail_open, load_last, last_model, model_dirs, call_timings, call_model } = load_settings();
         // an installed app starts its own server (with the last model if it is set to), as the launcher does
         let launch = (model_dirs.clone(), if load_last { last_model.clone() } else { None });
         let dark = match mode {
@@ -938,6 +999,28 @@ impl App {
             warm_up: true,
             preview_url: None,
             preview_open: false,
+            voice: false,
+            orb: orb::Sim::new(),
+            voice_models: (None, None),
+            call: None,
+            call_state: String::new(),
+            settings_page: SettingsPage::General,
+            call_lines: Vec::new(),
+            call_chat: None,
+            call_pending: false,
+            call_timing: String::new(),
+            call_timings,
+            call_typing: false,
+            call_task: None,
+            call_choice: call_model,
+            call_ready: None,
+            together: false,
+            call_confirm: None,
+            asked_pair: false,
+            voice_on: false,
+            call_wait: None,
+            call_text: String::new(),
+            call_started: None,
         };
         let connecting = blocking(move || {
             setup::start_server(&addr, &launch.0, launch.1.as_deref());
@@ -990,7 +1073,13 @@ impl App {
                 } else {
                     Task::none()
                 };
-                let system = Task::batch([self.refresh_system(), self.refresh_memory(), self.refresh_extras(), self.wait_for_model(), plus, first_run]);
+                let call = if std::mem::take(&mut self.start.call) {
+                    self.voice = true;
+                    Task::done(Message::StartCall)
+                } else {
+                    Task::none()
+                };
+                let system = Task::batch([self.refresh_system(), self.refresh_memory(), self.refresh_extras(), self.wait_for_model(), plus, first_run, call]);
                 if let Some(id) = self.start.open.take() {
                     return Task::batch([system, self.call(move |api| api.get(&format!("/api/chats/{id}")), Message::ChatLoaded)]);
                 }
@@ -1013,7 +1102,16 @@ impl App {
                 );
             }
             Message::Chats(Ok(c)) => self.set_chats(&c),
-            Message::Chats(Err(e)) | Message::ChatLoaded(Err(e)) | Message::ModelLoaded(Err(e)) => self.status = e,
+            Message::Chats(Err(e)) | Message::ChatLoaded(Err(e)) => self.status = e,
+            Message::ModelLoaded(Err(e)) => {
+                self.status = e.clone();
+                // the switch for a call failed: no call, and the model from before it back
+                if std::mem::take(&mut self.call_pending) {
+                    self.call_wait = None;
+                    self.call_state = format!("Couldn't switch models for the call: {e}");
+                    return self.back_to_code();
+                }
+            }
             Message::OpenChat(id) => {
                 if self.busy.is_none() {
                     return self.call(move |api| api.get(&format!("/api/chats/{id}")), Message::ChatLoaded);
@@ -1058,14 +1156,7 @@ impl App {
                 self.last_model = Some(id.clone());
                 self.save_settings();
                 self.status = format!("Loading {}…", choice.label);
-                let body = obj(vec![("id", str(&id))]);
-                return self.call(
-                    move |api| {
-                        api.post("/api/models/load", &body)?;
-                        api.get("/api/models")
-                    },
-                    Message::ModelLoaded,
-                );
+                return self.load_models(false);
             }
             Message::ModelLoaded(Ok(models)) => {
                 let was_warming = self.warming;
@@ -1079,7 +1170,24 @@ impl App {
                         Some(_) => String::new(),
                     };
                 }
-                return Task::batch([self.wait_for_model(), self.refresh_system()]);
+                // a call asked for while the model loaded
+                // (a poll while it switched models for the call reports the old ones: only the call model it switched
+                // to counts, once running, beside the Code model or alone)
+                let ready = self.loading.is_none()
+                    && match &self.call_wait {
+                        None => self.model.is_some(),
+                        Some(w) => self.call_ready.as_ref() == Some(w) || self.model.as_ref().is_some_and(|m| m.id == *w),
+                    };
+                let call = if ready && std::mem::take(&mut self.call_pending) { Task::done(Message::StartCall) } else { Task::none() };
+                // a model running that the app did not ask for with its call model (the launcher's): the call model
+                // and the voice beside it too, if they fit
+                if !self.asked_pair && self.loading.is_none() && self.model.is_some() && self.call.is_none() && !self.call_pending && self.voice_models.0.is_some() && self.voice_models.1.is_some() {
+                    self.asked_pair = true;
+                    if self.call_ready.is_none() {
+                        return Task::batch([self.refresh_system(), self.load_models(false)]);
+                    }
+                }
+                return Task::batch([self.wait_for_model(), self.refresh_system(), call]);
             }
             Message::Edit(action) => {
                 let (edits, shape) = (action.is_edit(), self.composer_shape());
@@ -1140,6 +1248,14 @@ impl App {
             Message::ToggleSidebar => self.sidebar = !self.sidebar,
             Message::Tick => {
                 self.clock = self.born.elapsed().as_millis() as u64;
+                // a call: the microphone's level and the ghost's mouth move on every tick
+                if self.call.is_some() {
+                    self.repaint = !self.repaint;
+                }
+                if self.voice {
+                    let (phase, level) = self.orb_input();
+                    self.orb.step(self.clock, phase, level);
+                }
                 // a model downloading: a look every second
                 let downloading = self.download.get("state").and_then(Json::as_str) == Some("downloading");
                 if downloading && !self.download_polling && self.clock.saturating_sub(self.download_polled) > 1000 {
@@ -1204,18 +1320,21 @@ impl App {
             Message::Read(Ok(c)) => self.set_chats(&c),
             Message::Read(Err(_)) => {}
             Message::Menu(m) => self.menu = m,
-            Message::ToggleTheme => {
-                self.set_dark(!self.dark);
-                self.mode = if self.dark { ThemeMode::Dark } else { ThemeMode::Light };
+            Message::SetTheme(mode) => {
+                self.mode = mode;
+                self.set_dark(match mode {
+                    ThemeMode::Dark => true,
+                    ThemeMode::Light => false,
+                    ThemeMode::System => windows_dark(),
+                });
                 self.save_settings();
-                self.menu = None;
             }
-            Message::SystemTheme => {
-                self.mode = ThemeMode::System;
-                self.set_dark(windows_dark());
+            Message::SettingsPage(page) => self.settings_page = page,
+            Message::ToggleCallTimings => {
+                self.call_timings = !self.call_timings;
                 self.save_settings();
-                self.menu = None;
             }
+            Message::ToggleCallTyping => self.call_typing = !self.call_typing,
             Message::ToggleTool(i, j) => {
                 if let Some(t) = self.messages.get_mut(i).and_then(|m| m.tools.get_mut(j)) {
                     t.open = !t.open;
@@ -1373,7 +1492,6 @@ impl App {
             }
             Message::Maximized(m) => self.maximized = m,
             Message::ToggleWarmUp => {
-                self.menu = None;
                 self.warm_up = !self.warm_up;
                 let body = obj(vec![("folders", Json::Arr(self.folders.iter().map(|f| str(f)).collect())), ("warm_up", Json::Bool(self.warm_up))]);
                 return self.call(move |api| api.post("/api/harness", &body), Message::Harness);
@@ -1476,6 +1594,160 @@ impl App {
                 }
             }
             Message::FocusApp => preview::focus_app(),
+            // back in Code mode: the Code model with its whole memory, if a call took it
+            Message::SetVoice(on) => {
+                self.voice = on;
+                if !on && self.call.is_none() && !self.call_pending {
+                    return self.back_to_code();
+                }
+            }
+            // the model calls talk to: loaded beside the Code model if they both fit (else at the next call's start)
+            Message::PickCallModel(id) => {
+                self.menu = None;
+                self.call_choice = id;
+                self.save_settings();
+                if self.call.is_none() && self.loading.is_none() && self.code_model().is_some() {
+                    return self.load_models(false);
+                }
+            }
+            Message::ConfirmCall(yes) => {
+                self.call_confirm = None;
+                if yes {
+                    return self.switch_for_call();
+                }
+            }
+            Message::StartCall => {
+                let Some(api) = self.api.clone() else { return Task::none() };
+                if self.call.is_some() {
+                    return Task::none();
+                }
+                if self.voice_models.0.is_none() || self.voice_models.1.is_none() {
+                    self.call_state = "The server has no voice: start it with --tts and --stt.".into();
+                    return Task::none();
+                }
+                if self.loading.is_some() && self.call_wait.is_none() {
+                    // one is loading: the call starts once it has
+                    self.call_pending = true;
+                    self.call_state = "Waiting for the model to load…".into();
+                    return self.wait_for_model();
+                }
+                let Some(target) = self.call_target() else {
+                    self.call_state = "Pick a model first: the call talks to it.".into();
+                    return Task::none();
+                };
+                // the call model and the voice not loaded yet: switch to them (asking first when that unloads the
+                // Code model or shrinks its context); switched already and still not ready: the voice did not load
+                if self.call_ready.as_deref() != Some(target.id.as_str()) {
+                    if self.call_wait.as_deref() == Some(target.id.as_str()) {
+                        self.call_wait = None;
+                        self.call_state = "The voice didn't load: the server's log says why.".into();
+                        return self.back_to_code();
+                    }
+                    match self.model.clone() {
+                        Some(code) if code.id != target.id => {
+                            let ask = format!(
+                                "Your graphics card doesn't have room for {} and {} with the voice at the same time.\n\nUnload {} and start the call? It loads again when you switch back to Code.",
+                                code.label, target.label, code.label
+                            );
+                            self.call_confirm = Some((ask, "Unload and call"));
+                            return Task::none();
+                        }
+                        Some(code) => {
+                            let ask = format!(
+                                "Your graphics card doesn't have room for the voice beside {} at its full context.\n\nReload {} with a smaller context and start the call? It gets its full context back when you switch back to Code.",
+                                code.label, code.label
+                            );
+                            self.call_confirm = Some((ask, "Reload and call"));
+                            return Task::none();
+                        }
+                        None => return self.switch_for_call(),
+                    }
+                }
+                let (tx, rx) = mpsc::unbounded();
+                match call::start(api, None, MODES[self.perm].0.to_string(), tx) {
+                    Ok(c) => {
+                        self.call = Some(c);
+                        self.call_wait = None;
+                        self.call_lines.clear();
+                        self.call_chat = None;
+                        self.call_timing.clear();
+                        self.call_started = Some(std::time::Instant::now());
+                        self.call_state = "Listening".into();
+                        let (task, handle) = Task::run(rx, Message::Call).abortable();
+                        self.call_task = Some(handle);
+                        return task;
+                    }
+                    Err(e) => self.call_state = format!("Couldn't start the call: {e}"),
+                }
+            }
+            // at once: the devices close, and what the call's thread still sends (it may be waiting on a reply) is
+            // not heard any more
+            Message::EndCall => {
+                // still switching models for it: the call does not start
+                let pending = std::mem::take(&mut self.call_pending);
+                self.call_wait = None;
+                if let Some(c) = self.call.take() {
+                    c.end();
+                    if let Some(h) = self.call_task.take() {
+                        h.abort();
+                    }
+                } else if !pending {
+                    return Task::none();
+                }
+                self.call_state = "Call ended".into();
+                return Task::batch([self.call(|api| api.get("/api/chats"), Message::Chats), self.after_call()]);
+            }
+            Message::Reflected(r) => {
+                // another call began meanwhile: it keeps the model
+                if self.call.is_some() || self.call_pending {
+                    return Task::none();
+                }
+                self.call_state = match r {
+                    Ok(_) => "Call ended".into(),
+                    Err(e) => format!("Call ended (Maya couldn't think it over: {e})"),
+                };
+                return self.back_to_code();
+            }
+            Message::ToggleMute => {
+                if let Some(c) = &self.call {
+                    c.set_muted(!c.muted());
+                }
+            }
+            Message::CallText(t) => self.call_text = t,
+            Message::SendCallText => {
+                let text = self.call_text.trim().to_string();
+                if let (Some(c), false) = (&self.call, text.is_empty()) {
+                    c.send_text(text);
+                    self.call_text.clear();
+                }
+            }
+            Message::Call(ev) => match ev {
+                call::CallEvent::State(s) => self.call_state = s.into(),
+                call::CallEvent::You(t) => {
+                    self.call_lines.push((true, t));
+                    self.call_lines.push((false, String::new()));
+                }
+                call::CallEvent::Ghost(t) => {
+                    if let Some(l) = self.call_lines.last_mut().filter(|l| !l.0) {
+                        l.1 = t;
+                    }
+                }
+                call::CallEvent::Chat(id) => {
+                    let new = self.call_chat.is_none();
+                    self.call_chat = Some(id);
+                    if new {
+                        return self.call(|api| api.get("/api/chats"), Message::Chats);
+                    }
+                }
+                call::CallEvent::Timing(t) => self.call_timing = t,
+                call::CallEvent::Error(e) => self.call_state = e,
+                call::CallEvent::Ended => {
+                    self.call = None;
+                    self.call_task = None;
+                    self.call_state = if self.call_lines.is_empty() { String::new() } else { "Call ended".into() };
+                    return Task::batch([self.call(|api| api.get("/api/chats"), Message::Chats), self.after_call()]);
+                }
+            },
             Message::UseModelFolder => {
                 return Task::perform(blocking(|| rfd::FileDialog::new().set_title("Choose a folder with GGUF models").pick_folder().map(|p| p.display().to_string())), Message::ModelFolder);
             }
@@ -1695,9 +1967,13 @@ impl App {
             ("rail", Json::Bool(self.rail)),
             ("rail_open", Json::Arr(self.rail_open.iter().map(|k| str(k)).collect())),
             ("load_last", Json::Bool(self.load_last)),
+            ("call_timings", Json::Bool(self.call_timings)),
         ];
         if let Some(m) = &self.last_model {
             fields.push(("last_model", str(m)));
+        }
+        if let Some(m) = &self.call_choice {
+            fields.push(("call_model", str(m)));
         }
         if let Some(w) = &self.workdir {
             fields.push(("workdir", str(w)));
@@ -1790,13 +2066,101 @@ impl App {
         out
     }
 
+    /// The model a call runs on when the current one is too big (CALL_MAX): the largest that fits, preferring
+    /// one of at least 1 GB (a tiny one answers too poorly to talk to).
+    fn call_model(&self) -> Option<ModelChoice> {
+        let fits = |m: &&ModelChoice| m.size > 0 && m.size <= CALL_MAX;
+        let best = |min: u64| self.models.iter().filter(fits).filter(|m| m.size >= min).max_by_key(|m| m.size).cloned();
+        best(1_000_000_000).or_else(|| best(0))
+    }
+
+    /// The Code model: the one last picked for chats, else the one running.
+    fn code_model(&self) -> Option<ModelChoice> {
+        let id = self.last_model.clone().or_else(|| self.model.as_ref().map(|m| m.id.clone()))?;
+        self.models.iter().find(|m| m.id == id).cloned().or_else(|| self.model.clone().filter(|m| m.id == id))
+    }
+
+    /// The model calls talk to: the one picked for calls, else the Code model, unless that is too big to answer
+    /// quickly beside the voice (then the largest that fits).
+    fn call_target(&self) -> Option<ModelChoice> {
+        if let Some(m) = self.call_choice.as_ref().and_then(|id| self.models.iter().find(|m| m.id == *id)) {
+            return Some(m.clone());
+        }
+        let code = self.code_model()?;
+        if code.size > CALL_MAX { self.call_model() } else { Some(code) }
+    }
+
+    /// Asks the server for the Code model and the call model: both kept loaded with the voice when they fit,
+    /// else the call model with the voice (`for_call`) or the Code model alone.
+    fn load_models(&mut self, for_call: bool) -> Task<Message> {
+        let (code, target) = (self.code_model(), self.call_target());
+        let Some(main) = code.clone().or_else(|| target.clone()) else { return Task::none() };
+        self.asked_pair = true;
+        let has_voice = self.voice_models.0.is_some() && self.voice_models.1.is_some();
+        self.loading = Some(if for_call { target.as_ref().unwrap_or(&main).id.clone() } else { main.id.clone() });
+        self.model = None;
+        let mut body = vec![("id", str(&main.id))];
+        match target.filter(|_| has_voice) {
+            Some(t) => {
+                body.push(("call", str(&t.id)));
+                body.push(("for_call", Json::Bool(for_call)));
+            }
+            None if for_call => body.push(("voice", Json::Bool(true))),
+            None => {}
+        }
+        let body = obj(body);
+        self.call(
+            move |api| {
+                api.post("/api/models/load", &body)?;
+                api.get("/api/models")
+            },
+            Message::ModelLoaded,
+        )
+    }
+
+    /// At a call's end: Maya thinks it over (with the call's model, while it still runs), then the model from
+    /// before the call comes back.
+    fn after_call(&mut self) -> Task<Message> {
+        let (Some(started), Some(chat)) = (self.call_started.take(), self.call_chat.clone()) else { return self.back_to_code() };
+        self.call_state = "Maya is thinking back over the call…".into();
+        let body = obj(vec![("chat", str(&chat)), ("seconds", Json::Num(started.elapsed().as_secs_f64()))]);
+        self.call(move |api| api.post("/api/maya/reflect", &body), Message::Reflected)
+    }
+
+    /// Loads the call model with the voice (beside the Code model when they fit), then starts the call.
+    fn switch_for_call(&mut self) -> Task<Message> {
+        let Some(target) = self.call_target() else { return Task::none() };
+        self.call_wait = Some(target.id.clone());
+        self.call_pending = true;
+        self.call_state = if self.model.as_ref().is_some_and(|m| m.id == target.id) { "Loading the voice…".into() } else { format!("Switching to {} for the call…", target.label) };
+        self.load_models(true)
+    }
+
+    /// Back in Code mode (or a call that could not start, there): the Code model with its whole memory again, when
+    /// a call took it (the call model swapped in, or the voice squeezed in beside it).
+    fn back_to_code(&mut self) -> Task<Message> {
+        let Some(code) = self.code_model() else { return Task::none() };
+        if self.voice || self.loading.is_some() || (self.model.as_ref().is_some_and(|m| m.id == code.id) && (!self.voice_on || self.together)) {
+            return Task::none();
+        }
+        self.status = format!("Loading {} again…", code.label);
+        self.load_models(false)
+    }
+
     fn set_models(&mut self, j: &Json) {
-        let choice = |id: &str| ModelChoice { id: id.to_string(), label: short_model(id) };
-        self.models = j.get("models").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(|m| m.get("id").and_then(Json::as_str).map(choice)).collect();
+        let listed = j.get("models").and_then(Json::as_array).unwrap_or(&[]);
+        let size = |id: &str| listed.iter().find(|m| m.get("id").and_then(Json::as_str) == Some(id)).and_then(|m| m.get("size")).and_then(Json::as_f64).unwrap_or(0.0) as u64;
+        let choice = |id: &str| ModelChoice { id: id.to_string(), label: short_model(id), size: size(id) };
+        self.models = listed.iter().filter_map(|m| m.get("id").and_then(Json::as_str).map(choice)).collect();
         self.model = j.get("current").and_then(Json::as_str).map(choice);
         self.loading = j.get("loading").and_then(Json::as_str).map(String::from);
         self.warming = j.get("warming").and_then(Json::as_bool).unwrap_or(false);
         self.context.1 = j.get("context_length").and_then(Json::as_f64).unwrap_or(0.0);
+        let name = |k: &str| j.get(k).and_then(Json::as_str).map(String::from);
+        self.voice_models = (name("speech"), name("listen"));
+        self.voice_on = j.get("voice").and_then(Json::as_bool).unwrap_or(false);
+        self.call_ready = name("call_model");
+        self.together = j.get("together").and_then(Json::as_bool).unwrap_or(false);
     }
 
     fn set_chats(&mut self, j: &Json) {
@@ -1899,6 +2263,24 @@ impl App {
         dir.map(folder_name).unwrap_or_else(|| "Choose a folder".into())
     }
 
+    /// What moves the call orb: where the call is, and its level: the microphone while the user may speak, the
+    /// voice while it plays.
+    fn orb_input(&self) -> (orb::Phase, f32) {
+        use orb::Phase;
+        let Some(c) = &self.call else { return (Phase::Ready, 0.0) };
+        if c.muted() {
+            return (Phase::Muted, 0.0);
+        }
+        if c.talking() {
+            return (Phase::Speaking, c.shared.voice());
+        }
+        match self.call_state.as_str() {
+            "Thinking" => (Phase::Thinking, 0.0),
+            "Hearing you" => (Phase::Hearing, c.shared.level()),
+            _ => (Phase::Listening, c.shared.level()),
+        }
+    }
+
     /// The ghost's clock: a tick a few times a second (the sprite moves in steps, so no more is needed).
     fn subscription(&self) -> iced::Subscription<Message> {
         let resized = iced::window::resize_events().map(|(_, size)| Message::WindowResized(size));
@@ -1918,6 +2300,12 @@ impl App {
                 iced::keyboard::Event::KeyPressed { key: iced::keyboard::Key::Character(c), .. } => mode_key(&c),
                 _ => None,
             })
+        } else if self.menu == Some(Menu::Settings) {
+            // Esc closes the settings window
+            iced::keyboard::listen().filter_map(|e| match e {
+                iced::keyboard::Event::KeyPressed { key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape), .. } => Some(Message::Menu(None)),
+                _ => None,
+            })
         } else {
             iced::Subscription::none()
         };
@@ -1934,7 +2322,22 @@ impl App {
             tray::events().map(Message::Tray)
         });
         let close = iced::window::close_requests().map(|_| Message::CloseWindow);
-        iced::Subscription::batch([tick, resized, keys, clicks, tray, close])
+        // the Voice call view: the orb steps a dozen times a second (its mouth and level need more than the clock)
+        let orb = if self.voice {
+            iced::Subscription::run(|| {
+                use iced::futures::StreamExt;
+                let (tx, rx) = mpsc::unbounded::<()>();
+                std::thread::spawn(move || {
+                    while tx.unbounded_send(()).is_ok() {
+                        std::thread::sleep(std::time::Duration::from_millis(83));
+                    }
+                });
+                rx.map(|_| Message::Tick)
+            })
+        } else {
+            iced::Subscription::none()
+        };
+        iced::Subscription::batch([tick, resized, keys, clicks, tray, close, orb])
     }
 
     /// Shows a web page in the preview pane, making the pane's view the first time (on the window's thread).

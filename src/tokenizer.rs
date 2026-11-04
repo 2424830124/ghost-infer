@@ -203,7 +203,8 @@ impl Tokenizer {
         let pre = match g.get("tokenizer.ggml.pre").and_then(Value::as_str).unwrap_or("default") {
             "smollm" | "starcoder" | "refact" => PreTokenizer::Gpt2IsolatedDigits,
             "qwen2" => PreTokenizer::Qwen2,
-            "glm4" => PreTokenizer::Glm4,
+            // Llama 3's regex is GLM-4's
+            "glm4" | "llama-bpe" => PreTokenizer::Glm4,
             "qwen35" => PreTokenizer::Qwen35,
             _ => PreTokenizer::Gpt2,
         };
@@ -260,7 +261,9 @@ impl Tokenizer {
             pre,
             bos_id: id("tokenizer.ggml.bos_token_id"),
             eos_id: id("tokenizer.ggml.eos_token_id"),
-            add_bos: g.get("tokenizer.ggml.add_bos_token").and_then(Value::as_bool).unwrap_or(false),
+            // unsaid, Llama 3's vocabulary starts with <|begin_of_text|> as llama.cpp's does: its fine-tunes' files often
+            // leave the flag out, and without it a long prompt sends the model off the rails
+            add_bos: g.get("tokenizer.ggml.add_bos_token").and_then(Value::as_bool).unwrap_or(g.get("tokenizer.ggml.pre").and_then(Value::as_str) == Some("llama-bpe")),
         })
     }
 
@@ -276,10 +279,13 @@ impl Tokenizer {
         self.is_special.get(id as usize).copied().unwrap_or(false)
     }
 
-    /// Encodes text; special tokens written literally (e.g. `<|im_start|>`) become their single id.
+    /// Encodes text; special tokens written literally (e.g. `<|im_start|>`) become their single id. The
+    /// beginning-of-text token is added first, unless the text writes it itself (a prompt that places it, such as
+    /// maya1's after its own start marker, would otherwise have two).
     pub fn encode(&self, text: &str) -> Vec<u32> {
         let mut ids = Vec::new();
-        if self.add_bos {
+        let written = self.bos_id.filter(|&b| self.is_special(b)).and_then(|b| self.tokens.get(b as usize)).is_some_and(|t| text.contains(t.as_str()));
+        if self.add_bos && !written {
             ids.extend(self.bos_id);
         }
         let mut rest = text;

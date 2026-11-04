@@ -18,9 +18,11 @@ use crate::{ChatFormat, Engine, Opts};
 
 mod agent;
 mod download;
+mod maya;
 mod mcp;
 mod schedule;
 mod skills;
+mod speech;
 
 const MAX_BODY: usize = 32 << 20;
 
@@ -32,8 +34,129 @@ enum Kind {
 /// Work for the model thread.
 enum Work {
     Job(Job),
-    /// switch to this GGUF file; the reply comes once a model is running again (Err: it stayed on the old one)
-    Load(PathBuf, mpsc::Sender<Result<(), String>>),
+    /// switch to these models; the reply comes once a model is running again (Err: it stayed on the old one)
+    Load(Plan, mpsc::Sender<Result<(), String>>),
+}
+
+/// The models asked for: `model`, with the voice models beside it (Some(true)), unloaded (Some(false)) or as they
+/// are; or, with `call`, `model` for chats and `call` for voice calls, both kept loaded with the voice when they
+/// all fit, else only the one `for_call` says comes first (the call model with the voice, or `model` alone).
+#[derive(Clone, PartialEq)]
+struct Plan {
+    model: PathBuf,
+    voice: Option<bool>,
+    call: Option<PathBuf>,
+    for_call: bool,
+}
+
+impl Plan {
+    fn one(model: PathBuf, voice: Option<bool>) -> Plan {
+        Plan { model, voice, call: None, for_call: false }
+    }
+}
+
+/// The call model's context when it is kept beside the chat model (a call's prompt and its turns), the least it
+/// may get, and the least the chat model keeps beside them both (the agent's prompt and a working chat).
+const CALL_CTX: usize = 8192;
+const MIN_CALL_CTX: usize = 4096;
+const MIN_CHAT_CTX: usize = 16384;
+/// A model's GPU memory beside its file and its session (whose size counts the activations): the kernels and the
+/// conversion scratch. Its file is a little more than its GPU weights (a big embedding table stays in RAM).
+const MODEL_WORK: usize = 64 << 20;
+
+/// Whether `model`, `call` (when another file) and the voice (when not loaded yet) look like they fit in the GPU
+/// memory free now with their least contexts: a quick check before trying, from the files' sizes.
+fn pair_fits(model: &Path, call: &Path, voice: &speech::Voice) -> bool {
+    let Ok(free) = crate::cuda::gpu_free() else { return false };
+    let one = |p: &Path, ctx: usize| -> Option<usize> {
+        let g = crate::gguf::Gguf::open(p).ok()?;
+        let cfg = crate::model::Config::from_gguf(&g).ok()?;
+        let size = std::fs::metadata(p).ok()?.len() as usize;
+        Some(size + MODEL_WORK + crate::cuda::session_bytes(&cfg, ctx.min(cfg.max_ctx)))
+    };
+    let models = if call == model { one(model, MIN_CHAT_CTX) } else { one(model, MIN_CHAT_CTX).zip(one(call, MIN_CALL_CTX)).map(|(a, b)| a + b) };
+    let voice = if voice.loaded() { 0 } else { voice.bytes() };
+    // only plainly too much is not tried: the files overstate the weights (a big embedding table stays in RAM),
+    // and loading them is the real test (each context is checked after)
+    let Some(need) = models.map(|m| m + voice + crate::cuda::kept_free()) else { return false };
+    let fits = need <= free + free / 8;
+    if !fits {
+        eprintln!("[calls: {} needs about {} MB beside the voice, {} MB is free: one model at a time]", if call == model { model_id(model) } else { format!("{} with {}", model_id(model), model_id(call)) }, need >> 20, free >> 20);
+    }
+    fits
+}
+
+/// How a reply is held in (0: not at all): penalties against repeating itself, as the Sampler has them
+/// (`presence` on the words of the model's recent replies and of this one, `dry` on runs of tokens it said
+/// before), `sentences`, the most it may say before it is stopped, and `spoken`: a reply that is voiced, whose
+/// voice tags are kept to one the voice does well (VoiceTags).
+#[derive(Clone, Copy, Default)]
+struct Style {
+    presence: f32,
+    dry: f32,
+    sentences: usize,
+    spoken: bool,
+    /// a repetition penalty (above 1; Sampler::with_repetition) over the prompt and the reply
+    repetition: f32,
+}
+
+/// The voice tags a spoken reply keeps, as it is written: one pause and one sound at most, and only ones the
+/// voice does well; any other ([smiles], [softly], a second [laughs]) is left out, with the space after it, and
+/// so is a pause before the first word. A small model told "at most one" wrote 44 in 17 replies, making up its own,
+/// and each pause tag is a cut in the voice; left in the chat, they taught it to write more.
+#[derive(Default)]
+struct VoiceTags {
+    open: String, // a tag being written
+    paused: bool, // a pause kept
+    sounded: bool, // a sound kept
+    spoke: bool, // a word was written
+    skip_space: bool,
+}
+
+impl VoiceTags {
+    const PAUSES: [&'static str; 2] = ["pause", "short pause"];
+    /// the sounds picked by ear (speech.rs SOUNDS makes them)
+    const SOUNDS: [&'static str; 22] = [
+        "laughs", "laugh", "chuckles", "sighs", "sigh", "hmm", "gasps", "gasp", "shocked", "aha", "scoffs", "scoff", "grunts", "grunt",
+        "groans", "groan", "moans", "moan", "whimpers", "whimper", "giggles", "thinks",
+    ];
+
+    /// The text to send of what the model just wrote.
+    fn push(&mut self, s: &str) -> String {
+        let mut out = String::new();
+        for c in s.chars() {
+            if !self.open.is_empty() {
+                self.open.push(c);
+                if c == ']' {
+                    let tag = self.open[1..self.open.len() - 1].trim().to_lowercase();
+                    let (pause, sound) = (Self::PAUSES.contains(&tag.as_str()), Self::SOUNDS.contains(&tag.as_str()));
+                    // a pause before the first word is only a later start; a sound there ([laughs] when asked to laugh) is kept
+                    if (pause && self.spoke && !self.paused) || (sound && !self.sounded) {
+                        out.push_str(&self.open);
+                        self.paused |= pause;
+                        self.sounded |= sound;
+                    } else {
+                        self.skip_space = true;
+                    }
+                    self.open.clear();
+                } else if c == '\n' || self.open.len() > 40 {
+                    // not a tag after all
+                    out.push_str(&std::mem::take(&mut self.open));
+                }
+                continue;
+            }
+            if c == '[' {
+                self.open.push(c);
+                continue;
+            }
+            if std::mem::take(&mut self.skip_space) && c == ' ' {
+                continue;
+            }
+            self.spoke |= c.is_alphanumeric();
+            out.push(c);
+        }
+        out
+    }
 }
 
 /// A generation request handed from a connection thread to the model thread.
@@ -46,6 +169,7 @@ struct Job {
     top_k: usize,
     top_p: f32,
     seed: u64,
+    style: Style,
     stop: Vec<String>,
     /// sent before the reply: text the prompt already holds but the reply is read with (GLM's
     /// prompt ends with <think>, so a thinking reply starts with it too)
@@ -68,15 +192,29 @@ struct Loaded {
     default_system: Option<String>,
     thinking: bool, // the chat template has a thinking switch
     glm: bool,      // GLM-4's chat format instead of ChatML
-    coder: bool,    // Qwen3-Coder's tool format (XML) instead of Qwen3's (JSON)
+    mistral: bool,  // Mistral's chat format ([INST] ... [/INST]) instead of ChatML
+    llama3: bool,   // Llama 3's chat format (<|start_header_id|> ... <|eot_id|>) instead of ChatML
+    coder: bool,   // Qwen3-Coder's tool format (XML) instead of Qwen3's (JSON)
     backend: String, // where it runs, e.g. "GPU NVIDIA GeForce RTX 2060 SUPER (sm_75, ...)"
+    about: Json,     // what the model is, from its file (about_model)
     tok: Arc<crate::tokenizer::Tokenizer>, // to count a prompt's tokens before sending it (the agent fits chats to the context)
 }
 
 #[derive(Default)]
 struct Status {
     current: Option<Loaded>,
+    /// a second model loaded beside it for voice calls (Plan::call)
+    call: Option<Loaded>,
+    /// the chat model, the call model and the voice all loaded together (Plan::call, when they fit)
+    together: bool,
     loading: Option<String>, // the model being loaded; requests get 503 meanwhile
+}
+
+impl Status {
+    /// The model a voice call talks to: the call model beside the chat model, else the chat model.
+    fn for_call(&self) -> Option<Loaded> {
+        self.call.clone().or_else(|| self.current.clone())
+    }
 }
 
 /// What the connection threads share: the model's status, and where the models are.
@@ -92,6 +230,37 @@ struct Shared {
     agent_groups: Mutex<Vec<String>>,
     /// made at startup and written into the chat page: the agent tools answer only requests carrying it
     token: String,
+    /// the speech and speech-to-text models (--tts, --stt), for /v1/audio/speech and /v1/audio/transcriptions:
+    /// loaded only while asked for (see speech::Voice)
+    voice: Mutex<speech::Voice>,
+}
+
+/// What a model is, from its file: name, size label, parameters (all of them, and those one token uses
+/// in a mixture of experts) and quantization, for the chat page to tell the model about itself.
+fn about_model(g: &crate::gguf::Gguf, id: &str) -> Json {
+    let text = |k: &str| g.get(k).and_then(|v| v.as_str()).map(str);
+    let total: u64 = g.tensors.iter().map(|t| t.n_elements()).sum();
+    let experts: u64 = g.tensors.iter().filter(|t| t.name.contains("_exps.")).map(|t| t.n_elements()).sum();
+    let mut fields = vec![
+        ("name", text("general.name").unwrap_or_else(|| str(id))),
+        ("parameters", num(total as f64)),
+    ];
+    if let Some(label) = text("general.size_label") {
+        fields.push(("size_label", label));
+    }
+    if let Ok(c) = crate::model::Config::from_gguf(g) {
+        if c.n_experts > 0 {
+            let active = total - experts + experts * c.n_experts_used as u64 / c.n_experts as u64;
+            fields.push(("active_parameters", num(active as f64)));
+            fields.push(("experts", num(c.n_experts as f64)));
+            fields.push(("experts_per_token", num(c.n_experts_used as f64)));
+        }
+    }
+    // the quantization is the file name's last part by convention (…-Q3_K_M)
+    if let Some(q) = id.rsplit(['-', '.']).next().filter(|q| q.starts_with(['Q', 'q', 'I', 'F', 'B'])) {
+        fields.push(("quantization", str(&q.to_uppercase())));
+    }
+    obj(fields)
 }
 
 fn model_id(path: &Path) -> String {
@@ -127,7 +296,7 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
     }
     let shared = Arc::new(Shared {
         // a model given at startup shows as loading from the first request on
-        status: Mutex::new(Status { current: None, loading: (!start_idle).then(|| model_id(&o.model)) }),
+        status: Mutex::new(Status { loading: (!start_idle).then(|| model_id(&o.model)), ..Default::default() }),
         dirs,
         download_dir: o.models.first().cloned(),
         defaults: (o.temp, o.top_k, o.top_p, o.max_new),
@@ -135,6 +304,7 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
         harness: Mutex::new(crate::tools::Settings::load()),
         agent_groups: Mutex::new(vec!["files".to_string()]),
         token: new_token(),
+        voice: Mutex::new(speech::Voice { tts: o.tts.clone(), stt: o.stt.clone(), ..Default::default() }),
     });
     std::thread::spawn(mcp::start_all); // the MCP servers in mcp.json, while the model loads
     let (work, rx) = mpsc::channel::<Work>();
@@ -151,13 +321,15 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
         }
     });
 
-    // the model thread: the engine (GPU state included) never leaves it. Each turn of this loop loads a
-    // model and serves it until a switch is asked for; the engine and its file are dropped before the next.
+    // the model thread: the engines (GPU state included) never leave it. Each turn of this loop loads the models
+    // of a Plan and serves them until another is asked for; they and their files are dropped before the next.
     // Started without one, it first waits for a model to be picked, and waits again if that one fails to load.
-    let mut path = o.model.clone();
+    let mut plan = Plan::one(o.model.clone(), None);
     let mut idle = start_idle;
-    let mut last_good: Option<PathBuf> = None;
+    let mut last_good: Option<Plan> = None;
     let mut waiting: Option<(mpsc::Sender<Result<(), String>>, Option<String>)> = None; // who asked for this switch, and an error to report
+    // (chat model, call model) pairs found not to fit beside each other and the voice: not tried again
+    let mut no_pair: Vec<(PathBuf, PathBuf)> = Vec::new();
     if start_idle {
         eprintln!("[no model loaded: pick one in the chat page or the app]");
         eprintln!("chat in your browser: http://{host}:{port}/");
@@ -174,29 +346,71 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
                     Ok(Work::Load(p, reply)) => break (p, reply),
                 }
             };
-            path = next;
+            plan = next;
             waiting = Some((reply, None));
             idle = false;
+        }
+        // what this plan loads: the call model and the voice beside the model when they all fit, else one of them
+        let pair = plan.call.clone().filter(|k| o.gpu && !no_pair.contains(&(plan.model.clone(), k.clone())) && pair_fits(&plan.model, k, &shared.voice.lock().unwrap()));
+        let (path, voice, second) = match (&plan.call, &pair) {
+            (Some(_), Some(k)) => (plan.model.clone(), Some(true), (*k != plan.model).then(|| k.clone())),
+            (Some(k), None) if plan.for_call => (k.clone(), Some(true), None),
+            (Some(_), None) => (plan.model.clone(), Some(false), None),
+            (None, _) => (plan.model.clone(), plan.voice, None),
+        };
+        // the voice models first (the last models are gone by now): what they take, the next ones go without
+        if let Some(on) = voice {
+            if on != shared.voice.lock().unwrap().loaded() {
+                shared.status.lock().unwrap().loading = Some(model_id(&path));
+                speech::set_voice(&shared.voice, on);
+                // their threads may have made the GPU context: the language model loads on this one
+                let _ = crate::cuda::bind_thread();
+            }
+        }
+        // the call model next, with the context a call needs: the chat model has the rest
+        let call_id = second.as_deref().map(model_id);
+        if let Some(c) = &call_id {
+            shared.status.lock().unwrap().loading = Some(c.clone());
+        }
+        let t = Instant::now();
+        let g2 = match second.as_deref().map(crate::gguf::Gguf::open).transpose() {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("[could not open the call model {}: {e}; one model at a time]", call_id.as_deref().unwrap_or(""));
+                no_pair.push((plan.model.clone(), second.clone().unwrap_or_default()));
+                continue;
+            }
+        };
+        let mut engine2 = match g2.as_ref().map(|g| crate::load_with_draft(g, o.gpu, CALL_CTX, None, 0)).transpose() {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("[could not load the call model {}: {e}; one model at a time]", call_id.as_deref().unwrap_or(""));
+                no_pair.push((plan.model.clone(), second.clone().unwrap_or_default()));
+                continue;
+            }
+        };
+        if let (Some(e), Some(c)) = (&engine2, &call_id) {
+            eprintln!("[loaded {c} for calls on {} in {:.2}s, {}-token context]", e.backend.describe(), t.elapsed().as_secs_f64(), e.backend.ctx());
         }
         let id = model_id(&path);
         shared.status.lock().unwrap().loading = Some(id.clone());
         let t = Instant::now();
-        // a failed switch goes back to the model that was running; failing at startup (or on the way back) ends the server
-        let mut fall_back = |e: String, path: &mut PathBuf| -> Result<(), String> {
+        // a failed switch goes back to the models that were running; failing at startup (or on the way back) ends the server
+        let mut fall_back = |e: String, plan: &mut Plan| -> Result<(), String> {
             if start_idle && last_good.is_none() {
                 // nothing ran yet: report it and wait for another pick
-                eprintln!("[could not load {}: {e}]", model_id(path));
+                eprintln!("[could not load {}: {e}]", model_id(&path));
                 if let Some((w, _)) = waiting.take() {
-                    let _ = w.send(Err(format!("could not load {}: {e}", model_id(path))));
+                    let _ = w.send(Err(format!("could not load {}: {e}", model_id(&path))));
                 }
                 idle = true;
                 return Ok(());
             }
             match (&mut waiting, &last_good) {
-                (Some(w), Some(prev)) if prev != path => {
-                    eprintln!("[could not load {}: {e}; going back to {}]", model_id(path), model_id(prev));
-                    w.1 = Some(format!("could not load {}: {e}", model_id(path)));
-                    *path = prev.clone();
+                (Some(w), Some(prev)) if prev != plan => {
+                    eprintln!("[could not load {}: {e}; going back to {}]", model_id(&path), model_id(&prev.model));
+                    w.1 = Some(format!("could not load {}: {e}", model_id(&path)));
+                    *plan = prev.clone();
                     Ok(())
                 }
                 _ => Err(e),
@@ -205,7 +419,7 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
         let g = match crate::gguf::Gguf::open(&path) {
             Ok(g) => g,
             Err(e) => {
-                fall_back(e, &mut path)?;
+                fall_back(e, &mut plan)?;
                 continue;
             }
         };
@@ -214,11 +428,10 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
         let mut engine = match crate::load_with_draft(&g, o.gpu, o.ctx.unwrap_or(0), draft, o.draft_k) {
             Ok(e) => e,
             Err(e) => {
-                fall_back(e, &mut path)?;
+                fall_back(e, &mut plan)?;
                 continue;
             }
         };
-        let fmt = ChatFormat::detect(&g).ok();
         eprintln!(
             "[loaded {} on {} in {:.2}s, {}-token context{}]",
             id,
@@ -227,31 +440,32 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
             engine.backend.ctx(),
             if engine.draft.is_some() { ", with a draft model for greedy requests" } else { "" }
         );
+        // kept together only when each has room to work: else one at a time from now on
+        if let Some(k) = &pair {
+            let least = crate::model::Config::from_gguf(&g).map_or(MIN_CHAT_CTX, |c| c.max_ctx.min(MIN_CHAT_CTX)).min(o.ctx.unwrap_or(usize::MAX));
+            if engine.backend.ctx() < least || engine2.as_ref().is_some_and(|e| e.backend.ctx() < MIN_CALL_CTX) {
+                eprintln!("[{id}, the call model and the voice leave too little room for their contexts: one model at a time]");
+                no_pair.push((plan.model.clone(), k.clone()));
+                continue;
+            }
+        }
         if last_good.is_none() && !start_idle {
             eprintln!("chat in your browser: http://{host}:{port}/");
             eprintln!("OpenAI-compatible API: http://{host}:{port}/v1 (/v1/chat/completions, /v1/completions, /v1/models)");
         }
-        if fmt.is_none() {
-            eprintln!("[note: no chat template this server knows (ChatML or GLM) in this model, so /v1/chat/completions is off]");
+        if ChatFormat::detect(&g).is_err() {
+            eprintln!("[note: no chat template this server knows (ChatML, GLM, Mistral or Llama 3) in this model, so /v1/chat/completions is off]");
         }
         *shared.status.lock().unwrap() = Status {
-            current: Some(Loaded {
-                id: id.clone(),
-                ctx: engine.backend.ctx(),
-                chat_ok: fmt.is_some(),
-                thinking: fmt.as_ref().is_some_and(|f| f.thinking),
-                glm: fmt.as_ref().is_some_and(|f| f.glm),
-                coder: fmt.as_ref().is_some_and(|f| f.coder),
-                backend: engine.backend.describe(),
-                tok: engine.tok.clone(),
-                default_system: fmt.and_then(|f| f.default_system),
-            }),
+            current: Some(loaded(&id, &g, &engine)),
+            call: g2.as_ref().zip(engine2.as_ref()).zip(call_id.as_deref()).map(|((g, e), c)| loaded(c, g, e)),
+            together: pair.is_some(),
             loading: None,
         };
         if let Some((w, err)) = waiting.take() {
             let _ = w.send(err.map_or(Ok(()), Err));
         }
-        last_good = Some(path.clone());
+        last_good = Some(plan.clone());
         // a few short replies first (the weights into memory), then the agent's opening read in, unless a
         // request comes in meanwhile: it goes first
         let warm = shared.harness.lock().unwrap().warm_up;
@@ -262,23 +476,66 @@ pub fn serve(o: &Opts, host: &str, port: u16) -> Result<(), String> {
         }
         WARMING.store(false, std::sync::atomic::Ordering::Relaxed);
 
-        let (next, reply) = loop {
+        let next = loop {
             let work = match early.take() {
                 Some(w) => Ok(w),
                 None => rx.recv(),
             };
             match work {
                 Err(_) => return Ok(()),
-                Ok(Work::Job(job)) => run(&mut engine, &id, job),
-                Ok(Work::Load(p, reply)) if p == path => {
+                Ok(Work::Job(job)) => match (engine2.as_mut(), call_id.as_deref()) {
+                    (Some(e), Some(c)) if job.model == c => run(e, c, job),
+                    _ => run(&mut engine, &id, job),
+                },
+                // already running: the same models (with both loaded, which comes first no longer matters), or
+                // this one model with the voice as asked
+                Ok(Work::Load(p, reply)) if p == plan || (pair.is_some() && p.model == plan.model && p.call == plan.call) => {
+                    plan = p;
+                    let _ = reply.send(Ok(()));
+                }
+                Ok(Work::Load(p, reply)) if p.call.is_none() && p.model == path && p.voice.is_none_or(|v| v == shared.voice.lock().unwrap().loaded()) => {
+                    let _ = reply.send(Ok(()));
+                }
+                // the model alone, with a call model already found not to fit beside it: as it would load
+                Ok(Work::Load(p, reply))
+                    if !p.for_call && p.model == path && second.is_none() && !shared.voice.lock().unwrap().loaded() && p.call.as_ref().is_some_and(|k| no_pair.contains(&(p.model.clone(), k.clone()))) =>
+                {
+                    plan = p;
                     let _ = reply.send(Ok(()));
                 }
                 Ok(Work::Load(p, reply)) => break (p, reply),
             }
         };
-        eprintln!("[switching from {id} to {}]", model_id(&next));
-        path = next;
+        let (next, reply) = next;
+        let also = match (&next.call, next.voice) {
+            (Some(k), _) if *k != next.model => format!(", with {} for calls when they fit", model_id(k)),
+            (Some(_), _) => ", with the voice when it fits".into(),
+            (None, Some(true)) => ", with the voice".into(),
+            (None, Some(false)) => ", without the voice".into(),
+            (None, None) => String::new(),
+        };
+        eprintln!("[switching from {id} to {}{also}]", model_id(&next.model));
+        plan = next;
         waiting = Some((reply, None));
+    }
+}
+
+/// What a loaded model is, for the connection threads.
+fn loaded(id: &str, g: &crate::gguf::Gguf, engine: &Engine) -> Loaded {
+    let fmt = ChatFormat::detect(g).ok();
+    Loaded {
+        id: id.to_string(),
+        ctx: engine.backend.ctx(),
+        chat_ok: fmt.is_some(),
+        thinking: fmt.as_ref().is_some_and(|f| f.thinking),
+        glm: fmt.as_ref().is_some_and(|f| f.glm),
+        mistral: fmt.as_ref().is_some_and(|f| f.mistral),
+        llama3: fmt.as_ref().is_some_and(|f| f.llama3),
+        coder: fmt.as_ref().is_some_and(|f| f.coder),
+        backend: engine.backend.describe(),
+        about: about_model(g, id),
+        tok: engine.tok.clone(),
+        default_system: fmt.and_then(|f| f.default_system),
     }
 }
 
@@ -303,7 +560,7 @@ fn warm_up(engine: &mut Engine, id: &str, rx: &mpsc::Receiver<Work>) -> Option<W
             Err(mpsc::TryRecvError::Empty) => {}
         }
         let (tx, events) = mpsc::channel();
-        let job = Job { model: id.to_string(), kind: Kind::Completion, prompt: prompt.into(), max_tokens: Some(48), temperature: 0.0, top_k: 1, top_p: 1.0, seed: 1, stop: Vec::new(), lead: "", events: tx };
+        let job = Job { model: id.to_string(), kind: Kind::Completion, prompt: prompt.into(), max_tokens: Some(48), temperature: 0.0, top_k: 1, top_p: 1.0, seed: 1, style: Style::default(), stop: Vec::new(), lead: "", events: tx };
         run(engine, id, job);
         tokens += events.try_iter().map(|e| if let Event::Done { completion_tokens, .. } = e { completion_tokens } else { 0 }).sum::<usize>();
     }
@@ -348,7 +605,7 @@ fn run(engine: &mut Engine, model: &str, job: Job) {
     // prompt is read in two, up to the reply's own header and then the header. The next prompt may write this
     // turn's header differently (without its empty thinking once a message follows it, as the compaction's
     // question or a nudge does): it then goes back to the header, not to the start.
-    let keep = match ["<|im_start|>assistant", "<|assistant|>"].iter().filter_map(|h| job.prompt.rfind(h)).max() {
+    let keep = match REPLY_HEADS.iter().filter_map(|h| job.prompt.rfind(h)).max() {
         Some(at) => {
             let head = engine.tok.encode(&job.prompt[..at]);
             let b = head.len();
@@ -357,7 +614,36 @@ fn run(engine: &mut Engine, model: &str, job: Job) {
         None => keep,
     };
     let max_new = job.max_tokens.unwrap_or(usize::MAX).min(ctx - ids.len()).max(1);
+    // GHOST_INFER_SHOW_PROMPT=1: each prompt as the model reads it, to the log
+    if std::env::var_os("GHOST_INFER_SHOW_PROMPT").is_some() {
+        eprintln!("[prompt, {} tokens, {} kept from the cache]\n{}\n[end of prompt]", ids.len(), keep, job.prompt);
+    }
     let mut sampler = Sampler::new(job.temperature, job.top_k, job.top_p, job.seed);
+    // a Llama 3 reply never writes a turn's header: a small model unsure how to begin can start one ("assistant",
+    // then <|end_header_id|>) and then write nothing but headers
+    if job.prompt.ends_with(LLAMA3_REPLY_HEAD) {
+        sampler = sampler.with_ban(["<|start_header_id|>", "<|end_header_id|>", "assistant"].iter().filter_map(|t| engine.tok.token_id(t)));
+    }
+    if job.style.presence > 0.0 {
+        let said: Vec<u32> = recent_replies(&job.prompt, 4).iter().flat_map(|r| engine.tok.encode(&without_tags(r))).collect();
+        let tok = engine.tok.clone();
+        sampler = sampler.with_presence(job.style.presence, said, move |id| is_word(&tok.token_bytes(id, false)));
+    }
+    if job.style.repetition > 1.0 {
+        sampler = sampler.with_repetition(job.style.repetition, ids.iter().copied());
+    }
+    if job.style.dry > 0.0 {
+        // its own recent replies, a line break after each, then what it says: only repeating itself is held back.
+        // (Over the whole context, the system prompt's ordinary phrases were held back too, and the model fled to
+        // rare spellings: all lowercase, "i’m" with a curly apostrophe, which the voice read as gibberish.)
+        let tok = engine.tok.clone();
+        let line = engine.tok.encode("\n");
+        let history: Vec<u32> = recent_replies(&job.prompt, DRY_REPLIES).iter().flat_map(|r| engine.tok.encode(r).into_iter().chain(line.iter().copied())).collect();
+        sampler = sampler.with_dry(job.style.dry, history, move |id| {
+            let b = tok.token_bytes(id, false);
+            b.is_empty() || b.contains(&b'\n')
+        });
+    }
 
     let tok = engine.tok.clone();
     let mut utf8 = Utf8Stream::default();
@@ -366,8 +652,27 @@ fn run(engine: &mut Engine, model: &str, job: Job) {
     let mut hit_stop = false;
     let events = job.events.clone();
     let stops = job.stop.clone();
+    let limit = job.style.sentences;
+    let mut all = String::new(); // the reply so far, for its sentences
+    let mut tags = job.style.spoken.then(VoiceTags::default);
     let result = engine.generate_with(&ids[keep..], max_new, &mut sampler, &mut |id| {
-        held.push_str(&utf8.push(&tok.token_bytes(id, true)));
+        let piece = utf8.push(&tok.token_bytes(id, true));
+        let piece = match tags.as_mut() {
+            Some(t) => t.push(&piece),
+            None => piece,
+        };
+        held.push_str(&piece);
+        if limit > 0 {
+            all.push_str(&piece);
+            if let Some(end) = nth_sentence_end(&all, limit) {
+                // what follows the last sentence is this token's, not sent yet
+                let tail = all.len() - end;
+                held.truncate(held.len().saturating_sub(tail));
+                hit_stop = true;
+                let _ = events.send(Event::Text(std::mem::take(&mut held)));
+                return Ok(false);
+            }
+        }
         if let Some(at) = stops.iter().filter_map(|s| held.find(s.as_str())).min() {
             held.truncate(at);
             hit_stop = true;
@@ -424,6 +729,124 @@ fn partial_suffix(text: &str, stop: &str) -> usize {
         .rev()
         .find(|&k| stop.is_char_boundary(k) && text.is_char_boundary(text.len() - k) && text.ends_with(&stop[..k]))
         .unwrap_or(0)
+}
+
+/// The model's replies DRY looks back over.
+const DRY_REPLIES: usize = 8;
+
+/// Where the `n`th sentence of `text` ends (after its . ! or ?, once a space follows), if it does yet. An
+/// ellipsis ("more... human") and anything in a voice tag ([short pause]) do not end one, and a sentence of fewer
+/// than four words ("Oh!", "Hmm.") runs on into the next: the limit cut a reply off at "N... like tiger... oh!".
+fn nth_sentence_end(text: &str, n: usize) -> Option<usize> {
+    let mut count = 0;
+    let mut depth = 0;
+    let mut words = 0;
+    let mut prev = ' ';
+    let mut it = text.char_indices().peekable();
+    while let Some((i, c)) = it.next() {
+        let next = it.peek().map(|&(_, c)| c);
+        match c {
+            '[' => depth += 1,
+            ']' if depth > 0 => depth -= 1,
+            '.' | '!' | '?' if depth == 0 && next.is_some_and(char::is_whitespace) && !(c == '.' && prev == '.') && words >= 4 => {
+                count += 1;
+                words = 0;
+                if count == n {
+                    return Some(i + 1);
+                }
+            }
+            _ if depth == 0 && c.is_alphanumeric() && !prev.is_alphanumeric() && prev != '\'' => words += 1,
+            _ => {}
+        }
+        prev = c;
+    }
+    None
+}
+
+/// Where the model's reply starts in a chat prompt: ChatML, GLM, Mistral and Llama 3.
+const REPLY_HEADS: [&str; 4] = ["<|im_start|>assistant", "<|assistant|>", "[/INST]", "<|start_header_id|>assistant<|end_header_id|>"];
+
+/// The model's last `n` finished replies in a chat prompt (any of REPLY_HEADS' formats), for the presence penalty.
+fn recent_replies(prompt: &str, n: usize) -> Vec<&str> {
+    let mut out = Vec::new();
+    for head in REPLY_HEADS {
+        let mut rest = prompt;
+        while let Some(at) = rest.find(head) {
+            rest = &rest[at + head.len()..];
+            // a finished reply ends at the next special marker; the open one at the end (the reply to come) has none
+            if let Some(end) = ["<|", "</s>"].iter().filter_map(|m| rest.find(m)).min() {
+                out.push(rest[..end].trim());
+            }
+        }
+    }
+    out.retain(|r| !r.is_empty());
+    let skip = out.len().saturating_sub(n);
+    out.split_off(skip)
+}
+
+/// A reply without its voice tags ([pause], [laughs]): saying one does not make the next unwelcome.
+fn without_tags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut depth = 0;
+    for c in text.chars() {
+        match c {
+            '[' => depth += 1,
+            ']' if depth > 0 => depth -= 1,
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A token the presence penalty counts: a word of at least four letters (not "the", "you", punctuation or
+/// markup, which every reply needs; never a special token such as <|im_end|>, or a reply could not end).
+fn is_word(bytes: &[u8]) -> bool {
+    let t = String::from_utf8_lossy(bytes);
+    !t.contains("<|") && t.chars().filter(|c| c.is_alphabetic()).count() >= 4
+}
+
+#[cfg(test)]
+mod penalty_tests {
+    use super::*;
+
+    #[test]
+    fn recent_replies_are_the_finished_ones() {
+        let p = "<|im_start|>system\nBe kind.<|im_end|>\n<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n[short pause] Hey there.<|im_end|>\n<|im_start|>user\nhow are you<|im_end|>\n<|im_start|>assistant\nGood, you?<|im_end|>\n<|im_start|>user\nfine<|im_end|>\n<|im_start|>assistant\n";
+        assert_eq!(recent_replies(p, 4), vec!["[short pause] Hey there.", "Good, you?"]);
+        assert_eq!(recent_replies(p, 1), vec!["Good, you?"]);
+        assert_eq!(without_tags("[short pause] Hey [laughs] there."), " Hey  there.");
+        assert!(is_word(b" figure") && !is_word(b" the") && !is_word(b"<|im_end|>"));
+    }
+
+    /// A pause and a sound the voice does well are kept, after the first word; the rest go, written whole or in pieces.
+    #[test]
+    fn a_spoken_reply_keeps_one_good_tag() {
+        let reply = "[pauses] Oh! [smiles] A bright laugh [laughs] there. [pause] Did that [softly] feel like you? [laughs] [pause]";
+        let mut t = VoiceTags::default();
+        assert_eq!(t.push(reply), "Oh! A bright laugh [laughs] there. [pause] Did that feel like you? ");
+        let mut t = VoiceTags::default();
+        let streamed: String = ["Hi", " [la", "ughs", "] ok", " [smi", "les] ", "fine"].iter().map(|p| t.push(p)).collect();
+        assert_eq!(streamed, "Hi [laughs] ok fine");
+        // asked to laugh, it laughs first
+        let mut t = VoiceTags::default();
+        assert_eq!(t.push("[laughs] Okay, that one got me. [pause] Again?"), "[laughs] Okay, that one got me. [pause] Again?");
+        let mut t = VoiceTags::default();
+        assert_eq!(t.push("a [note in brackets that runs on far too long to be a tag] b"), "a [note in brackets that runs on far too long to be a tag] b");
+    }
+
+    #[test]
+    fn sentences_end_at_a_stop_and_a_space() {
+        // "Hey!" is too short to be one: it runs on into the next
+        let t = "Hey! I was going to be more... human. [short pause] Right? Okay, that settles it then. And one more thing here.";
+        assert_eq!(&t[..nth_sentence_end(t, 1).unwrap()], "Hey! I was going to be more... human.");
+        assert_eq!(&t[..nth_sentence_end(t, 2).unwrap()], "Hey! I was going to be more... human. [short pause] Right? Okay, that settles it then.");
+        assert_eq!(nth_sentence_end(t, 3), None); // the last stop has no space after it yet
+        assert_eq!(nth_sentence_end("It took 3.5 seconds to get here, wow", 1), None);
+        let r = "Hmm. N... like tiger... oh! Wait, I've got it now. Next one.";
+        assert_eq!(&r[..nth_sentence_end(r, 1).unwrap()], "Hmm. N... like tiger... oh!");
+        assert_eq!(&r[..nth_sentence_end(r, 2).unwrap()], "Hmm. N... like tiger... oh! Wait, I've got it now.");
+    }
 }
 
 // ------------------------------------------------------------------ HTTP
@@ -499,6 +922,129 @@ fn respond(conn: &mut TcpStream, code: u16, body: &Json) -> Result<(), String> {
 
 /// The built-in chat page (src/chat.html, compiled into the program), with this run's tool token written
 /// in. It is sent without CORS headers, so another website cannot read the token out of it.
+/// POST /v1/audio/speech, as OpenAI's: {"input": text, "voice": a speaker id (a number, or "maya": 4, the
+/// speaker the Maya fine-tune learned), "response_format": "wav" (the default, sent when done) or "pcm" (16-bit
+/// mono samples at the X-Sample-Rate header's rate, sent as they are made)}, and also "conversation" (an id:
+/// the turns spoken under it are this one's context, which keeps the voice), "temperature", "top_k", "seed".
+fn speech_request(conn: &mut TcpStream, req: &Request, shared: &Shared) -> Result<(), String> {
+    if req.method == "OPTIONS" {
+        let head = format!("HTTP/1.1 204 No Content\r\n{CORS}Content-Length: 0\r\nConnection: close\r\n\r\n");
+        return conn.write_all(head.as_bytes()).map_err(|e| e.to_string());
+    }
+    if req.method != "POST" {
+        return respond(conn, 405, &error_body("method not allowed"));
+    }
+    let (sp, available) = {
+        let v = shared.voice.lock().unwrap();
+        (v.speech.clone(), v.tts.is_some())
+    };
+    let Some(sp) = sp else {
+        let why = if available { "the voice is off: it loads with a model, POST /api/models/load {\"id\": ..., \"voice\": true}" } else { "no speech model: start the server with --tts <CSM folder>" };
+        return respond(conn, if available { 409 } else { 404 }, &error_body(why));
+    };
+    let body = match std::str::from_utf8(&req.body).map_err(|e| e.to_string()).and_then(Json::parse) {
+        Ok(b) => b,
+        Err(e) => return respond(conn, 400, &error_body(&format!("request body: {e}"))),
+    };
+    let text = body.get("input").and_then(Json::as_str).unwrap_or("").trim().to_string();
+    if text.is_empty() {
+        return respond(conn, 400, &error_body("send the text to speak as \"input\""));
+    }
+    let speaker = match body.get("voice") {
+        Some(Json::Str(v)) if v.eq_ignore_ascii_case("maya") => 4,
+        Some(Json::Str(v)) => match v.parse() {
+            Ok(n) => n,
+            Err(_) => return respond(conn, 400, &error_body(&format!("voice \"{v}\": give a speaker number, or \"maya\""))),
+        },
+        Some(v) => v.as_f64().unwrap_or(4.0) as u32,
+        None => 4,
+    };
+    let pcm = match body.get("response_format").and_then(Json::as_str).unwrap_or("wav") {
+        "wav" => false,
+        "pcm" => true,
+        f => return respond(conn, 400, &error_body(&format!("response_format \"{f}\": wav or pcm"))),
+    };
+    let f = |k: &str| body.get(k).and_then(Json::as_f64);
+    let seed = f("seed").map_or_else(|| SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1), |s| s as u64);
+    let sampling = crate::csm::Sampling { temperature: f("temperature").map_or(sp.temperature, |v| v as f32), top_k: f("top_k").map_or(sp.top_k, |v| v as usize), seed };
+    // room for slow speech: about two frames (160 ms) a character, at most a minute
+    let max_frames = (text.chars().count() * 2 + 50).min(750);
+    let (tx, events) = mpsc::channel();
+    let conversation = body.get("conversation").and_then(Json::as_str).map(String::from);
+    sp.send(speech::SpeechJob { text, speaker, sampling, max_frames, conversation, events: tx })?;
+    let s16 = |samples: &[f32]| -> Vec<u8> { samples.iter().flat_map(|&v| ((v.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes()).collect() };
+    if pcm {
+        // each 80 ms of audio goes out on its own: small writes must not wait for the last one's ACK
+        let _ = conn.set_nodelay(true);
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Type: audio/pcm\r\nX-Sample-Rate: {}\r\nAccess-Control-Expose-Headers: X-Sample-Rate\r\nCache-Control: no-store\r\nTransfer-Encoding: chunked\r\n{CORS}Connection: close\r\n\r\n", sp.sample_rate);
+        conn.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
+        for ev in events {
+            match ev {
+                // a failed write: the client is gone, and dropping `events` stops the speech
+                speech::SpeechEvent::Audio(a) => write_chunk(conn, &s16(&a))?,
+                speech::SpeechEvent::Done => break,
+                speech::SpeechEvent::Error(e) => {
+                    eprintln!("[speech: {e}]");
+                    break;
+                }
+            }
+        }
+        return conn.write_all(b"0\r\n\r\n").map_err(|e| e.to_string());
+    }
+    let mut audio = Vec::new();
+    for ev in events {
+        match ev {
+            speech::SpeechEvent::Audio(a) => audio.extend(a),
+            speech::SpeechEvent::Done => break,
+            speech::SpeechEvent::Error(e) => return respond(conn, 500, &error_body(&e)),
+        }
+    }
+    let wav = crate::csm::wav(&audio, sp.sample_rate);
+    let head = format!("HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nContent-Length: {}\r\nCache-Control: no-store\r\n{CORS}Connection: close\r\n\r\n", wav.len());
+    conn.write_all(head.as_bytes()).and_then(|()| conn.write_all(&wav)).map_err(|e| e.to_string())
+}
+
+/// POST /v1/audio/transcriptions: a WAV file as the body (or as the file of an OpenAI-style multipart form);
+/// {"text", "language", "no_speech" (how likely it held no speech, 0..1), "duration"}.
+fn transcription_request(conn: &mut TcpStream, req: &Request, shared: &Shared) -> Result<(), String> {
+    if req.method == "OPTIONS" {
+        let head = format!("HTTP/1.1 204 No Content\r\n{CORS}Content-Length: 0\r\nConnection: close\r\n\r\n");
+        return conn.write_all(head.as_bytes()).map_err(|e| e.to_string());
+    }
+    if req.method != "POST" {
+        return respond(conn, 405, &error_body("method not allowed"));
+    }
+    let (l, available) = {
+        let v = shared.voice.lock().unwrap();
+        (v.listener.clone(), v.stt.is_some())
+    };
+    let Some(l) = l else {
+        let why = if available { "speech-to-text is off: it loads with a model, POST /api/models/load {\"id\": ..., \"voice\": true}" } else { "no speech-to-text model: start the server with --stt <whisper.gguf>" };
+        return respond(conn, if available { 409 } else { 404 }, &error_body(why));
+    };
+    // the WAV wherever it starts (a multipart form's boundary and headers come before it)
+    let Some(at) = req.body.windows(4).position(|w| w == b"RIFF") else {
+        return respond(conn, 400, &error_body("send a WAV file"));
+    };
+    let audio = match crate::whisper::read_wav(&req.body[at..]) {
+        Ok(a) => a,
+        Err(e) => return respond(conn, 400, &error_body(&e)),
+    };
+    let duration = audio.len() as f64 / crate::whisper::RATE as f64;
+    match l.transcribe(audio) {
+        Ok(h) => respond(conn, 200, &obj(vec![("text", str(&h.text)), ("language", str(&h.language)), ("no_speech", num(h.no_speech)), ("duration", num(duration))])),
+        Err(e) => respond(conn, 500, &error_body(&e)),
+    }
+}
+
+/// One piece of a chunked response.
+fn write_chunk(conn: &mut TcpStream, bytes: &[u8]) -> Result<(), String> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    conn.write_all(format!("{:x}\r\n", bytes.len()).as_bytes()).and_then(|()| conn.write_all(bytes)).and_then(|()| conn.write_all(b"\r\n")).map_err(|e| e.to_string())
+}
+
 fn respond_page(conn: &mut TcpStream, token: &str) -> Result<(), String> {
     let page = include_str!("chat.html").replace("__GHOST_TOKEN__", token);
     respond_file(conn, page.as_bytes(), "text/html; charset=utf-8", "no-store")
@@ -651,9 +1197,9 @@ fn sse(conn: &mut TcpStream, data: &str) -> std::io::Result<()> {
 fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Result<(), String> {
     let req = read_request(&mut conn)?;
     let created = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let (current, loading) = {
+    let (current, for_call, together, loading) = {
         let s = shared.status.lock().unwrap();
-        (s.current.clone(), s.loading.clone())
+        (s.current.clone(), s.for_call(), s.together, s.loading.clone())
     };
     let (defaults, think_default) = (shared.defaults, shared.think_default);
     // the agent tools and their settings: private to the chat page on this computer
@@ -661,7 +1207,14 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
     if req.method == "GET" && req.path.starts_with("/preview/") {
         return respond_preview(&mut conn, &req, &req.path["/preview/".len()..]);
     }
-    if ["/api/tools", "/api/harness", "/api/chats", "/api/agent", "/api/memory", "/api/quit", "/api/skills", "/api/mcp", "/api/instructions", "/api/background", "/api/schedules", "/api/downloads"].iter().any(|p| path.starts_with(p)) {
+    // speech has a model of its own: it answers whether or not a language model runs
+    if path == "/v1/audio/speech" {
+        return speech_request(&mut conn, &req, shared);
+    }
+    if path == "/v1/audio/transcriptions" {
+        return transcription_request(&mut conn, &req, shared);
+    }
+    if ["/api/tools", "/api/harness", "/api/chats", "/api/agent", "/api/memory", "/api/maya", "/api/quit", "/api/skills", "/api/mcp", "/api/instructions", "/api/background", "/api/schedules", "/api/downloads"].iter().any(|p| path.starts_with(p)) {
         if let Err(e) = tools_allowed(&req, &conn, &shared.token) {
             return respond_private(&mut conn, 403, &error_body(e));
         }
@@ -749,15 +1302,36 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
                 }
             }
             // one reply of the agent, streamed as events (see agent.rs)
+            // (Maya talks with the call model)
             ("POST", "/api/agent") => {
-                let Some(l) = current.clone().filter(|_| loading.is_none()) else {
+                let b = match body() {
+                    Ok(b) => b,
+                    Err(e) => return respond_private(&mut conn, 400, &error_body(&e)),
+                };
+                let maya = b.get("persona").and_then(Json::as_str) == Some("maya");
+                let Some(l) = (if maya { for_call.clone() } else { current.clone() }).filter(|_| loading.is_none()) else {
                     return respond_private(&mut conn, 503, &error_body("no model is running yet; try again in a moment"));
                 };
-                match body() {
-                    Ok(b) => agent::run(&mut conn, &b, work, shared, &l),
+                agent::run(&mut conn, &b, work, shared, &l)
+            }
+            // Maya, the voice call's companion (maya.rs): what she remembers; after a call {"chat", "seconds"?}, she
+            // thinks it over; reset: strangers again
+            ("GET", "/api/maya") => respond_private(&mut conn, 200, &maya::status()),
+            ("POST", "/api/maya/reflect") => {
+                let Some(l) = for_call.clone().filter(|_| loading.is_none()) else {
+                    return respond_private(&mut conn, 503, &error_body("no model is running yet; try again in a moment"));
+                };
+                let b = body().unwrap_or(Json::Null);
+                let chat = b.get("chat").and_then(Json::as_str).unwrap_or("");
+                match maya::reflect(chat, b.get("seconds").and_then(Json::as_f64), work, shared, &l) {
+                    Ok(j) => respond_private(&mut conn, 200, &j),
                     Err(e) => respond_private(&mut conn, 400, &error_body(&e)),
                 }
             }
+            ("POST", "/api/maya/reset") => match maya::reset() {
+                Ok(()) => respond_private(&mut conn, 200, &maya::status()),
+                Err(e) => respond_private(&mut conn, 500, &error_body(&e)),
+            },
             // {"id": ..., "decision": "once" | "always" | "deny"}: the user's answer to an approval event
             ("POST", "/api/agent/approve") => {
                 let b = body().unwrap_or(Json::Null);
@@ -860,6 +1434,10 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
     match (req.method.as_str(), req.path.trim_end_matches('/')) {
         // the models folder, for the chat page's model picker
         ("GET", "/api/models") => {
+            let (voice_names, voice_on) = {
+                let v = shared.voice.lock().unwrap();
+                (v.names(), v.loaded())
+            };
             let models = list_models(&shared.dirs)
                 .into_iter()
                 .map(|(id, _, size)| obj(vec![("id", str(&id)), ("size", num(size as f64))]))
@@ -874,6 +1452,19 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
                 ("thinking", Json::Bool(current.as_ref().is_some_and(|c| c.thinking))),
                 // Qwen3 also reads "/no_think" in a message as switching thinking off; GLM does not
                 ("no_think_tag", Json::Bool(current.as_ref().is_some_and(|c| c.thinking && !c.glm))),
+                ("about", current.as_ref().map(|c| c.about.clone()).unwrap_or(Json::Null)),
+                // the speech model (--tts), whose voice the chat page can read replies in
+                ("speech", voice_names.0.as_deref().map_or(Json::Null, str)),
+                // and the speech-to-text model (--stt): with both, the app offers voice calls
+                ("listen", voice_names.1.as_deref().map_or(Json::Null, str)),
+                // whether they are loaded now (they load with a model, when asked: /api/models/load "voice")
+                ("voice", Json::Bool(voice_on)),
+                // the model a call talks to now (loaded, with the voice): a call model kept beside the chat
+                // model, or the chat model itself
+                ("call_model", opt(voice_on.then(|| for_call.as_ref().map(|c| c.id.as_str())).flatten())),
+                ("call_context_length", for_call.as_ref().filter(|_| voice_on).map(|c| num(c.ctx as f64)).unwrap_or(Json::Null)),
+                // the chat model and the call model (with the voice) both loaded: switching between them is free
+                ("together", Json::Bool(together)),
                 ("models", Json::Arr(models)),
             ]);
             return respond(&mut conn, 200, &body);
@@ -894,19 +1485,32 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
             let body = obj(vec![("done", num(done as f64)), ("total", num(total as f64)), ("disk_ms", num(disk_ms as f64)), ("disk", Json::Bool(disk))]);
             return respond(&mut conn, 200, &body);
         }
-        // {"id": "<file name without .gguf>"}: answers once the switch is done (it can take a minute)
+        // {"id": "<file name without .gguf>", "voice": true / false (the voice models loaded beside it, or not; left
+        // as they are without it)}; or {"id", "call": "<model for voice calls, may be the same>", "for_call": bool}:
+        // both kept loaded with the voice when they all fit, else the call model with the voice (for_call) or the
+        // model alone. Answers once the switch is done (it can take a minute)
         ("POST", "/api/models/load") => {
-            let id = std::str::from_utf8(&req.body).map_err(|e| e.to_string()).and_then(Json::parse).ok().and_then(|b| b.get("id").and_then(Json::as_str).map(String::from));
-            let Some(id) = id else { return respond(&mut conn, 400, &error_body("send {\"id\": \"<model>\"}")) };
-            let Some((_, path, _)) = list_models(&shared.dirs).into_iter().find(|m| m.0 == id) else {
+            let b = std::str::from_utf8(&req.body).map_err(|e| e.to_string()).and_then(Json::parse).ok();
+            let field = |k: &str| b.as_ref().and_then(|b| b.get(k)).cloned();
+            let Some(id) = field("id").and_then(|v| v.as_str().map(String::from)) else { return respond(&mut conn, 400, &error_body("send {\"id\": \"<model>\"}")) };
+            let models = list_models(&shared.dirs);
+            let find = |id: &str| models.iter().find(|m| m.0 == id).map(|m| m.1.clone());
+            let missing = |id: &str| {
                 let dirs: Vec<String> = shared.dirs.iter().map(|d| d.display().to_string()).collect();
-                return respond(&mut conn, 404, &error_body(&format!("no {id}.gguf in {}", dirs.join(" or "))));
+                error_body(&format!("no {id}.gguf in {}", dirs.join(" or ")))
             };
+            let Some(path) = find(&id) else { return respond(&mut conn, 404, &missing(&id)) };
+            let mut plan = Plan::one(path, field("voice").and_then(|v| v.as_bool()));
+            if let Some(call) = field("call").and_then(|v| v.as_str().map(String::from)) {
+                let Some(p) = find(&call) else { return respond(&mut conn, 404, &missing(&call)) };
+                plan.call = Some(p);
+                plan.for_call = field("for_call").and_then(|v| v.as_bool()).unwrap_or(false);
+            }
             if let Some(l) = &loading {
                 return respond(&mut conn, 409, &error_body(&format!("{l} is loading; wait for it")));
             }
             let (tx, done) = mpsc::channel();
-            work.send(Work::Load(path, tx)).map_err(|_| "the model thread stopped")?;
+            work.send(Work::Load(plan, tx)).map_err(|_| "the model thread stopped")?;
             return match done.recv() {
                 Ok(Ok(())) => respond(&mut conn, 200, &obj(vec![("current", str(&id))])),
                 Ok(Err(e)) => respond(&mut conn, 500, &error_body(&e)),
@@ -916,7 +1520,7 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
         _ => {}
     }
     // everything else needs a running model
-    let Some(Loaded { id: model_id, ctx, chat_ok, default_system, thinking, glm, coder, .. }) = current.filter(|_| loading.is_none()) else {
+    let Some(Loaded { id: model_id, ctx, chat_ok, default_system, thinking, glm, mistral, llama3, coder, .. }) = current.filter(|_| loading.is_none()) else {
         if matches!(req.path.trim_end_matches('/'), "/v1/chat/completions" | "/v1/completions" | "/v1/models") {
             let msg = match loading.as_deref() {
                 Some(what) => format!("loading {what}; try again in a moment"),
@@ -960,10 +1564,12 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
         Ok(b) => b,
         Err(e) => return respond(&mut conn, 400, &error_body(&format!("request body: {e}"))),
     };
-    let prompt = match (chat, glm) {
-        (true, true) => chat_prompt_glm(&body, think_default, thinking),
-        (true, false) => chat_prompt(&body, default_system, think_default, thinking, coder),
-        (false, _) => completion_prompt(&body),
+    let prompt = match (chat, glm, mistral) {
+        (true, true, _) => chat_prompt_glm(&body, think_default, thinking),
+        (true, _, true) => chat_prompt_mistral(&body),
+        (true, ..) if llama3 => chat_prompt_llama3(&body),
+        (true, false, false) => chat_prompt(&body, default_system, think_default, thinking, coder),
+        (false, ..) => completion_prompt(&body),
     };
     let prompt = match prompt {
         Ok(p) => p,
@@ -988,6 +1594,13 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
         top_k: f("top_k").map(|k| k as usize).unwrap_or(defaults.1),
         top_p: f("top_p").map(|p| p as f32).unwrap_or(defaults.2),
         seed: f("seed").map(|s| s as u64).unwrap_or_else(|| SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1)),
+        style: Style {
+            presence: f("presence_penalty").unwrap_or(0.0) as f32,
+            dry: f("dry_multiplier").unwrap_or(0.0) as f32,
+            sentences: f("max_sentences").unwrap_or(0.0) as usize,
+            spoken: false,
+            repetition: f("repetition_penalty").unwrap_or(1.0) as f32,
+        },
         stop,
         lead,
         events: tx,
@@ -1531,6 +2144,116 @@ fn chat_prompt_glm(body: &Json, think_default: bool, switch: bool) -> Result<Str
     Ok(s)
 }
 
+/// `chat_prompt` for Mistral's format (Mistral Nemo and its merges, as Ayla), as Nemo's template writes it:
+/// `[INST]user[/INST]reply</s>`, turns strictly taking turns (a run of messages from one side is one turn),
+/// the system prompt in front of the last user turn, and no tools: their results are read as the user's
+/// text and earlier calls are left out. The tokenizer adds the <s> in front.
+fn chat_prompt_mistral(body: &Json) -> Result<String, String> {
+    let messages = body.get("messages").and_then(Json::as_array).ok_or("messages must be a list")?;
+    if messages.is_empty() {
+        return Err("messages is empty".into());
+    }
+    let mut system = Vec::new();
+    let mut turns: Vec<(bool, Vec<String>)> = Vec::new(); // (the user's, its messages)
+    for m in messages {
+        let text = content_text(m.get("content"))?;
+        let (user, text) = match m.get("role").and_then(Json::as_str) {
+            Some("system" | "developer") => {
+                system.push(text);
+                continue;
+            }
+            Some("user") => (true, text),
+            Some("tool") => (true, format!("Tool result:\n{text}")),
+            // earlier replies without their reasoning
+            Some("assistant") => (false, text.rsplit("</think>").next().unwrap_or(&text).to_string()),
+            Some(other) => return Err(format!("unknown message role {other}")),
+            None => return Err("a message has no role".into()),
+        };
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            continue;
+        }
+        match turns.last_mut() {
+            Some((u, texts)) if *u == user => texts.push(text),
+            _ => turns.push((user, vec![text])),
+        }
+    }
+    let system = system.join("\n\n");
+    let last_user = turns.iter().rposition(|(u, _)| *u);
+    if last_user.is_none() && !system.is_empty() {
+        turns.push((true, Vec::new()));
+    }
+    let last_user = turns.iter().rposition(|(u, _)| *u);
+    let mut s = String::new();
+    for (i, (user, texts)) in turns.iter().enumerate() {
+        let text = texts.join("\n\n");
+        if !user {
+            s.push_str(&format!("{text}</s>"));
+        } else if Some(i) == last_user && !system.is_empty() {
+            s.push_str(&format!("[INST]{}[/INST]", if text.is_empty() { system.clone() } else { format!("{system}\n\n{text}") }));
+        } else {
+            s.push_str(&format!("[INST]{text}[/INST]"));
+        }
+    }
+    Ok(s)
+}
+
+/// `chat_prompt` for Llama 3's format, as its template writes it: each message
+/// `<|start_header_id|>role<|end_header_id|>\n\ntext<|eot_id|>`, the system prompts first as one, then the
+/// reply's header. No tools: their results are read as the user's text and earlier calls are left out. The
+/// tokenizer adds <|begin_of_text|> in front.
+fn chat_prompt_llama3(body: &Json) -> Result<String, String> {
+    let messages = body.get("messages").and_then(Json::as_array).ok_or("messages must be a list")?;
+    if messages.is_empty() {
+        return Err("messages is empty".into());
+    }
+    let mut system = Vec::new();
+    let mut turns = String::new();
+    for m in messages {
+        let text = content_text(m.get("content"))?;
+        let (role, text) = match m.get("role").and_then(Json::as_str) {
+            Some("system" | "developer") => {
+                system.push(text.trim().to_string());
+                continue;
+            }
+            Some("user") => ("user", text),
+            Some("tool") => ("user", format!("Tool result:\n{text}")),
+            // earlier replies without their reasoning
+            Some("assistant") => ("assistant", text.rsplit("</think>").next().unwrap_or(&text).to_string()),
+            Some(other) => return Err(format!("unknown message role {other}")),
+            None => return Err("a message has no role".into()),
+        };
+        let text = text.trim();
+        if !text.is_empty() {
+            turns.push_str(&format!("<|start_header_id|>{role}<|end_header_id|>\n\n{text}<|eot_id|>"));
+        }
+    }
+    system.retain(|s| !s.is_empty());
+    let mut s = String::new();
+    if !system.is_empty() {
+        s.push_str(&format!("<|start_header_id|>system<|end_header_id|>\n\n{}<|eot_id|>", system.join("\n\n")));
+    }
+    s.push_str(&turns);
+    s.push_str(LLAMA3_REPLY_HEAD);
+    Ok(s)
+}
+
+/// How a Llama 3 prompt ends: the reply's header.
+const LLAMA3_REPLY_HEAD: &str = "<|start_header_id|>assistant<|end_header_id|>\n\n";
+
+/// A chat request's prompt in the loaded model's format.
+fn chat_prompt_for(loaded: &Loaded, body: &Json, think_default: bool) -> Result<String, String> {
+    if loaded.glm {
+        chat_prompt_glm(body, think_default, loaded.thinking)
+    } else if loaded.mistral {
+        chat_prompt_mistral(body)
+    } else if loaded.llama3 {
+        chat_prompt_llama3(body)
+    } else {
+        chat_prompt(body, loaded.default_system.as_deref(), think_default, loaded.thinking, loaded.coder)
+    }
+}
+
 /// One piece of a reply, once tool calls are split out of the text.
 #[derive(Debug, PartialEq)]
 enum Part {
@@ -1935,6 +2658,27 @@ mod tests {
             let plain = chat_prompt(&body(r#",{"role":"user","content":"Name this chat"}"#), None, true, switch, coder).unwrap();
             assert!(!plain.starts_with(start));
         }
+    }
+
+    #[test]
+    fn mistral_prompt() {
+        // the system prompt in front of the last user turn, replies closed with </s>, a side's run of messages one turn
+        let body = Json::parse(r#"{"messages":[{"role":"system","content":"Be Maya."},{"role":"user","content":"hey"},{"role":"assistant","content":"<think>x</think>Hi!"},{"role":"user","content":"long day"},{"role":"user","content":"ugh"}]}"#).unwrap();
+        assert_eq!(chat_prompt_mistral(&body).unwrap(), "[INST]hey[/INST]Hi!</s>[INST]Be Maya.\n\nlong day\n\nugh[/INST]");
+        let only = Json::parse(r#"{"messages":[{"role":"system","content":"Say hi."}]}"#).unwrap();
+        assert_eq!(chat_prompt_mistral(&only).unwrap(), "[INST]Say hi.[/INST]");
+        assert_eq!(recent_replies("[INST]a[/INST]one</s>[INST]b[/INST]two</s>[INST]c[/INST]", 5), vec!["one", "two"]);
+    }
+
+    #[test]
+    fn llama3_prompt() {
+        let body = Json::parse(r#"{"messages":[{"role":"system","content":"Be Maya."},{"role":"user","content":"hey"},{"role":"assistant","content":"<think>x</think>Hi!"},{"role":"user","content":"long day"}]}"#).unwrap();
+        let p = chat_prompt_llama3(&body).unwrap();
+        assert_eq!(
+            p,
+            "<|start_header_id|>system<|end_header_id|>\n\nBe Maya.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nhey<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nHi!<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nlong day<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+        );
+        assert_eq!(recent_replies(&p, 5), vec!["Hi!"]);
     }
 
     #[test]

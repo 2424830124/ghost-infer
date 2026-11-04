@@ -129,13 +129,15 @@
   .dock > * { width: var(--column); margin: 0 auto; }
   .perch { position: relative; height: 62px; }
   canvas#ghost { position: absolute; left: 0; bottom: -10px; width: 160px; height: 120px; display: block; }
+  /* the pixel ghost: 24x22 pixels drawn three times over, with hard edges */
+  canvas#pixelGhost { position: absolute; left: 10px; bottom: -3px; width: 72px; height: 66px; display: block; image-rendering: pixelated; image-rendering: crisp-edges; }
+  body[data-ghost="pixel"] canvas#ghost, body:not([data-ghost="pixel"]) canvas#pixelGhost { display: none; }
   .status { position: absolute; left: 92px; bottom: 14px; display: inline-flex; align-items: center; gap: 8px; font-size: 13.5px; color: var(--muted); white-space: nowrap; transition: opacity 0.2s; }
   .status i { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 8px var(--accent); }
   .status.quiet { opacity: 0; }
   .status.error { color: var(--danger); }
   .status.error i { background: var(--danger); box-shadow: 0 0 8px var(--danger); }
   .speed { color: var(--text); font-variant-numeric: tabular-nums; }
-  body.noghost .status { left: 4px; }
   .composer { position: relative; pointer-events: auto; border-radius: 22px; background: var(--raise); border: 1px solid var(--line-2); box-shadow: 0 16px 40px -18px rgba(0, 0, 0, 0.8); }
   .composer:focus-within { border-color: rgba(185, 199, 255, 0.4); }
   .composer textarea { display: block; width: 100%; border: 0; outline: none; resize: none; background: transparent; min-height: 52px; max-height: 40vh; padding: 14px 18px 4px; line-height: 1.55; }
@@ -176,6 +178,10 @@
   .field textarea { background: var(--bg); border: 1px solid var(--line-2); border-radius: 10px; padding: 8px 10px; resize: vertical; min-height: 64px; font-size: 14px; }
   .field small, .check small { color: var(--muted); font-size: 12.5px; line-height: 1.45; }
   .check { display: flex; gap: 10px; align-items: flex-start; font-size: 14px; }
+  .seg { display: inline-flex; gap: 2px; padding: 3px; border-radius: 10px; background: var(--bg); border: 1px solid var(--line-2); justify-self: start; }
+  .seg button { border: 0; background: none; color: var(--muted); padding: 4px 14px; border-radius: 7px; font-size: 13.5px; }
+  .seg button:hover { color: var(--text); }
+  .seg button[aria-checked="true"] { background: var(--accent-soft); color: var(--accent); }
   .check input { accent-color: var(--accent); margin-top: 4px; }
   .scrim { display: none; }
 
@@ -208,18 +214,24 @@
   <div class="machine">
     <button type="button" id="settingsBtn" aria-expanded="false">
       <svg width="18" height="18" viewBox="0 0 20 20" aria-hidden="true"><path d="M4 6h8M15 6h1M4 14h1M8 14h8" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/><circle cx="13.5" cy="6" r="2" fill="none" stroke="currentColor" stroke-width="1.7"/><circle cx="6.5" cy="14" r="2" fill="none" stroke="currentColor" stroke-width="1.7"/></svg>
-      Reply settings
+      Settings
     </button>
   </div>
 </aside>
 <div class="scrim" id="scrim"></div>
 
 <section class="settings" id="settings" aria-label="Settings">
-  <h2>Reply settings</h2>
-  <label class="field"><span class="row"><span>Temperature</span><span id="tempVal"></span></span><input type="range" id="temp" min="0" max="2" step="0.1" value="0"><small>0 gives the same answer every time and is fastest (it uses the draft model if the server has one).</small></label>
+  <h2>Settings</h2>
+  <div class="field"><span class="row"><span>Ghost</span></span>
+    <div class="seg" id="ghostStyle" role="radiogroup" aria-label="Ghost style">
+      <button type="button" role="radio" data-style="3d">3D</button><button type="button" role="radio" data-style="pixel">Pixel</button>
+    </div>
+    <small>Pixel needs no 3D graphics, so it is lighter on a slow computer.</small></div>
+  <label class="field"><span class="row"><span>Temperature</span><span id="tempVal"></span></span><input type="range" id="temp" min="0" max="2" step="0.1" value="0.6"><small>0.6 suits most models. 0 always picks the likeliest word: the same answer every time, but thinking models can then repeat themselves without end.</small></label>
   <label class="field"><span class="row"><span>Longest reply</span><span id="maxVal"></span></span><input type="range" id="maxTokens" min="64" max="8192" step="64" value="2048"></label>
   <label class="field"><span class="row"><span>System prompt</span></span><textarea id="system" placeholder="Leave empty to use the model's default"></textarea></label>
   <label class="check"><input type="checkbox" id="moods" checked><span>Let the model set the ghost's mood<br><small>It starts replies with a hidden tag such as [happy]. Turn off for models that don't follow it.</small></span></label>
+  <label class="check" id="speakRow" style="margin-top: 12px; display: none"><input type="checkbox" id="speak"><span>Speak replies aloud<br><small id="speakNote">Each sentence is read out as soon as it is written.</small></span></label>
   <label class="check" style="margin-top: 12px"><input type="checkbox" id="tools" checked><span>Let the model use tools<br><small>It asks you first before it changes a file, runs a command or goes online.</small></span></label>
   <div class="toolgroups">
     <label class="check"><input type="checkbox" id="tg_files" checked><span>Read files</span></label>
@@ -240,6 +252,7 @@
   <div class="dock" id="dock">
     <div class="perch">
       <canvas id="ghost" aria-hidden="true"></canvas>
+      <canvas id="pixelGhost" width="24" height="22" aria-hidden="true"></canvas>
       <span class="status quiet" id="status"><i></i><span id="statusText"></span><span class="speed" id="speed"></span></span>
     </div>
     <form class="composer" id="form">
@@ -271,8 +284,9 @@ const $ = (id) => document.getElementById(id);
 
 // ================================================================ the ghost
 // A small 3D ghost drawn in code (three.js), sitting on the message box: every state is a set of pose targets the
-// animation eases toward, so changes always blend. ghost.set(state), ghost.token() on each streamed token, ghost.rate(tok/s).
-const ghost = await (async () => {
+// animation eases toward, so changes always blend. set(state), token() on each streamed token, rate(tok/s).
+// Made only when the 3D style is chosen (three.js is not even loaded otherwise); null without WebGL.
+async function make3d() {
   let THREE;
   try { THREE = await import("three"); } catch { return null; }
   const canvas = $("ghost");
@@ -450,6 +464,7 @@ const ghost = await (async () => {
   const ease = (a, b, k) => a + (b - a) * k;
   const clock = new THREE.Clock();
   function frame() {
+    if (document.body.dataset.ghost !== "3d") { clock.getDelta(); requestAnimationFrame(frame); return; } // the pixel ghost is shown
     const dt = Math.min(clock.getDelta(), 0.05), t = clock.elapsedTime, k = 1 - Math.pow(0.0015, dt);
     for (const key of ["eyeOpen", "lookX", "lookY", "lean", "tilt", "glow", "blush", "height", "prop", "hem", "opacity", "bob", "heat", "mouthO"]) cur[key] = ease(cur[key], target[key], k);
     for (const key of ["arms", "armLift", "front", "brow"]) cur[key].forEach((v, i) => (cur[key][i] = ease(v, target[key][i], k)));
@@ -551,6 +566,7 @@ const ghost = await (async () => {
     requestAnimationFrame(frame);
   }
   new ResizeObserver(() => {
+    if (!canvas.clientWidth) return; // hidden
     renderer.setSize(canvas.clientWidth, canvas.clientHeight, false);
     camera.aspect = canvas.clientWidth / canvas.clientHeight;
     camera.updateProjectionMatrix();
@@ -567,8 +583,154 @@ const ghost = await (async () => {
     token() { lastTokenAt = clock.elapsedTime; },
     rate(r) { rate = r; },
   };
-})();
+}
 
+// ================================================================ the pixel ghost
+// The same ghost as pixel art on a 2D canvas, with the same moods and the same set / token / rate. A hand-drawn
+// 14x14 body on a 24x22 canvas, leaving room above and to the right for signs and props; it moves in steps a few
+// times a second, like an old game sprite.
+function makePixel(canvas) {
+  const ctx = canvas.getContext("2d");
+  const W = 24, H = 22, OX = 3, OY = 6;
+  const PAL = { o: "#0b0e17", w: "#e8ebf3", s: "#aeb6cc", h: "#ffffff", e: "#121726", b: "#ff9db5", a: "#b9c7ff", A: "#7f8cc4", t: "#8fc0ff", y: "#ffc98a", p: "#8e96ab" };
+  const TOP = ["....wwwwww....", "..wwwwwwwwww..", ".wwwwwwwwwwww.", ".wwwwwwwwwwww.", ...Array(8).fill("wwwwwwwwwwwwww")];
+  const HEM = [["wwww..wwww..ww", ".ww....ww....w"], ["ww..wwww..wwww", "w....ww....ww."]]; // two frames: it wiggles
+  const bodies = HEM.map((hem) => [...TOP, ...hem].map((r) => [...r].map((ch) => ch === "w")));
+  const SIGN = { // little pictures above its head, row by row
+    "!": ["y", "y", "y", ".", "y"],
+    "?": [".yy.", "y..y", "..y.", "....", "..y."],
+    z: ["aaa", "..a", ".a.", "aaa"],
+  };
+  const reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const pointer = { x: 0, y: 0 };
+  addEventListener("pointermove", (e) => {
+    const r = canvas.getBoundingClientRect();
+    pointer.x = Math.max(-1, Math.min(1, (e.clientX - (r.left + r.width / 2)) / 300));
+    pointer.y = Math.max(-1, Math.min(1, (e.clientY - (r.top + r.height / 2)) / 200));
+  });
+  let state = "idle", setAt = 0, lastTokenAt = -1e9, blinkAt = 2500, glanceAt = 5000, glance = 0;
+
+  function paint(now) {
+    const since = now - setAt;
+    const step = Math.floor(now / (reduced ? 900 : 420)); // the sprite's clock
+    const speaking = now - lastTokenAt < 350 && !["thinking", "tool", "sleepy"].includes(state);
+    const syllable = speaking && Math.floor(now / 110) % 2; // mouth open, about 4.5 times a second
+    const g = Array.from({ length: H }, () => Array(W).fill(null));
+    const put = (x, y, c) => { if (x >= 0 && y >= 0 && x < W && y < H) g[y][x] = c; };
+
+    // where the body sits: a one-pixel bob; sinking when low, hopping when glad, shaking when shocked or angry
+    let dx = 0, dy = Math.floor(now / (state === "sleepy" ? 1100 : 420)) % 2;
+    if (["sleepy", "sad"].includes(state)) dy += 2;
+    if (["sorry", "shy"].includes(state)) dy += 1;
+    if (state === "proud") dy -= 1;
+    if (!reduced) {
+      if (state === "happy" || state === "wave") dy -= [0, 1, 2, 1][Math.floor(now / 200) % 4];
+      if (state === "excited") dy -= [0, 1, 2, 1][Math.floor(now / 120) % 4];
+      if ((state === "shocked" && since < 600) || (state === "angry" && Math.floor(now / 70) % 6 < 2)) dx = Math.floor(now / 50) % 2 ? 1 : -1;
+    }
+    const B = (x, y, c) => put(OX + dx + x, OY + dy + y, c); // in body coordinates
+    const sign = (k, x, y) => SIGN[k].forEach((row, j) => [...row].forEach((c, i) => c !== "." && put(OX + x + i, OY + dy + y + j, c)));
+
+    // body, shaded on its right and bottom edges, with a shine
+    const m = bodies[step % 2];
+    for (let y = 0; y < m.length; y++) for (let x = 0; x < 14; x++) if (m[y][x]) {
+      const edge = !m[y][x + 1] || !(m[y + 1] && m[y + 1][x]);
+      B(x, y, edge ? "s" : "w");
+    }
+    B(3, 1, "h"); B(2, 2, "h");
+
+    // where it looks: at the pointer when idle or listening, with a glance now and then
+    if (now > glanceAt) { glance = glance ? 0 : Math.random() < 0.5 ? -1 : 1; glanceAt = now + (glance ? 900 : 4000 + Math.random() * 4000); }
+    const follow = ["idle", "listening"].includes(state);
+    const lx = follow ? (glance || Math.round(pointer.x)) : 0;
+    const eye = (x, y, h = 2, shine = true) => {
+      for (let i = 0; i < h; i++) { B(x, y + i, "e"); B(x + 1, y + i, "e"); }
+      if (shine) B(x + (lx > 0 ? 1 : 0), y, "h");
+    };
+    const eyes = (y = 4, h = 2, shine = true, look = lx) => { eye(3 + look, y, h, shine); eye(9 + look, y, h, shine); };
+    const px = (list, c = "e") => list.forEach(([x, y]) => B(x, y, c));
+    const arcs = (look = 0) => px([[2 + look, 5], [3 + look, 4], [4 + look, 5], [8 + look, 5], [9 + look, 4], [10 + look, 5]]);
+    const lines = (y = 5) => px([[3, y], [4, y], [9, y], [10, y]]);
+    const blush = (wide = false) => { px([[1, 7], [12, 7]], "b"); if (wide) px([[2, 7], [11, 7]], "b"); };
+    const smile = () => px([[5, 7], [6, 8], [7, 8], [8, 7]]);
+    const talk = () => { px([[6, 8], [7, 8]]); if (syllable) px([[6, 9], [7, 9]]); };
+    const magnifier = () => { px([[15, 3], [16, 2], [17, 2], [18, 3], [18, 4], [17, 5], [16, 5], [15, 4]], "a"); if (step % 3) B(16, 3, "h"); px([[14, 6], [13, 7]], "A"); };
+    if (now > blinkAt + 140) blinkAt = now + 2500 + Math.random() * 3500;
+    const blinking = now > blinkAt && ["idle", "listening", "talking", "tool", "curious", "serious", "surprised"].includes(state);
+
+    switch (state) {
+      case "listening": blinking ? lines(6) : eyes(5); break; // looking down at the box
+      case "thinking":
+        eyes(3, 2, false, 1);
+        for (let i = 0; i < 3; i++) if (step % 4 > i) put(OX + 13 + i * 2, OY + dy - 2, "a");
+        break;
+      case "talking": blinking ? lines() : eyes(); talk(); break;
+      case "cheerful": arcs(); blush(); syllable ? px([[5, 7], [6, 8], [7, 8], [8, 7], [6, 9], [7, 9]]) : smile(); break;
+      case "tool": blinking ? lines() : eyes(4, 2, false, 1); magnifier(); break;
+      case "curious":
+        eye(4, 4, 2, false); eye(10, 3, 3, false); px([[10, 1], [11, 1]]);
+        magnifier();
+        break;
+      case "happy": arcs(); blush(); smile(); break;
+      case "excited":
+        arcs(); blush(); px([[5, 7], [6, 8], [7, 8], [8, 7], [6, 7], [7, 7]]);
+        [[15, -1], [17, 2], [-2, 1], [16, 6], [-1, 6]].forEach(([x, y], i) => (step + i) % 3 === 0 && put(OX + dx + x, OY + dy + y, "y"));
+        break;
+      case "surprised": blinking ? lines() : eyes(3, 3); px([[6, 9], [7, 9]]); break;
+      case "shocked":
+        eyes(3, 3); px([[6, 8], [7, 8], [6, 9], [7, 9]]);
+        if (since < 2500) sign("!", 16, -5);
+        break;
+      case "sorry": lines(); px([[3, 3], [4, 2], [9, 2], [10, 3], [6, 9], [7, 9]]); break;
+      case "sad":
+        lines(); px([[3, 3], [4, 2], [9, 2], [10, 3], [5, 9], [6, 8], [7, 8], [8, 9]]);
+        B(3, 6 + (step % 4), "t");
+        break;
+      case "shy": arcs(-1); blush(true); px([[6, 9]]); break;
+      case "proud": px([[3, 3], [4, 3], [9, 3], [10, 3]]); lines(5); smile(); blush(); break;
+      case "angry":
+        px([[3, 2], [4, 3], [9, 3], [10, 2], [3, 4], [4, 4], [9, 4], [10, 4], [5, 9], [6, 8], [7, 8], [8, 9]]);
+        if (step % 2) { put(OX + dx + 1, OY + dy - 2, "p"); put(OX + dx + 2, OY + dy - 3, "p"); } else { put(OX + dx + 12, OY + dy - 2, "p"); put(OX + dx + 11, OY + dy - 3, "p"); }
+        break;
+      case "serious": px([[3, 3], [4, 3], [9, 3], [10, 3]]); blinking ? lines() : eyes(4, 2, false); px([[5, 8], [6, 8], [7, 8], [8, 8]]); break;
+      case "confused":
+        px([[3, 5], [4, 5], [9, 2], [10, 2]]); eye(9, 4, 2, false); px([[5, 9], [6, 8], [7, 9], [8, 8]]);
+        if (since < 3000 || step % 4 < 2) sign("?", 15, -5);
+        break;
+      case "sleepy": lines(); if (step % 6 < 4) sign("z", 15, step % 6 > 1 ? -4 : -3); break;
+      case "wave":
+        arcs(); blush(); smile();
+        px(Math.floor(now / 180) % 2 ? [[14, 6], [15, 5], [16, 4], [16, 3]] : [[14, 6], [15, 5], [16, 5], [17, 4]], "w");
+        break;
+      default: blinking ? lines() : eyes(); // idle
+    }
+
+    // outline: every empty pixel touching the ghost (body, face or arm), not the props and signs
+    const solid = (x, y) => g[y] && ["w", "s", "h", "b", "e"].includes(g[y][x]);
+    const edge = [];
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++)
+      if (!g[y][x] && (solid(x - 1, y) || solid(x + 1, y) || solid(x, y - 1) || solid(x, y + 1))) edge.push([x, y]);
+    edge.forEach(([x, y]) => (g[y][x] = "o"));
+
+    ctx.clearRect(0, 0, W, H);
+    ctx.globalAlpha = ["sad", "sleepy"].includes(state) ? 0.8 : state === "sorry" ? 0.9 : 1;
+    const pal = state === "angry" ? { ...PAL, s: "#f0a196" } : PAL;
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) if (g[y][x]) { ctx.fillStyle = pal[g[y][x]]; ctx.fillRect(x, y, 1, 1); }
+  }
+  // repaint at most 20 times a second, and only while the pixel ghost is the one shown
+  let last = -1;
+  function frame(now) {
+    if (document.body.dataset.ghost === "pixel" && now - last > 50) { last = now; paint(now); }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+  return {
+    get state() { return state; },
+    set(s) { if (s !== state) { state = s; setAt = performance.now(); } },
+    token() { lastTokenAt = performance.now(); },
+    rate() {},
+  };
+}
 
 // ================================================================ conversations
 const store = {
@@ -632,7 +794,7 @@ for (const ev of ["pointermove", "keydown", "pointerdown", "wheel"]) addEventLis
 
 // ---- settings, kept in this browser
 const think = $("think");
-const prefs = { temp: ["temp", 0], maxTokens: ["maxTokens", 2048], system: ["system", ""], moods: ["moods", true], tools: ["tools", true],
+const prefs = { temp: ["temp", 0.6], maxTokens: ["maxTokens", 2048], system: ["system", ""], moods: ["moods", true], speak: ["speak", false], tools: ["tools", true],
   tg_files: ["tg_files", true], tg_edit: ["tg_edit", true], tg_cmd: ["tg_cmd", true], tg_web: ["tg_web", true] };
 for (const [id, [key, d]] of Object.entries(prefs)) {
   const el = $(id), v = store.get(key, d);
@@ -646,9 +808,31 @@ function showSettings() {
   $("maxVal").textContent = Number($("maxTokens").value).toLocaleString() + " tokens";
 }
 showSettings();
+$("speak").addEventListener("change", () => setVoice($("speak").checked));
 function openSettings(on) { $("settings").classList.toggle("open", on); $("settingsBtn").setAttribute("aria-expanded", String(on)); }
 $("settingsBtn").onclick = (e) => { e.stopPropagation(); openSettings(!$("settings").classList.contains("open")); };
 addEventListener("click", (e) => { if (!$("settings").contains(e.target)) openSettings(false); });
+
+// ---- the ghost's style: 3D or pixel, kept in this browser; both get every mood, only the chosen one is drawn
+let ghost3d = null;
+const pixel = makePixel($("pixelGhost"));
+const ghost = {
+  get state() { return pixel.state; },
+  set(s) { pixel.set(s); ghost3d?.set(s); },
+  token() { pixel.token(); ghost3d?.token(); },
+  rate(r) { pixel.rate(r); ghost3d?.rate(r); },
+};
+async function setGhostStyle(style) {
+  document.body.dataset.ghost = style;
+  if (style === "3d" && !ghost3d) {
+    ghost3d = await make3d();
+    if (ghost3d) ghost3d.set(pixel.state);
+    else { style = "pixel"; document.body.dataset.ghost = style; $("ghostStyle").hidden = true; } // no WebGL here
+  }
+  for (const b of $("ghostStyle").children) b.setAttribute("aria-checked", String(b.dataset.style === style));
+}
+for (const b of $("ghostStyle").children) b.onclick = () => { store.set("ghostStyle", b.dataset.style); setGhostStyle(b.dataset.style); };
+await setGhostStyle(new URLSearchParams(location.search).get("ghost") || store.get("ghostStyle", "3d"));
 
 // ---- the sidebar
 const menu = (on) => document.body.classList.toggle("menu", on);
@@ -685,6 +869,7 @@ function renderChats() {
 }
 function switchTo(c) {
   if (busy) busy.abort();
+  speaker.stop();
   chat = c;
   save(); renderChats(); renderAll(); menu(false);
   $("input").focus();
@@ -711,6 +896,109 @@ const size = (n) => n >= 1e9 ? (n / 1e9).toFixed(1) + " GB" : Math.round(n / 1e6
 let model = null, loadingModel = null; // the server's model, and the one it is switching to
 let canThink = true; // the model has a thinking switch (Qwen3, GLM); others never think, so Think is hidden
 let noThinkTag = true; // the model also reads "/no_think" in a message (Qwen3)
+let about = null; // what the model is, read from its file by the server
+let speechModel = null; // the server's speech model (--tts), if it has one
+let voiceOn = false; // and it is loaded (it loads with a model, when asked, so it costs nothing until then)
+// "Speak replies aloud": the voice is loaded beside the model while it is on, and unloaded when it is off
+async function setVoice(on) {
+  if (!speechModel || !model || on === voiceOn) return;
+  $("speakNote").textContent = on ? "Loading the voice…" : "Unloading the voice…";
+  try {
+    await fetch("/api/models/load", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id: model, voice: on }) });
+  } catch {}
+  await refreshModels();
+}
+
+// ---- spoken replies: finished sentences go to the speech model one after another (/v1/audio/speech),
+// come back as 16-bit samples while they are made, and play back to back. A chat's id is the speech's
+// conversation, so the voice carries on from the sentences before.
+const speaker = {
+  ctx: null, at: 0, queue: [], running: false, ctrl: null, gen: 0, sources: [],
+  // on a click (browsers start audio only after one)
+  unlock() { this.ctx ||= new AudioContext(); this.ctx.resume(); },
+  say(text, conversation) { this.queue.push({ text, conversation }); this.run(); },
+  stop() {
+    this.gen++; this.queue = []; this.ctrl?.abort();
+    for (const s of this.sources) try { s.stop(); } catch {}
+    this.sources = []; this.at = 0;
+  },
+  async run() {
+    if (this.running) return;
+    this.running = true;
+    const gen = this.gen;
+    try {
+      while (this.queue.length && gen === this.gen) {
+        const { text, conversation } = this.queue.shift();
+        this.ctrl = new AbortController();
+        const r = await fetch("/v1/audio/speech", { method: "POST", headers: { "Content-Type": "application/json" }, signal: this.ctrl.signal,
+          body: JSON.stringify({ input: text, voice: "maya", response_format: "pcm", conversation }) });
+        if (!r.ok) break;
+        const rate = Number(r.headers.get("X-Sample-Rate")) || 24000, reader = r.body.getReader();
+        let odd = null; // a sample split between two chunks
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done || gen !== this.gen) break;
+          let bytes = value;
+          if (odd !== null) { bytes = new Uint8Array(value.length + 1); bytes[0] = odd; bytes.set(value, 1); odd = null; }
+          if (bytes.length % 2) { odd = bytes[bytes.length - 1]; bytes = bytes.subarray(0, bytes.length - 1); }
+          const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.length), f = new Float32Array(bytes.length / 2);
+          for (let i = 0; i < f.length; i++) f[i] = view.getInt16(2 * i, true) / 32768;
+          if (f.length) this.play(f, rate);
+        }
+      }
+    } catch {} finally {
+      this.running = false;
+      if (this.queue.length && gen === this.gen) this.run();
+    }
+  },
+  play(samples, rate) {
+    this.ctx ||= new AudioContext();
+    const buf = this.ctx.createBuffer(1, samples.length, rate);
+    buf.copyToChannel(samples, 0);
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(this.ctx.destination);
+    // a little lead when starting (or after a gap), so the pieces after it play without a seam
+    if (this.at < this.ctx.currentTime + 0.03) this.at = this.ctx.currentTime + 0.15;
+    src.start(this.at);
+    this.at += buf.duration;
+    this.sources.push(src);
+    src.onended = () => { this.sources = this.sources.filter((s) => s !== src); };
+    ghost?.token();
+  },
+};
+// the next whole sentences of a reply not yet sent to the speaker (all that is left once it is `final`), as
+// words: no code, no Markdown marks, links by their text
+function speakFrom(reply, conversation, final) {
+  if (!$("speak").checked || !speechModel || !voiceOn) return;
+  const text = reply.content || "", from = reply.said || 0, pending = text.slice(from);
+  let end = final ? pending.length : -1;
+  if (!final) {
+    // the last sentence end with something after it; the first piece may be short (it is heard sooner)
+    const re = /[.!?…:;](?=\s)|\n/g;
+    for (let m; (m = re.exec(pending)); ) if (m.index + 1 >= (from ? 40 : 12)) end = m.index + 1;
+    // not inside a code block still being written
+    if (end > 0 && ((text.slice(0, from + end).match(/```/g) || []).length % 2)) end = -1;
+  }
+  if (end <= 0) return;
+  reply.said = from + end;
+  const words = pending.slice(0, end)
+    .replace(/```[\s\S]*?(```|$)/g, " ").replace(/`[^`]*`/g, " ")
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1").replace(/https?:\/\/\S+/g, "a link")
+    .replace(/[*_#>|~]+/g, " ").replace(/\s+/g, " ").trim();
+  if (/\p{L}/u.test(words)) speaker.say(words, conversation);
+}
+// one sentence telling the model which model it is (and nothing about where it runs)
+function aboutModel(a) {
+  if (!a) return "";
+  const n = (v) => v >= 1e9 ? `${(v / 1e9).toFixed(1)} billion` : `${Math.round(v / 1e6)} million`;
+  let s = `You are ${a.name}, a language model with ${n(a.parameters)} parameters`;
+  if (a.active_parameters && a.active_parameters < a.parameters) {
+    s += ` (a mixture of experts: ${a.experts_per_token} of its ${a.experts} experts work on each token, so about ${n(a.active_parameters)} parameters are active per token)`;
+  }
+  if (a.quantization) s += `, quantized to ${a.quantization}`;
+  return s + ". When asked which model you are or how big you are, answer with these facts.";
+}
 function showModel() {
   const b = $("modelBtn");
   b.classList.remove("down");
@@ -725,6 +1013,11 @@ async function refreshModels() {
     model = j.current; loadingModel = j.loading;
     canThink = j.thinking !== false;
     noThinkTag = j.no_think_tag !== false;
+    about = j.about || null;
+    speechModel = j.speech || null;
+    voiceOn = !!j.voice;
+    $("speakRow").style.display = speechModel ? "" : "none";
+    if (speechModel) $("speakNote").textContent = `In the voice of ${speechModel}, each sentence as soon as it is written.` + (voiceOn ? "" : " Turning it on loads the voice (it takes GPU memory from the model while on).");
     think.hidden = !canThink;
     showModel();
     if (loadingModel) setTimeout(refreshModels, 1500); // a switch is under way (another tab, or the server starting): watch it finish
@@ -1174,7 +1467,7 @@ async function ask(thinking) {
   // earlier replies go back without their thinking (as Qwen3 expects), with their mood tags and any tool rounds
   const history = c.messages.slice(0, -1).flatMap((m) => [...expand(m), { role: m.role, content: m.sent ?? m.content }]);
   const useTools = $("tools").checked;
-  const sys = [$("system").value.trim(), useTools ? toolPrompt() : "", $("moods").checked ? MOOD_PROMPT : ""].filter(Boolean).join("\n\n");
+  const sys = [$("system").value.trim(), aboutModel(about), useTools ? toolPrompt() : "", $("moods").checked ? MOOD_PROMPT : ""].filter(Boolean).join("\n\n");
   if (sys) history.unshift({ role: "system", content: sys });
   const tools = useTools ? toolList() : [];
   reply.cp = `${c.id}-${Date.now()}`; // groups this reply's file changes for undo
@@ -1255,6 +1548,7 @@ async function ask(thinking) {
             const { shown, last } = moodOf(reply.answer || "", true);
             if (last) lastMood = last;
             reply.content = [...shownBefore(), shown].join("\n\n");
+            speakFrom(reply, c.id, false);
             if (shown.trim()) { ghost?.token(); mood(talkingFace(lastMood), "Writing"); }
             else if (lastMood && ++tagChunks > 48) { tagLoop = true; busy.abort(); }
           }
@@ -1294,6 +1588,8 @@ async function ask(thinking) {
     }
     const { shown } = moodOf(reply.answer || "", false);
     reply.content = [...shownBefore(), shown].join("\n\n");
+    speakFrom(reply, c.id, true);
+    delete reply.said;
     reply.sent = reply.answer || ""; // with its tags, as the model wrote it
     const secs = (performance.now() - (firstAt ?? t0)) / 1000;
     if (usage) {
@@ -1345,16 +1641,16 @@ input.addEventListener("input", typed);
 input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); $("form").requestSubmit(); } });
 $("form").onsubmit = (e) => {
   e.preventDefault();
+  speaker.stop(); // a stopped reply, or a new message: the voice stops too
   if (busy) { busy.abort(); return; }
   const text = input.value.trim();
   if (!text) return;
+  if ($("speak").checked && speechModel) speaker.unlock();
   input.value = "";
   grow(); canSend();
   send(text);
 };
 
-// without 3D (no WebGL), the status sits alone above the box
-if (!ghost) { $("ghost").remove(); document.body.classList.add("noghost"); }
 renderChats();
 renderAll();
 // ?mood=shocked holds that face, to preview it; otherwise a wave hello

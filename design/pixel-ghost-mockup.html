@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pixel ghost (mockup)</title>
+<style>
+  @font-face { font-family: "Instrument Sans"; src: url("../src/vendor/instrument-sans.woff2") format("woff2"); font-weight: 400 700; font-display: swap; }
+  :root {
+    --side: #10141f; --bg: #151a27; --raise: #1c2232; --raise-2: #232a3d; --line: rgba(233, 237, 247, 0.08); --line-2: rgba(233, 237, 247, 0.15);
+    --text: #e8ebf3; --muted: #8e96ab; --faint: #646c82; --accent: #b9c7ff; --accent-ink: #121726; --accent-soft: rgba(185, 199, 255, 0.12);
+    --warm: #ffc98a; --danger: #ff9b8a;
+    --sans: "Instrument Sans", "Segoe UI", system-ui, -apple-system, Roboto, sans-serif;
+    --column: min(720px, calc(100% - 32px));
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--text); font: 15px/1.6 var(--sans); overflow: hidden; }
+  button { font: inherit; color: inherit; cursor: pointer; background: none; border: 0; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
+  canvas.px { image-rendering: pixelated; image-rendering: crisp-edges; display: block; }
+
+  .app { display: grid; grid-template-columns: 248px 1fr auto; height: 100%; }
+
+  /* chats */
+  aside.chats { background: var(--side); border-right: 1px solid var(--line); padding: 14px 10px; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .brand { display: flex; align-items: center; gap: 10px; padding: 4px 8px 16px; font-weight: 600; }
+  .brand canvas { width: 24px; height: 24px; }
+  .new { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 8px; color: var(--text); border: 1px solid var(--line-2); margin-bottom: 12px; }
+  .new:hover { background: var(--raise); }
+  .chat-item { text-align: left; padding: 7px 10px; border-radius: 8px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 14px; }
+  .chat-item:hover { background: var(--raise); color: var(--text); }
+  .chat-item.on { background: var(--raise-2); color: var(--text); }
+  .when { font-size: 12px; color: var(--faint); padding: 14px 10px 4px; }
+
+  /* conversation */
+  main { display: flex; flex-direction: column; min-width: 0; height: 100%; }
+  .top { display: flex; align-items: center; gap: 10px; padding: 12px 18px; border-bottom: 1px solid var(--line); }
+  .top .title { color: var(--muted); font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .monitor-btn { margin-left: auto; display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 999px; border: 1px solid var(--line-2); font-size: 13px; color: var(--muted); white-space: nowrap; }
+  .monitor-btn[aria-pressed="true"] { background: var(--accent-soft); border-color: transparent; color: var(--accent); }
+  .monitor-btn canvas { width: 14px; height: 14px; }
+  .log { flex: 1; overflow-y: auto; padding: 28px 0 12px; }
+  .msg { width: var(--column); margin: 0 auto 26px; }
+  .msg.user { display: flex; justify-content: flex-end; }
+  .msg.user p { background: var(--raise-2); padding: 10px 14px; border-radius: 16px 16px 4px 16px; margin: 0; max-width: 80%; }
+  .msg.bot p { margin: 0 0 10px; }
+  .meta { font-size: 12px; color: var(--faint); font-variant-numeric: tabular-nums; }
+
+  /* the ghost sits on the input box, like a pet on a shelf */
+  .dock { width: var(--column); margin: 0 auto 16px; position: relative; }
+  .perch { display: flex; align-items: flex-end; gap: 10px; height: 66px; padding-left: 14px; }
+  .perch canvas { width: 72px; height: 66px; margin-bottom: -6px; }
+  .say { font-size: 13px; color: var(--muted); padding-bottom: 12px; font-variant-numeric: tabular-nums; min-height: 1.6em; }
+  .say b { color: var(--text); font-weight: 500; }
+  .box { background: var(--raise); border: 1px solid var(--line-2); border-radius: 16px; padding: 12px 12px 10px 16px; }
+  .box .ph { color: var(--faint); padding: 2px 0 14px; }
+  .box .row { display: flex; align-items: center; gap: 8px; }
+  .pill { font-size: 13px; padding: 5px 11px; border-radius: 999px; border: 1px solid var(--line-2); color: var(--muted); white-space: nowrap; }
+  .send { margin-left: auto; width: 32px; height: 32px; border-radius: 50%; background: var(--accent); color: var(--accent-ink); display: grid; place-items: center; font-weight: 700; }
+
+  /* monitor */
+  aside.monitor { width: 0; overflow: hidden; background: var(--side); border-left: 1px solid var(--line); transition: width 0.25s ease; }
+  .app.mon aside.monitor { width: 312px; }
+  .mon-in { width: 312px; height: 100%; overflow-y: auto; padding: 16px 18px 24px; }
+  .mon-head { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; }
+  .mon-head h2 { font-size: 15px; font-weight: 600; margin: 0; }
+  .mon-head .close { margin-left: auto; }
+  .mon-head .live { font-size: 12px; color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }
+  .mon-head .live i { width: 6px; height: 6px; background: #8fe3a8; display: inline-block; }
+  .close { color: var(--muted); padding: 2px 6px; font-size: 18px; line-height: 1; display: none; }
+  section.card { padding: 14px 0; border-top: 1px solid var(--line); }
+  section.card h3 { font-size: 13px; font-weight: 500; color: var(--muted); margin: 0 0 8px; }
+  .big { font-size: 30px; font-weight: 600; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; line-height: 1.1; }
+  .big small { font-size: 14px; font-weight: 400; color: var(--muted); letter-spacing: 0; margin-left: 4px; }
+  .spark { width: 100%; height: 40px; margin-top: 10px; }
+  .bar { margin: 10px 0 4px; }
+  .bar .lab { display: flex; justify-content: space-between; font-size: 13px; font-variant-numeric: tabular-nums; }
+  .bar .lab span:last-child { color: var(--muted); }
+  .bar .track { height: 8px; background: var(--raise-2); margin-top: 6px; display: flex; }
+  .bar .track i { display: block; height: 100%; }
+  .gpu { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; font-size: 13px; font-variant-numeric: tabular-nums; }
+  .gpu div span { display: block; color: var(--muted); font-size: 12px; }
+  .heat { width: 100%; height: auto; aspect-ratio: 128 / 48; margin: 8px 0 6px; background: #0c0f18; }
+  .heat-axis { display: flex; justify-content: space-between; font-size: 11px; color: var(--faint); }
+  .note { font-size: 12.5px; color: var(--muted); line-height: 1.5; margin: 8px 0 0; }
+  .key { display: flex; gap: 14px; font-size: 12px; color: var(--muted); margin-top: 8px; }
+  .key i { width: 8px; height: 8px; display: inline-block; margin-right: 5px; vertical-align: -1px; }
+
+  /* mockup-only: pose picker */
+  .poses { position: fixed; left: 50%; top: 10px; transform: translateX(-50%); z-index: 9; display: flex; gap: 4px; padding: 5px; background: rgba(16, 20, 31, 0.92); border: 1px dashed var(--line-2); border-radius: 12px; max-width: calc(100% - 20px); overflow-x: auto; }
+  .poses button { font-size: 12px; padding: 4px 9px; border-radius: 8px; color: var(--muted); white-space: nowrap; }
+  .poses button.on { background: var(--accent-soft); color: var(--accent); }
+
+  @media (max-width: 900px) {
+    .app { grid-template-columns: 1fr; }
+    aside.chats { display: none; }
+    aside.monitor { position: fixed; inset: auto 0 0 0; width: auto !important; height: 0; border-left: 0; border-top: 1px solid var(--line-2); border-radius: 18px 18px 0 0; transition: height 0.25s ease; z-index: 5; }
+    .app.mon aside.monitor { height: min(78vh, 640px); }
+    .mon-in { width: auto; }
+    .close { display: block; }
+    .top { padding-top: 54px; }
+  }
+  @media (prefers-reduced-motion: reduce) { aside.monitor { transition: none; } }
+</style>
+</head>
+<body>
+<nav class="poses" aria-label="Mockup: ghost poses"></nav>
+<div class="app mon" id="app">
+  <aside class="chats">
+    <div class="brand"><canvas class="px" id="logo" width="18" height="18"></canvas>ghost-infer</div>
+    <button class="new">+ New chat</button>
+    <div class="when">Today</div>
+    <button class="chat-item on">Hi, what model are you?</button>
+    <button class="chat-item">Fix the borrow checker error in cuda.rs</button>
+    <button class="chat-item">Three famous bridges</button>
+    <div class="when">Yesterday</div>
+    <button class="chat-item">Check my system specs</button>
+    <button class="chat-item">Rust lifetimes, simply</button>
+  </aside>
+
+  <main>
+    <div class="top">
+      <span class="title">Hi, what model are you? and what is your parameter size?</span>
+      <button class="monitor-btn" id="monBtn" aria-pressed="true" aria-controls="monitor"><canvas class="px" id="monIcon" width="7" height="7"></canvas>Monitor</button>
+    </div>
+    <div class="log">
+      <div class="msg user"><p>Hi, what model are you? and what is your parameter size?</p></div>
+      <div class="msg bot">
+        <p>I'm Qwen3-30B-A3B-Instruct-2507, a mixture-of-experts language model with 30.5 billion parameters. About 3.3 billion of them are active for each token: a router picks 8 of 128 experts in every layer.</p>
+        <p>This copy is quantized to Q3_K_M, so it fits on smaller hardware.</p>
+        <div class="meta">96 tokens in 5.0 s, 19.2 tok/s</div>
+      </div>
+      <div class="msg user"><p>How many experts are on the graphics card right now?</p></div>
+    </div>
+    <div class="dock">
+      <div class="perch">
+        <canvas class="px" id="ghost" width="24" height="22" role="img" aria-label="The ghost"></canvas>
+        <div class="say" id="say" aria-live="polite"></div>
+      </div>
+      <div class="box">
+        <div class="ph">Ask anything, or paste code</div>
+        <div class="row"><span class="pill">Qwen3-30B-A3B Q3_K_M</span><span class="pill">Think</span><button class="send" aria-label="Send">↑</button></div>
+      </div>
+    </div>
+  </main>
+
+  <aside class="monitor" id="monitor" aria-label="Monitor">
+    <div class="mon-in">
+      <div class="mon-head"><h2>Monitor</h2><span class="live"><i></i>Live</span><button class="close" id="monClose" aria-label="Close the monitor">×</button></div>
+
+      <section class="card">
+        <h3>Reply speed</h3>
+        <div class="big" id="rate">19.2<small>tok/s</small></div>
+        <canvas class="px spark" id="spark" width="60" height="16"></canvas>
+        <div class="heat-axis"><span>a minute ago</span><span>now</span></div>
+      </section>
+
+      <section class="card">
+        <h3>Memory</h3>
+        <div class="bar"><div class="lab"><span>Graphics card</span><span id="vramTxt">7.2 of 8.0 GB</span></div>
+          <div class="track"><i style="width:56%;background:var(--accent)" title="Experts"></i><i style="width:34%;background:#7f8cc4" title="Model and context"></i></div></div>
+        <div class="bar"><div class="lab"><span>System memory</span><span>11.4 of 15.9 GB</span></div>
+          <div class="track"><i style="width:22%;background:var(--warm)"></i><i style="width:50%;background:#5b6378"></i></div></div>
+        <div class="key"><span><i style="background:var(--warm)"></i>ghost-infer 3.5 GB</span><span><i style="background:#5b6378"></i>Other apps</span></div>
+      </section>
+
+      <section class="card">
+        <h3>RTX 2060 SUPER</h3>
+        <div class="gpu">
+          <div><span>Temperature</span><b id="temp">64 °C</b></div>
+          <div><span>Load</span><b id="load">87%</b></div>
+          <div><span>Driver</span>581.57</div>
+          <div><span>Context</span>1,412 of 32,768</div>
+        </div>
+      </section>
+
+      <section class="card">
+        <h3>Experts on the graphics card</h3>
+        <div class="big" style="font-size:22px">2,163<small>of 6,144</small></div>
+        <canvas class="px heat" id="heat" width="128" height="48"></canvas>
+        <div class="heat-axis"><span>Expert 1</span><span>Expert 128</span></div>
+        <div class="key"><span><i style="background:#ffffff"></i>Used, on the card</span><span><i style="background:var(--accent)"></i>On the card</span><span><i style="background:var(--warm)"></i>Used, read from RAM</span></div>
+        <p class="note">Each row is one of the 48 layers. Each layer picks 8 experts per token. White ones run on the graphics card, orange ones are read from RAM, which is slower. The more an expert is used, the longer it stays on the card.</p>
+      </section>
+    </div>
+  </aside>
+</div>
+
+<script>
+// ---- the pixel ghost: a body mask, an outline worked out from it, a face and props per pose ----
+const PAL = { o: "#0b0e17", w: "#e8ebf3", s: "#aeb6cc", h: "#ffffff", e: "#121726", b: "#ff9b8a", a: "#b9c7ff", A: "#7f8cc4", t: "#8fc0ff", y: "#ffc98a" };
+const W = 24, H = 22, OX = 3, OY = 5; // canvas size; where the 14x14 body starts (room above and to the right for props)
+// the body, hand-drawn; two hem frames make it wiggle
+const TOP = [
+  "....wwwwww....",
+  "..wwwwwwwwww..",
+  ".wwwwwwwwwwww.",
+  ".wwwwwwwwwwww.",
+  "wwwwwwwwwwwwww",
+  "wwwwwwwwwwwwww",
+  "wwwwwwwwwwwwww",
+  "wwwwwwwwwwwwww",
+  "wwwwwwwwwwwwww",
+  "wwwwwwwwwwwwww",
+  "wwwwwwwwwwwwww",
+  "wwwwwwwwwwwwww",
+];
+const HEM = [["wwww..wwww..ww", ".ww....ww....w"], ["ww..wwww..wwww", "w....ww....ww."]];
+const body = (f) => [...TOP, ...HEM[f]].map((r) => [...r].map((ch) => ch === "w"));
+
+function draw(ctx, pose, t) {
+  const frame = Math.floor(t / 420);
+  const bob = (pose === "sleepy" ? Math.floor(t / 900) : frame) % 2;
+  const m = body(frame % 2);
+  const g = Array.from({ length: H }, () => Array(W).fill(null));
+  const put = (x, y, c) => { if (x >= 0 && y >= 0 && x < W && y < H) g[y][x] = c; };
+  const B = (x, y, c) => put(OX + x, OY + y + bob, c); // in body coordinates
+  for (let y = 0; y < m.length; y++) for (let x = 0; x < 14; x++) if (m[y][x]) {
+    const edgeR = !m[y][x + 1], edgeB = !(m[y + 1] && m[y + 1][x]);
+    B(x, y, edgeR || edgeB ? "s" : "w");
+  }
+  B(3, 1, "h"); B(2, 2, "h"); // shine
+
+  const eye = (x, y, h = 2, shine = true) => { for (let i = 0; i < h; i++) { B(x, y + i, "e"); B(x + 1, y + i, "e"); } if (shine) B(x, y, "h"); };
+  const blink = pose === "idle" && frame % 9 === 0;
+  switch (pose) {
+    case "idle":
+      if (blink) [3, 4, 9, 10].forEach((x) => B(x, 5, "e"));
+      else { eye(3, 4); eye(9, 4); }
+      break;
+    case "thinking":
+      eye(4, 3, 2, false); eye(10, 3, 2, false);
+      for (let i = 0; i < 3; i++) if (frame % 4 > i) put(OX + 15 + i * 2, OY - 3 + bob, "a");
+      break;
+    case "writing":
+      eye(3, 4); eye(9, 4); B(6, 8, "e"); B(7, 8, "e");
+      if (frame % 2) { B(6, 9, "e"); B(7, 9, "e"); }
+      break;
+    case "happy":
+      [[2, 5], [3, 4], [4, 5], [9, 5], [10, 4], [11, 5], [5, 7], [6, 8], [7, 8], [8, 7]].forEach(([x, y]) => B(x, y, "e"));
+      B(1, 7, "b"); B(12, 7, "b");
+      break;
+    case "shocked":
+      eye(3, 3, 3); eye(9, 3, 3);
+      B(6, 8, "e"); B(7, 8, "e"); B(6, 9, "e"); B(7, 9, "e");
+      put(OX + 16, OY - 3, "y"); put(OX + 16, OY - 2, "y"); put(OX + 16, OY, "y");
+      break;
+    case "sad":
+      [[3, 5], [4, 5], [9, 5], [10, 5], [3, 3], [4, 2], [9, 2], [10, 3], [5, 9], [6, 8], [7, 8], [8, 9]].forEach(([x, y]) => B(x, y, "e"));
+      B(3, 6 + (frame % 4), "t");
+      break;
+    case "tool": // eyes right, magnifier held out
+      eye(4, 4, 2, false); eye(10, 4, 2, false);
+      [[15, 3], [16, 2], [17, 2], [18, 3], [18, 4], [17, 5], [16, 5], [15, 4]].forEach(([x, y]) => B(x, y, "a"));
+      B(16, 3, "h"); B(14, 6, "A"); B(13, 7, "A");
+      break;
+    case "disk": // carrying a floppy disk: loading weights from disk
+      eye(3, 5, 2, false); eye(9, 5, 2, false);
+      for (let y = 8; y < 14; y++) for (let x = 10; x < 17; x++) B(x, y, "a");
+      for (let x = 12; x < 15; x++) { B(x, 8, "w"); B(x, 9, "w"); }
+      B(13, 9, "A"); for (let x = 11; x < 16; x++) B(x, 12, "A");
+      break;
+    case "sleepy":
+      [3, 4, 9, 10].forEach((x) => B(x, 5, "e"));
+      if (frame % 6 < 4) [[15, -2], [16, -2], [16, -3], [15, -4], [16, -4]].forEach(([x, y]) => B(x, y, "a"));
+      break;
+  }
+
+  // outline: every empty pixel touching the ghost's body
+  const bodyAt = (x, y) => g[y] && ["w", "s", "h"].includes(g[y][x]);
+  const out = [];
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++)
+    if (!g[y][x] && (bodyAt(x - 1, y) || bodyAt(x + 1, y) || bodyAt(x, y - 1) || bodyAt(x, y + 1))) out.push([x, y]);
+  out.forEach(([x, y]) => (g[y][x] = "o"));
+
+  ctx.clearRect(0, 0, W, H);
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) if (g[y][x]) { ctx.fillStyle = PAL[g[y][x]]; ctx.fillRect(x, y, 1, 1); }
+}
+
+const POSES = {
+  idle: "Ready",
+  thinking: "<b>Reading your message</b>, 42%",
+  disk: "<b>Loading weights from disk</b>, 18%",
+  tool: "<b>Checking this computer's specs</b>",
+  writing: "<b>Writing</b>, 19 tok/s",
+  happy: "", shocked: "", sad: "", sleepy: "Resting",
+};
+let pose = "writing";
+const gctx = document.getElementById("ghost").getContext("2d");
+const say = document.getElementById("say");
+const poses = document.querySelector(".poses");
+for (const p of Object.keys(POSES)) {
+  const b = document.createElement("button");
+  b.textContent = p;
+  b.onclick = () => setPose(p);
+  poses.append(b);
+}
+function setPose(p) {
+  pose = p;
+  say.innerHTML = POSES[p];
+  poses.querySelectorAll("button").forEach((b) => b.classList.toggle("on", b.textContent === p));
+}
+setPose(pose);
+
+// small static ghosts: the logo and the monitor button's icon
+(() => {
+  const c = document.getElementById("logo").getContext("2d");
+  const big = document.createElement("canvas"); big.width = W; big.height = H;
+  draw(big.getContext("2d"), "idle", 420);
+  c.drawImage(big, 2, 4, 18, 18, 0, 0, 18, 18);
+  const ic = document.getElementById("monIcon").getContext("2d");
+  ic.fillStyle = "#b9c7ff";
+  [[0, 6, 1], [2, 4, 3], [4, 1, 6], [6, 3, 4]].forEach(([x, y, h]) => ic.fillRect(x, y, 1, h));
+})();
+
+// ---- monitor: a speed history in blocks, and the expert map ----
+const spark = document.getElementById("spark").getContext("2d");
+const speeds = Array.from({ length: 60 }, (_, i) => (i < 22 ? 0 : i < 26 ? 4 + i % 3 : 17 + Math.round(Math.sin(i / 3) * 2)));
+function drawSpark() {
+  spark.clearRect(0, 0, 60, 16);
+  speeds.forEach((v, x) => {
+    const h = Math.round((v / 24) * 15);
+    spark.fillStyle = x === 59 ? "#ffffff" : "#b9c7ff";
+    spark.globalAlpha = x === 59 ? 1 : 0.35 + 0.65 * (x / 59);
+    spark.fillRect(x, 16 - h, 1, h);
+  });
+  spark.globalAlpha = 1;
+}
+
+const heat = document.getElementById("heat").getContext("2d");
+const LAYERS = 48, EXPERTS = 128;
+// a believable heat map: a few popular experts per layer, the rest cold
+const hotness = Array.from({ length: LAYERS }, (_, l) => Array.from({ length: EXPERTS }, (_, e) => {
+  const r = Math.sin(l * 12.9898 + e * 78.233) * 43758.5453;
+  const n = r - Math.floor(r);
+  return Math.pow(n, 2.4);
+}));
+const onCard = hotness.map((row) => row.map((h) => h > 0.36)); // about 35%, as on the 30B with an 8 GB card
+let picked = [];
+function pick() {
+  picked = hotness.map((row) => {
+    const s = new Set();
+    while (s.size < 8) {
+      const e = Math.floor(Math.random() * EXPERTS);
+      if (Math.random() < 0.02 + row[e] * row[e]) s.add(e);
+    }
+    return s;
+  });
+}
+function drawHeat() {
+  for (let l = 0; l < LAYERS; l++) for (let e = 0; e < EXPERTS; e++) {
+    let c;
+    if (picked[l] && picked[l].has(e)) c = onCard[l][e] ? "#ffffff" : "#ffc98a";
+    else if (onCard[l][e]) { c = `rgba(185,199,255,${(0.25 + 0.75 * hotness[l][e]).toFixed(2)})`; }
+    else c = "#191e2c";
+    heat.fillStyle = "#0c0f18"; heat.fillRect(e, l, 1, 1);
+    heat.fillStyle = c; heat.fillRect(e, l, 1, 1);
+  }
+}
+
+// ---- one clock for everything ----
+const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+let lastTick = 0;
+function frame(t) {
+  draw(gctx, pose, reduce ? 0 : t);
+  if (t - lastTick > 250) {
+    lastTick = t;
+    if (pose === "writing") pick(); else if (Math.random() < 0.1) picked = [];
+    drawHeat();
+    if (pose === "writing" && Math.random() < 0.25) {
+      speeds.shift(); speeds.push(17 + Math.round(Math.random() * 4));
+      document.getElementById("rate").firstChild.nodeValue = (speeds[59] + Math.random()).toFixed(1);
+      drawSpark();
+    }
+  }
+  requestAnimationFrame(frame);
+}
+drawSpark(); pick(); drawHeat();
+requestAnimationFrame(frame);
+
+// monitor open and closed
+const app = document.getElementById("app"), monBtn = document.getElementById("monBtn");
+const setMon = (on) => { app.classList.toggle("mon", on); monBtn.setAttribute("aria-pressed", on); };
+monBtn.onclick = () => setMon(!app.classList.contains("mon"));
+document.getElementById("monClose").onclick = () => setMon(false);
+if (matchMedia("(max-width: 900px)").matches) setMon(false);
+</script>
+</body>
+</html>

@@ -27,6 +27,8 @@ pub struct Config {
     /// NEOX RoPE rotates (x[i], x[i + rope_dim/2]); otherwise adjacent pairs (x[2i], x[2i+1]).
     /// GGUF converters permute llama's Q/K for adjacent pairs but leave Qwen's as trained.
     pub rope_neox: bool,
+    /// Llama 3 frequency scaling (the rope_freqs tensor): per rotated pair, what its frequency is divided by
+    pub rope_freqs: Option<Vec<f32>>,
     pub norm_eps: f32,
     /// Mixture of experts (qwen3moe; 0 for dense models): experts per layer, experts each token
     /// uses, and an expert's hidden size.
@@ -185,7 +187,7 @@ impl Config {
         } else {
             None
         };
-        Ok(Config {
+        let cfg = Config {
             dim,
             // multi-token-prediction blocks come after the real ones; they are not run
             n_layers: blocks - u("nextn_predict_layers").unwrap_or(0),
@@ -201,6 +203,10 @@ impl Config {
             rope_dim: u("rope.dimension_count").unwrap_or(head_dim),
             rope_base: f("rope.freq_base").unwrap_or(10_000.0),
             rope_neox: arch.starts_with("qwen3"),
+            rope_freqs: match g.tensor("rope_freqs.weight") {
+                Some(_) => Some(vector(g, "rope_freqs.weight")?),
+                None => None,
+            },
             norm_eps: f("attention.layer_norm_rms_epsilon").unwrap_or(1e-5),
             n_experts: u("expert_count").unwrap_or(0),
             n_experts_used: u("expert_used_count").unwrap_or(0),
@@ -217,7 +223,11 @@ impl Config {
             expert_weights_scale: f("expert_weights_scale").unwrap_or(1.0),
             delta,
             attn_gated: next,
-        })
+        };
+        if cfg.rope_freqs.as_ref().is_some_and(|f| f.len() != cfg.rope_dim / 2) {
+            return Err(format!("rope_freqs holds {} values, not one per rotated pair ({})", cfg.rope_freqs.as_ref().unwrap().len(), cfg.rope_dim / 2));
+        }
+        Ok(cfg)
     }
 
     pub fn is_moe(&self) -> bool {
@@ -612,7 +622,7 @@ impl Session {
             head_in: Vec::new(),
             head_out: Vec::new(),
             logits: vec![0.0; cfg.vocab],
-            rope_inv_freq: (0..half).map(|i| cfg.rope_base.powf(-(2.0 * i as f32) / cfg.rope_dim as f32)).collect(),
+            rope_inv_freq: (0..half).map(|i| cfg.rope_base.powf(-(2.0 * i as f32) / cfg.rope_dim as f32) / cfg.rope_freqs.as_ref().map_or(1.0, |f| f[i])).collect(),
         }
     }
 

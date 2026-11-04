@@ -1,17 +1,22 @@
+mod csm;
 mod cuda;
 mod gguf;
 mod iquant;
 mod json;
 mod lookup;
+mod maya1;
+mod mimi;
 mod model;
 mod pool;
 mod profile;
 mod quant;
 mod sampler;
 mod server;
+mod snac;
 mod sysinfo;
 mod tokenizer;
 mod tools;
+mod whisper;
 
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
@@ -37,6 +42,11 @@ USAGE:
     ghost-infer chat     <model.gguf> [options]
     ghost-infer serve    [<model.gguf>] [--host <addr>] [--port <n>] [options]   (OpenAI-compatible HTTP API;
                          without a model none is loaded until one is picked from the --models folders)
+    ghost-infer tts      <csm folder> <text> [-o <out.wav>] [--speaker <n>] [-t <temp>] [--top-k <n>] [--seed <n>]
+                         [-n <max frames>]   (speech from a CSM folder made by scripts/csm-convert.py; GPU)
+    ghost-infer csm-check <csm folder> <reference.json>   (compares CSM with scripts/csm-reference.py's numbers)
+    ghost-infer stt      <whisper.gguf> <audio.wav>... [--language <code>]   (speech to text with a Whisper file
+                         made by scripts/whisper-convert.py; GPU)
 
 OPTIONS:
     -p, --prompt <text>   prompt (run)
@@ -60,6 +70,10 @@ OPTIONS:
         --port <n>        serve: port                        [8080]
         --no-think        serve: Qwen3 answers without thinking unless a request asks for it
         --models <dir>    serve: another folder of GGUF files for the model picker (repeatable)
+        --tts <dir>       serve: a CSM speech folder (scripts/csm-convert.py) for /v1/audio/speech and spoken
+                          replies in the chat page (GPU, about 1.7 GB of its memory)
+        --stt <file>      serve: a Whisper file (scripts/whisper-convert.py) for /v1/audio/transcriptions; with
+                          --tts, the app's voice calls (GPU, about 1 GB)
 ";
 
 struct Opts {
@@ -82,6 +96,8 @@ struct Opts {
     host: String,
     port: u16,
     models: Vec<PathBuf>, // serve: more folders of GGUF files to switch to, besides the model's own
+    tts: Option<PathBuf>, // serve: a CSM folder for /v1/audio/speech
+    stt: Option<PathBuf>, // serve: a Whisper file for /v1/audio/transcriptions
 }
 
 fn parse_opts(args: &[String]) -> Result<Opts, String> {
@@ -113,6 +129,8 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
         host: "127.0.0.1".into(),
         port: 8080,
         models: Vec::new(),
+        tts: None,
+        stt: None,
     };
     while let Some(a) = it.next() {
         let mut val = |name: &str| it.next().cloned().ok_or_else(|| format!("{name} needs a value"));
@@ -141,6 +159,8 @@ fn parse_opts(args: &[String]) -> Result<Opts, String> {
             "--host" => o.host = val(a)?,
             "--port" => o.port = num(val(a)?, a)? as u16,
             "--models" => o.models.push(PathBuf::from(val(a)?)),
+            "--tts" => o.tts = Some(PathBuf::from(val(a)?)),
+            "--stt" => o.stt = Some(PathBuf::from(val(a)?)),
             "--kv" => match val(a)?.as_str() {
                 "f16" => cuda::set_kv_int8(false),
                 "int8" => cuda::set_kv_int8(true),
@@ -164,6 +184,10 @@ fn main() -> ExitCode {
         Some("bench") if !rest.is_empty() => parse_opts(rest).and_then(|o| bench(&o)),
         Some("run") if !rest.is_empty() => parse_opts(rest).and_then(|o| run(&o)),
         Some("chat") if !rest.is_empty() => parse_opts(rest).and_then(|o| chat(&o)),
+        Some("tts") if rest.len() >= 2 => tts(rest),
+        Some("stt") if rest.len() >= 2 => stt(rest),
+        Some("csm-check") if rest.len() == 2 => csm::check(&PathBuf::from(&rest[0]), &PathBuf::from(&rest[1])),
+        Some("snac-check") if rest.len() == 2 => snac::check(&PathBuf::from(&rest[0]), &PathBuf::from(&rest[1])),
         // no model file first (options only, or nothing): the server starts with none loaded
         Some("serve") => {
             let given = rest.first().is_some_and(|a| !a.starts_with('-'));
@@ -182,6 +206,101 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `stt <whisper.gguf> <wav>... [--language <code>]`: each file's text, with the time it took.
+fn stt(args: &[String]) -> Result<(), String> {
+    let mut files = Vec::new();
+    let mut language = None;
+    let mut it = args[1..].iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--language" => language = Some(it.next().ok_or("--language needs a value")?.clone()),
+            _ => files.push(PathBuf::from(a)),
+        }
+    }
+    let t0 = Instant::now();
+    let mut w = whisper::Whisper::load(&PathBuf::from(&args[0]))?;
+    eprintln!("[loaded in {:.1} s]", t0.elapsed().as_secs_f64());
+    for f in files {
+        let audio = whisper::read_wav(&std::fs::read(&f).map_err(|e| format!("cannot read {}: {e}", f.display()))?)?;
+        let t = Instant::now();
+        let heard = w.transcribe(&audio, language.as_deref())?;
+        println!(
+            "{} ({:.1} s of audio in {:.0} ms, {}, no speech {:.2}): {}",
+            f.display(),
+            audio.len() as f64 / whisper::RATE as f64,
+            t.elapsed().as_secs_f64() * 1000.0,
+            heard.language,
+            heard.no_speech,
+            heard.text
+        );
+    }
+    Ok(())
+}
+
+/// `tts <folder> <text> [options]`: speaks the text into a WAV file, printing the speed.
+fn tts(args: &[String]) -> Result<(), String> {
+    let (dir, text) = (PathBuf::from(&args[0]), args[1].clone());
+    let (mut out, mut speaker, mut temp, mut top_k, mut max) = (PathBuf::from("speech.wav"), 0u32, 0.9f32, 50usize, 375usize);
+    let mut seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(1);
+    let mut it = args[2..].iter();
+    while let Some(a) = it.next() {
+        let v = it.next().ok_or_else(|| format!("{a} needs a value"))?;
+        let num = |name: &str| v.parse::<f64>().map_err(|_| format!("{name}: \"{v}\" is not a number"));
+        match a.as_str() {
+            "-o" => out = PathBuf::from(v),
+            "--speaker" => speaker = num(a)? as u32,
+            "-t" | "--temp" => temp = num(a)? as f32,
+            "--top-k" => top_k = num(a)? as usize,
+            "--seed" => seed = num(a)? as u64,
+            "-n" | "--max" => max = num(a)? as usize,
+            other => return Err(format!("unknown option {other}")),
+        }
+    }
+    let t0 = Instant::now();
+    let model = csm::Csm::load(&dir)?;
+    let mut s = model.session()?;
+    eprintln!("[loaded in {:.1} s]", t0.elapsed().as_secs_f64());
+    let sampling = csm::Sampling { temperature: temp, top_k, seed };
+    // Mimi decodes on a thread of its own while the GPU makes the next frames, as a stream would
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u32>>();
+    let t1 = Instant::now();
+    let (frames, audio, first_audio) = std::thread::scope(|sc| {
+        let mimi = &model.mimi;
+        let mut st = mimi.state();
+        let worker = sc.spawn(move || {
+            let (mut audio, mut first) = (Vec::new(), None);
+            for f in rx {
+                audio.extend(mimi.decode(&mut st, &[f]));
+                first.get_or_insert_with(|| t1.elapsed());
+            }
+            (audio, first)
+        });
+        let frames = model.speak(&mut s, &[], speaker, &text, max, sampling, |f| tx.send(f.to_vec()).is_ok());
+        drop(tx);
+        let (audio, first) = worker.join().unwrap_or_default();
+        frames.map(|f| (f, audio, first))
+    })?;
+    let total = t1.elapsed();
+    if std::env::var_os("GHOST_INFER_CSM_FRAMES").is_some() {
+        for (i, f) in frames.iter().enumerate().skip(frames.len().saturating_sub(4)) {
+            eprintln!("frame {i}: zeros {}, codes over 2047: {}, first {:?}", f.iter().filter(|&&c| c == 0).count(), f.iter().filter(|&&c| c > 2047).count(), &f[..8]);
+        }
+    }
+    let secs = audio.len() as f64 / model.mimi.sample_rate as f64;
+    std::fs::write(&out, csm::wav(&audio, model.mimi.sample_rate)).map_err(|e| format!("cannot write {}: {e}", out.display()))?;
+    eprintln!(
+        "{:.2} s of audio ({} frames) in {:.2} s ({:.1} ms a frame, first audio after {:.0} ms): {:.2}x real time -> {}",
+        secs,
+        frames.len(),
+        total.as_secs_f64(),
+        total.as_secs_f64() * 1000.0 / frames.len().max(1) as f64,
+        first_audio.map_or(0.0, |d| d.as_secs_f64() * 1000.0),
+        secs / total.as_secs_f64(),
+        out.display()
+    );
+    Ok(())
 }
 
 fn inspect(path: &PathBuf) -> Result<(), String> {
@@ -426,10 +545,20 @@ fn load_with_draft<'a>(g: &'a Gguf, gpu: bool, ctx: usize, draft: Option<&PathBu
             Some(model)
         }
     };
+    let fit = |m: &cuda::GpuModel| cuda::fit_ctx(&[Some(&m.cfg), draft_model.as_ref().map(|d| &d.cfg)].into_iter().flatten().collect::<Vec<_>>());
     let ctx = match (ctx, &main) {
         (0, Some(m)) => {
-            let fit = cuda::fit_ctx(&[Some(&m.cfg), draft_model.as_ref().map(|d| &d.cfg)].into_iter().flatten().collect::<Vec<_>>())?;
+            let fit = fit(m)?;
             if m.cfg.is_moe() { fit.min(cuda::MOE_DEFAULT_CTX) } else { fit }
+        }
+        // asked for: at most what fits, when the caches are made whole at once (more on Windows does not fail,
+        // it quietly lives in system RAM: a call on it ran about seven times slower and stuttered)
+        (c, Some(m)) if !cuda::session_grows(&m.cfg) => {
+            let fit = fit(m)?;
+            if fit < c.min(m.cfg.max_ctx) {
+                eprintln!("[context: {fit} tokens fit in the GPU memory free, not the {c} asked for]");
+            }
+            c.min(fit)
         }
         (0, None) => 4096,
         (c, _) => c,
@@ -915,6 +1044,10 @@ struct ChatFormat {
     glm: bool,
     /// ChatML with Qwen3-Coder's tools: listed as XML, called as <function=...> with a <parameter=...> per argument
     coder: bool,
+    /// Mistral's format ([INST] ... [/INST], replies closed with </s>), as Mistral Nemo and its merges have it
+    mistral: bool,
+    /// Llama 3's format (<|start_header_id|>role<|end_header_id|>, turns closed with <|eot_id|>)
+    llama3: bool,
 }
 
 impl ChatFormat {
@@ -922,10 +1055,16 @@ impl ChatFormat {
         let tpl = g.get("tokenizer.chat_template").and_then(Value::as_str).unwrap_or("");
         let glm = tpl.contains("[gMASK]") && tpl.contains("<|assistant|>");
         if glm {
-            return Ok(ChatFormat { default_system: None, thinking: tpl.contains("enable_thinking"), glm, coder: false });
+            return Ok(ChatFormat { default_system: None, thinking: tpl.contains("enable_thinking"), glm, coder: false, mistral: false, llama3: false });
+        }
+        if !tpl.contains("<|im_start|>") && tpl.contains("[INST]") {
+            return Ok(ChatFormat { default_system: None, thinking: false, glm: false, coder: false, mistral: true, llama3: false });
+        }
+        if !tpl.contains("<|im_start|>") && tpl.contains("<|start_header_id|>") {
+            return Ok(ChatFormat { default_system: None, thinking: false, glm: false, coder: false, mistral: false, llama3: true });
         }
         if !tpl.contains("<|im_start|>") {
-            return Err("this model's chat template is neither ChatML nor GLM's; use --raw".into());
+            return Err("this model's chat template is not ChatML, GLM's, Mistral's or Llama 3's; use --raw".into());
         }
         // the template's built-in system prompt, if it has one: '<|im_start|>system\n…<|im_end|>'
         let default_system = tpl.find("<|im_start|>system").and_then(|i| {
@@ -936,10 +1075,20 @@ impl ChatFormat {
             (!text.is_empty() && !text.contains("{{") && !text.contains("{%")).then(|| text.to_string())
         });
         let coder = tpl.contains("<function=") && tpl.contains("<parameter=");
-        Ok(ChatFormat { default_system, thinking: tpl.contains("enable_thinking"), glm, coder })
+        Ok(ChatFormat { default_system, thinking: tpl.contains("enable_thinking"), glm, coder, mistral: false, llama3: false })
     }
 
     fn first_turn(&self, system: Option<&str>, user: &str) -> String {
+        if self.mistral {
+            return match system {
+                Some(sys) => format!("[INST]{sys}\n\n{user}[/INST]"),
+                None => self.next_turn(user),
+            };
+        }
+        if self.llama3 {
+            let sys = system.map(|s| format!("<|start_header_id|>system<|end_header_id|>\n\n{s}<|eot_id|>")).unwrap_or_default();
+            return format!("{sys}{}", self.next_turn(user));
+        }
         if self.glm {
             let sys = system.map(|s| format!("<|system|>{s}")).unwrap_or_default();
             return format!("[gMASK]<sop>{sys}{}", self.next_turn(user));
@@ -953,6 +1102,12 @@ impl ChatFormat {
     }
 
     fn next_turn(&self, user: &str) -> String {
+        if self.mistral {
+            return format!("[INST]{user}[/INST]");
+        }
+        if self.llama3 {
+            return format!("<|start_header_id|>user<|end_header_id|>\n\n{user}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n");
+        }
         if self.glm {
             return format!("<|user|>{user}<|assistant|>{}", if self.thinking { "<think>" } else { "</think>" });
         }
@@ -1032,10 +1187,17 @@ fn chat(o: &Opts) -> Result<(), String> {
         let mut ids = Vec::new();
         if let Some(end) = pending_end.take().filter(|_| !fmt.glm) {
             ids.push(end);
-            ids.extend(engine.tok.encode("\n"));
+            if !fmt.mistral && !fmt.llama3 {
+                ids.extend(engine.tok.encode("\n"));
+            }
         }
         let text = if first { fmt.first_turn(o.system.as_deref(), msg) } else { fmt.next_turn(msg) };
-        ids.extend(engine.tok.encode(&text));
+        let mut turn = engine.tok.encode(&text);
+        // the tokenizer puts <s> in front of what it encodes when the model wants one: only at the very start
+        if !first && engine.tok.add_bos && turn.first() == engine.tok.bos_id.as_ref() {
+            turn.remove(0);
+        }
+        ids.extend(turn);
         first = false;
         if engine.backend.pos() + ids.len() + 1 >= engine.backend.ctx() {
             eprintln!("(context full - starting a new conversation)");
@@ -1043,7 +1205,7 @@ fn chat(o: &Opts) -> Result<(), String> {
             ids = engine.tok.encode(&fmt.first_turn(o.system.as_deref(), msg));
         }
         let st = engine.generate(&ids, o.max_new, &mut sampler, o.show_special)?;
-        pending_end = st.stopped_on.or_else(|| engine.tok.token_id("<|im_end|>"));
+        pending_end = st.stopped_on.or_else(|| engine.tok.token_id(if fmt.mistral { "</s>" } else if fmt.llama3 { "<|eot_id|>" } else { "<|im_end|>" }));
         print_stats(&st);
     }
     Ok(())

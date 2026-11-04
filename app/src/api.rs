@@ -34,16 +34,20 @@ impl Api {
     }
 
     fn send(&self, method: &str, path: &str, body: Option<&str>) -> Result<Response, String> {
+        self.send_bytes(method, path, "application/json", body.unwrap_or("").as_bytes())
+    }
+
+    fn send_bytes(&self, method: &str, path: &str, content_type: &str, body: &[u8]) -> Result<Response, String> {
         let mut conn = TcpStream::connect(&self.addr).map_err(|e| format!("cannot reach ghost-infer at {}: {e}", self.addr))?;
         conn.set_read_timeout(Some(Duration::from_secs(1800))).ok();
-        let body = body.unwrap_or("");
+        let _ = conn.set_nodelay(true);
         let head = format!(
-            "{method} {path} HTTP/1.1\r\nHost: {}\r\nX-Ghost-Token: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "{method} {path} HTTP/1.1\r\nHost: {}\r\nX-Ghost-Token: {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             self.addr,
             self.token,
             body.len()
         );
-        conn.write_all(head.as_bytes()).and_then(|_| conn.write_all(body.as_bytes())).map_err(|e| e.to_string())?;
+        conn.write_all(head.as_bytes()).and_then(|_| conn.write_all(body)).map_err(|e| e.to_string())?;
         let mut reader = BufReader::new(conn);
         let mut line = String::new();
         reader.read_line(&mut line).map_err(|e| e.to_string())?;
@@ -95,6 +99,27 @@ impl Api {
 
     pub fn delete(&self, path: &str) -> Result<Json, String> {
         self.json("DELETE", path, None)
+    }
+
+    /// POSTs raw bytes (a WAV file, for speech-to-text) and reads the JSON answer.
+    pub fn post_bytes(&self, path: &str, content_type: &str, body: &[u8]) -> Result<Json, String> {
+        let text = self.body(self.send_bytes("POST", path, content_type, body)?)?;
+        Json::parse(&text)
+    }
+
+    /// POSTs `body` and hands each piece of a streamed binary answer (speech) to `on_chunk` as it arrives, until
+    /// it ends or `on_chunk` returns false.
+    pub fn stream_bytes(&self, path: &str, body: &Json, mut on_chunk: impl FnMut(&[u8]) -> bool) -> Result<(), String> {
+        let mut r = self.send("POST", path, Some(&body.to_string()))?;
+        if r.status >= 400 || !r.chunked {
+            return Err(self.body(r).err().unwrap_or_else(|| "the server did not stream an answer".into()));
+        }
+        while let Some(chunk) = next_chunk(&mut r.reader)? {
+            if !on_chunk(&chunk) {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// POSTs `body` and hands each server-sent event's JSON to `on_event` as it arrives, until the stream
