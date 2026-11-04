@@ -62,6 +62,8 @@ with a silence, quick to hear how they are really doing; old jokes and shared me
 ];
 
 const FACTS_MAX: usize = 80;
+/// New facts kept from one call (a small model may list many, most of them alike).
+const NEW_FACTS_MAX: usize = 6;
 const MOMENTS_MAX: usize = 20;
 const CALLS_MAX: usize = 40;
 const CALLS_SHOWN: usize = 6;
@@ -273,6 +275,39 @@ pub fn reset() -> Result<(), String> {
 
 /// After a call: the model, as Maya, reads the call back and says what to remember; the memory gains it and
 /// the call. `seconds`: how long the call was (None: from the chat's first message to its last).
+/// The JSON object in a model's answer. One cut off (the reply ran out of tokens) keeps what it has whole: it is
+/// closed after its last complete value, the brackets open there closed in order.
+fn answer_json(out: &str) -> Option<Json> {
+    let s = &out[out.find('{')?..];
+    if let Some(j) = s.rfind('}').and_then(|end| Json::parse(&s[..=end]).ok()) {
+        return Some(j);
+    }
+    let (mut open, mut in_str, mut esc) = (Vec::new(), false, false);
+    let mut cuts: Vec<(usize, String)> = Vec::new(); // a comma outside strings, and the closers then
+    for (i, ch) in s.char_indices() {
+        if in_str {
+            match ch {
+                _ if esc => esc = false,
+                '\\' => esc = true,
+                '"' => in_str = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '{' => open.push('}'),
+            '[' => open.push(']'),
+            '}' | ']' => {
+                open.pop();
+            }
+            ',' => cuts.push((i, open.iter().rev().collect())),
+            _ => {}
+        }
+    }
+    cuts.iter().rev().find_map(|(i, close)| Json::parse(&format!("{}{close}", &s[..*i])).ok())
+}
+
 pub fn reflect(chat: &str, seconds: Option<f64>, work: &mpsc::Sender<Work>, shared: &Shared, loaded: &Loaded) -> Result<Json, String> {
     let c = load_chat(chat)?;
     let lines = chat_text(&c);
@@ -304,7 +339,7 @@ The call (their words came through speech recognition and may be misheard here a
 Now update your memory. Reply with JSON only, no other text:\n\
 {{\"name\": \"their name if they told you, else empty\",\n\
 \"summary\": \"one or two sentences: what the call was about and how it felt\",\n\
-\"facts\": [\"things you learned about them for the first time in this call and worth remembering (who they are, people and things in their life, likes, plans, worries), each a short sentence; nothing you knew already, reworded or not\"],\n\
+\"facts\": [\"things you learned about them for the first time in this call and worth remembering (who they are, people and things in their life, likes, plans, worries), each a short sentence, six at most, each said once; nothing you knew already, reworded or not\"],\n\
 \"forget\": [\"facts you knew that turned out wrong or no longer true, word for word as above\"],\n\
 \"moment\": \"something that happened in this call worth bringing up again some day (a joke you shared, something they opened up about), told in a few words from your side, or empty\",\n\
 \"impression\": \"two or three sentences in your own words: how you see them and the two of you now\"}}"
@@ -315,7 +350,9 @@ Now update your memory. Reply with JSON only, no other text:\n\
     ]);
     let prompt = chat_prompt_for(loaded, &body, shared.think_default)?;
     let (tx, events) = mpsc::channel();
-    let job = Job { model: loaded.id.clone(), kind: Kind::Chat, prompt, max_tokens: Some(700), temperature: 0.3, top_k: shared.defaults.1, top_p: shared.defaults.2, seed: 1, style: Style::default(), stop: Vec::new(), lead: "", events: tx };
+    // DRY: a small model listed the same facts again and again until the reply ran out, its JSON cut off
+    let style = Style { dry: 0.8, ..Style::default() };
+    let job = Job { model: loaded.id.clone(), kind: Kind::Chat, prompt, max_tokens: Some(900), temperature: 0.3, top_k: shared.defaults.1, top_p: shared.defaults.2, seed: 1, style, stop: Vec::new(), lead: "", events: tx };
     work.send(Work::Job(job)).map_err(|_| "the model is not running")?;
     let mut out = String::new();
     for ev in events {
@@ -326,7 +363,7 @@ Now update your memory. Reply with JSON only, no other text:\n\
         }
     }
     let out = out.rsplit("</think>").next().unwrap_or(&out);
-    let j = out.find('{').zip(out.rfind('}')).filter(|(a, b)| a < b).and_then(|(a, b)| Json::parse(&out[a..=b]).ok()).ok_or_else(|| format!("the model's answer was not JSON: {}", crate::tools::clip(out, 300)))?;
+    let j = answer_json(out).ok_or_else(|| format!("the model's answer was not JSON: {}", crate::tools::clip(out, 300)))?;
     let text = |k: &str| j.get(k).and_then(Json::as_str).map(str::trim).unwrap_or("").to_string();
     let now = now_ms();
     let seconds = seconds.unwrap_or_else(|| {
@@ -340,13 +377,15 @@ Now update your memory. Reply with JSON only, no other text:\n\
     if m.reflected.iter().any(|r| r == chat) {
         return Ok(status_of(&m));
     }
+    // (not the template's own words: "their name", "their name if they told you, else empty")
     let name = text("name");
-    if !name.is_empty() && name.split_whitespace().count() <= 4 && !name.to_lowercase().contains("empty") {
+    let lower = name.to_lowercase();
+    if !name.is_empty() && name.split_whitespace().count() <= 4 && !lower.contains("empty") && !lower.contains("their name") && !lower.contains("unknown") {
         m.name = name;
     }
     let forget: Vec<String> = strings(&j, "forget").iter().map(|f| f.to_lowercase()).collect();
     m.facts.retain(|f| !forget.contains(&f.to_lowercase()));
-    for f in strings(&j, "facts") {
+    for f in strings(&j, "facts").into_iter().take(NEW_FACTS_MAX) {
         if !m.facts.iter().any(|k| k.eq_ignore_ascii_case(&f)) {
             m.facts.push(f);
         }
@@ -392,6 +431,18 @@ fn status_of(m: &Memory) -> Json {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn answer_cut_off_keeps_what_is_whole() {
+        // as Impish wrote one: the facts listed again and again until the reply ran out, mid-string
+        let cut = r#"Sure! {"name": "", "summary": "a fun call", "facts": ["they have a job", "they like gossip", "they are excited to ch"#;
+        let j = answer_json(cut).unwrap();
+        assert_eq!(j.get("summary").and_then(Json::as_str), Some("a fun call"));
+        assert_eq!(strings(&j, "facts"), vec!["they have a job", "they like gossip"]);
+        let whole = r#"{"name": "Sam", "facts": ["a, b"], "moment": "x"} and more"#;
+        assert_eq!(answer_json(whole).unwrap().get("name").and_then(Json::as_str), Some("Sam"));
+        assert!(answer_json("no json here").is_none());
+    }
 
     #[test]
     fn closeness_grows_with_calls_and_time() {
