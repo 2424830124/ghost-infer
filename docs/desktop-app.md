@@ -109,7 +109,7 @@ works: you speak (or type), she answers aloud, a sentence at a time as the model
 <p align="center">
   <img src="demo-voice.gif" width="520" alt="A voice call in the desktop app: a typed question, and Maya's answer spoken while the pixel orb moves with her voice">
   <br><sub>Real time: a call with Impish_LLAMA_3B on an RTX 2060 SUPER (8 GB), with the voice (maya1 with a voice fine-tune
-  of our own, not included: plain maya1 sounds different) and Whisper turbo beside it on the same card.
+  of our own, <a href="https://huggingface.co/affifuddin-hazam/ghost-voice">on Hugging Face</a>) and Whisper turbo beside it on the same card.
   <a href="demo-voice.mp4">With sound</a>.</sub>
 </p>
 
@@ -127,16 +127,26 @@ works: you speak (or type), she answers aloud, a sentence at a time as the model
   **Call Maya** asks before it unloads the Code model (or reloads it with a smaller context), and switching
   back to Code brings it back.
 
-The voice needs two files the server is started with:
+The voice files are on Hugging Face: **[affifuddin-hazam/ghost-voice](https://huggingface.co/affifuddin-hazam/ghost-voice)**
+(about 3 GB). Put them in your models folder like this, then restart ghost:
+
+```
+models\
+  maya1-her\
+    maya1-her-250.Q4_K_M.gguf   (the voice: maya1 with her fine-tune)
+    snac.gguf                   (the audio decoder maya1 speaks through)
+  whisper\
+    whisper-turbo.gguf          (listening; in a folder of its own, or it would show in the model menus)
+```
+
+With the server alone:
 
 ```bash
-# speech: maya1 (a GGUF of maya-research/maya1) and the SNAC decoder in one folder
-python scripts/snac-convert.py C:\models\maya1\snac.gguf
-# listening: Whisper large-v3-turbo as one GGUF (in a folder of its own: in the models folder itself it would
-# show in the model menus)
-python scripts/whisper-convert.py C:\models\whisper\whisper-turbo.gguf
-ghost-infer serve --gpu --models C:\models --tts C:\models\maya1 --stt C:\models\whisper\whisper-turbo.gguf
+ghost-infer serve --gpu --models C:\models --tts C:\models\maya1-her --stt C:\models\whisper\whisper-turbo.gguf
 ```
+
+To make the files yourself instead: `scripts/snac-convert.py` and `scripts/whisper-convert.py` write the SNAC
+decoder and Whisper, and plain maya1 is any GGUF of maya-research/maya1.
 
 Installed, the app finds them in its models folders (Settings, Models) by themselves: a folder with `snac.gguf`
 (or CSM's three files), and a `whisper*.gguf` in a `whisper` folder. A `voice.txt` in the speech folder holds maya1's voice description (a

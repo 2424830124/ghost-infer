@@ -77,7 +77,8 @@ of two runs, llama.cpp with its automatic GPU split. Method and more results in 
 - **A desktop app with an agent.** The model reads and edits your files and runs commands, asking first,
   with permission modes, a task list and background jobs. [More](docs/desktop-app.md)
 - **Voice calls.** Talk with Maya, a companion who answers aloud and remembers your calls, with her own
-  model beside the coding one when the GPU has room. Speech and listening run on the same card.
+  model beside the coding one when the GPU has room. Speech and listening run on the same card. The voice
+  files (about 3 GB) are on [Hugging Face](https://huggingface.co/affifuddin-hazam/ghost-voice).
   [More](docs/desktop-app.md#voice-calls)
 - **Drop-in server.** OpenAI-compatible `/v1/chat/completions` with streaming and tool calls, so editor
   plugins, chat apps and agent harnesses work unchanged. [More](docs/usage.md)
@@ -86,8 +87,8 @@ of two runs, llama.cpp with its automatic GPU split. Method and more results in 
 
 <p align="center">
   <img src="docs/demo-voice.gif" width="520" alt="A voice call in the desktop app: Maya answers aloud while the pixel orb moves with her voice">
-  <br><sub>A voice call, real time: Impish_LLAMA_3B, the voice (maya1 with a voice fine-tune of our own, not included; plain
-  maya1 sounds different) and Whisper turbo together on an 8 GB RTX 2060 SUPER. <a href="docs/demo-voice.mp4">With sound</a>.</sub>
+  <br><sub>A voice call, real time: Impish_LLAMA_3B, the voice (maya1 with a voice fine-tune of our own,
+  <a href="https://huggingface.co/affifuddin-hazam/ghost-voice">on Hugging Face</a>) and Whisper turbo together on an 8 GB RTX 2060 SUPER. <a href="docs/demo-voice.mp4">With sound</a>.</sub>
 </p>
 
 ## Models
