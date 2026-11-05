@@ -535,6 +535,7 @@ pub enum SettingsPage {
     Appearance,
     Models,
     Voice,
+    Maya,
     About,
 }
 
@@ -713,7 +714,10 @@ struct App {
     call: Option<call::Call>, // a voice call going on
     call_state: String,      // listening, thinking, speaking, or what went wrong
     settings_page: SettingsPage, // the section the settings window shows
+    maya_memory: Json,           // what Maya remembers of the user (GET /api/maya), for its settings page
+    maya_name: String,           // the name she calls them, as typed on that page
     call_lines: Vec<(bool, String)>, // the call's turns: (the user's, the text)
+    call_mood: Option<(String, String)>, // Maya's mood and way of talking, as her last reply said
     call_chat: Option<String>, // the chat the call writes in
     call_pending: bool,      // a call asked for while the model loads: it starts once the model runs
     call_timing: String,     // how long the last turn took, step by step
@@ -802,6 +806,12 @@ enum Message {
     Menu(Option<Menu>),
     SetTheme(ThemeMode),
     SettingsPage(SettingsPage),
+    MayaMemory(Result<Json, String>),
+    MayaForget(&'static str, usize),
+    MayaName(String),
+    SaveMayaName,
+    ClearImpression,
+    ResetMaya,
     ToggleCallTimings,
     ToggleCallTyping,
     ToggleSearch,
@@ -1010,7 +1020,10 @@ impl App {
             call: None,
             call_state: String::new(),
             settings_page: SettingsPage::General,
+            maya_memory: Json::Null,
+            maya_name: String::new(),
             call_lines: Vec::new(),
+            call_mood: None,
             call_chat: None,
             call_pending: false,
             call_timing: String::new(),
@@ -1345,7 +1358,31 @@ impl App {
                 });
                 self.save_settings();
             }
-            Message::SettingsPage(page) => self.settings_page = page,
+            Message::SettingsPage(page) => {
+                self.settings_page = page;
+                if page == SettingsPage::Maya {
+                    return self.call(|api| api.get("/api/maya"), Message::MayaMemory);
+                }
+            }
+            Message::MayaMemory(Ok(j)) => {
+                self.maya_name = j.get("name").and_then(Json::as_str).unwrap_or("").to_string();
+                self.maya_memory = j;
+            }
+            Message::MayaMemory(Err(e)) => self.status = format!("Couldn't read Maya's memory: {e}"),
+            Message::MayaForget(list, i) => {
+                let body = obj(vec![("forget", str(list)), ("index", Json::Num(i as f64))]);
+                return self.call(move |api| api.post("/api/maya/edit", &body), Message::MayaMemory);
+            }
+            Message::MayaName(n) => self.maya_name = n,
+            Message::SaveMayaName => {
+                let body = obj(vec![("name", str(self.maya_name.trim()))]);
+                return self.call(move |api| api.post("/api/maya/edit", &body), Message::MayaMemory);
+            }
+            Message::ClearImpression => {
+                let body = obj(vec![("impression", str(""))]);
+                return self.call(move |api| api.post("/api/maya/edit", &body), Message::MayaMemory);
+            }
+            Message::ResetMaya => return self.call(|api| api.post("/api/maya/reset", &Json::Null), Message::MayaMemory),
             Message::ToggleCallTimings => {
                 self.call_timings = !self.call_timings;
                 self.save_settings();
@@ -1685,6 +1722,8 @@ impl App {
                         self.call = Some(c);
                         self.call_wait = None;
                         self.call_lines.clear();
+                        self.call_mood = None;
+                        self.orb.set_mood("");
                         self.call_chat = None;
                         self.call_timing.clear();
                         self.call_started = Some(std::time::Instant::now());
@@ -1729,11 +1768,18 @@ impl App {
                     c.set_muted(!c.muted());
                 }
             }
-            Message::CallText(t) => self.call_text = t,
+            Message::CallText(t) => {
+                // something being typed: Maya does not speak up meanwhile
+                if let Some(c) = &self.call {
+                    c.set_typing(!t.trim().is_empty());
+                }
+                self.call_text = t;
+            }
             Message::SendCallText => {
                 let text = self.call_text.trim().to_string();
                 if let (Some(c), false) = (&self.call, text.is_empty()) {
                     c.send_text(text);
+                    c.set_typing(false);
                     self.call_text.clear();
                 }
             }
@@ -1742,6 +1788,11 @@ impl App {
                 call::CallEvent::You(t) => {
                     self.call_lines.push((true, t));
                     self.call_lines.push((false, String::new()));
+                }
+                call::CallEvent::Her => self.call_lines.push((false, String::new())),
+                call::CallEvent::Mood(mood, talk) => {
+                    self.orb.set_mood(&mood);
+                    self.call_mood = Some((mood, talk));
                 }
                 call::CallEvent::Ghost(t) => {
                     if let Some(l) = self.call_lines.last_mut().filter(|l| !l.0) {
@@ -2283,11 +2334,12 @@ impl App {
     fn orb_input(&self) -> (orb::Phase, f32) {
         use orb::Phase;
         let Some(c) = &self.call else { return (Phase::Ready, 0.0) };
-        if c.muted() {
-            return (Phase::Muted, 0.0);
-        }
+        // her voice moves it whether or not the user's microphone is muted
         if c.talking() {
             return (Phase::Speaking, c.shared.voice());
+        }
+        if c.muted() {
+            return (Phase::Muted, 0.0);
         }
         match self.call_state.as_str() {
             "Thinking" => (Phase::Thinking, 0.0),

@@ -23,7 +23,10 @@ not have. You are a companion, not an assistant: you do not offer help, lists or
 not at them.";
 
 const VOICE: &str = "This is a live voice call: what you write is spoken aloud by your voice, and what they say reaches you through \
-speech recognition (it may mishear a word now and then). Talk the way people talk on the phone: short, natural spoken sentences, \
+speech recognition (it may mishear a word now and then). Begin every reply with your mood and your way of talking right now, in \
+braces: the mood one of calm, happy, playful, curious, excited, tender, thoughtful, sad, annoyed, tired, then a few words for how \
+you talk, as in {playful · teasing} or {tender · soft and slow}. It is not spoken, it only shows how you feel; let it follow the \
+conversation, and talk that way. Talk the way people talk on the phone: short, natural spoken sentences, \
 usually one or two and never more than about forty words, then let them talk; ask at most one question, and only when it keeps the \
 conversation going. Answer what they just said, and move the talk on: never say again what you already said in this call, \
 not even in other words, and do not keep going back to the same topic or to your earlier calls. Do not hedge. Never use lists, \
@@ -34,7 +37,13 @@ which your voice really makes: [laughs], [sighs], [hmm], [gasps], [shocked], [ah
 [whimpers]. At most one sound and one pause in a reply, most replies none, never to begin a reply, and no other bracketed \
 directions. When they ask you to make a sound, make it with its tag and a few words, never describe it (\"[laughs] Okay, that \
 one got me\", not \"a bright, warm laugh\"). Little spoken sounds are fine written as plain words, the way people really talk: \
-um, uh, mm, oh, ooh, whoa, aww, ugh; do not draw them out (no \"Ohhh\" or \"Ughhh\").";
+um, uh, mm, oh, ooh, whoa, aww, ugh; do not draw them out (no \"Ohhh\" or \"Ughhh\"). They can cut in while you talk: a reply \
+of yours that ends in a dash is where they did, so do not finish it, answer what they said. You keep the conversation alive \
+yourself: when a note says they have gone quiet, it is your turn, so say something of your own (a thought on what you were \
+talking about, something you are curious about, a new topic, or what you remember of them) as a friend on a call would, and \
+never mention the note. You can end the call yourself, as people do: when you have both said goodbye, or they ask you to hang \
+up, say your goodbye and put [hang up] right after the braces, as in {tender · warm} [hang up] Okay, talk soon. Bye! Only then, \
+never just because the talk slows down.";
 
 /// How well they know each other, from strangers to close.
 const STAGES: [(&str, &str); 4] = [
@@ -260,6 +269,43 @@ pub fn status() -> Json {
         fields.push(("persona".into(), str(&dir().map(|d| d.join("persona.md").display().to_string()).unwrap_or_default())));
     }
     j
+}
+
+/// POST /api/maya/edit: the user's own changes to what she remembers, one per request: {"forget": "facts" |
+/// "moments" | "calls", "index"} drops one line, {"name"} or {"impression"} sets that ("" clears it). Answers
+/// with the memory as GET /api/maya has it.
+pub fn edit(b: &Json) -> Result<Json, String> {
+    let _hold = LOCK.lock().unwrap();
+    let mut m = load();
+    if let Some(list) = b.get("forget").and_then(Json::as_str) {
+        let i = b.get("index").and_then(Json::as_f64).ok_or("which one to forget: no index")? as usize;
+        let len = match list {
+            "facts" => m.facts.len(),
+            "moments" => m.moments.len(),
+            "calls" => m.calls.len(),
+            _ => return Err(format!("she keeps no list called {list}")),
+        };
+        if i >= len {
+            return Err("that line is not there any more".into());
+        }
+        match list {
+            "facts" => drop(m.facts.remove(i)),
+            "moments" => drop(m.moments.remove(i)),
+            _ => drop(m.calls.remove(i)),
+        }
+    }
+    if let Some(name) = b.get("name").and_then(Json::as_str) {
+        m.name = name.trim().to_string();
+    }
+    if let Some(imp) = b.get("impression").and_then(Json::as_str) {
+        m.impression = imp.trim().to_string();
+    }
+    save(&m)?;
+    let mut j = status_of(&m);
+    if let Json::Obj(fields) = &mut j {
+        fields.push(("persona".into(), str(&dir().map(|d| d.join("persona.md").display().to_string()).unwrap_or_default())));
+    }
+    Ok(j)
 }
 
 /// POST /api/maya/reset: they start again as strangers (the old memory kept beside it as memory-<time>.json).

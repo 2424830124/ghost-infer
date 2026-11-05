@@ -471,6 +471,7 @@ impl App {
             nav_item(P::Appearance, ic::COLOR, "Appearance"),
             nav_item(P::Models, ic::FOLDER, "Models"),
             nav_item(P::Voice, ic::MIC, "Voice"),
+            nav_item(P::Maya, ic::MEMORY, "Maya"),
             nav_item(P::About, ic::INFO, "About"),
         ]
         .spacing(2);
@@ -588,7 +589,7 @@ impl App {
                     "Where ghost finds models.",
                     vec![
                         group("Folders", rows),
-                        text("Voice calls find their files in these folders too: a speech folder (a maya1 GGUF with snac.gguf) and a whisper folder with a whisper*.gguf. They are read when ghost starts.").size(12.5).color(s.faint).into(),
+                        text("Voice calls find their files in these folders too: a speech folder (a maya1 GGUF with snac.gguf) and a whisper folder with a whisper*.gguf, from huggingface.co/affifuddin-hazam/ghost-voice. They are read when ghost starts.").size(12.5).color(s.faint).into(),
                     ],
                 )
             }
@@ -617,6 +618,49 @@ impl App {
                         ),
                         group("During a call", vec![row_of("Show response timings", "How long each reply took to start: for checking speed.".into(), switch(self.call_timings, Message::ToggleCallTimings))]),
                         text("The voice models are chosen when the server starts (its --tts and --stt options).").size(12.5).color(s.faint).into(),
+                    ],
+                )
+            }
+            P::Maya => {
+                let m = &self.maya_memory;
+                let list = |k: &str| -> Vec<String> { m.get(k).and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(Json::as_str).map(String::from).collect() };
+                // a remembered line, with an X that makes her forget it
+                let line = |t: String, msg: Message| -> Element<'static, Message> {
+                    let x = button(icon(ic::CANCEL, 9).color(s.faint)).on_press(msg).padding([4, 5]).style(move |_, st| bare(s, st));
+                    row![text(t).size(13).color(s.text).width(Fill), x].spacing(12).align_y(Alignment::Center).padding([10, 18]).into()
+                };
+                let none = |t: &'static str| -> Vec<Element<'static, Message>> { vec![container(text(t).size(12.5).color(s.faint)).padding([12, 18]).into()] };
+                let or_none = |rows: Vec<Element<'static, Message>>, t: &'static str| if rows.is_empty() { none(t) } else { rows };
+
+                let count = m.get("count").and_then(Json::as_f64).unwrap_or(0.0) as u64;
+                let minutes = (m.get("seconds").and_then(Json::as_f64).unwrap_or(0.0) / 60.0).round() as u64;
+                let stage = m.get("stage").and_then(Json::as_str).unwrap_or("stranger");
+                let known = if count == 0 { "You haven't talked yet.".to_string() } else { format!("{count} call{}, about {minutes} min in all.", if count == 1 { "" } else { "s" }) };
+                let stage = stage[..1].to_uppercase() + &stage[1..];
+                let name = row![
+                    text_input("What she calls you", &self.maya_name).on_input(Message::MayaName).on_submit(Message::SaveMayaName).size(13).padding([6, 10]).width(200).style(move |t, st| input_style(s, t, st)),
+                    action("Save", Message::SaveMayaName, false),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center);
+
+                let facts = list("facts").into_iter().enumerate().map(|(i, f)| line(f, Message::MayaForget("facts", i))).collect();
+                let moments = list("moments").into_iter().enumerate().map(|(i, f)| line(f, Message::MayaForget("moments", i))).collect();
+                // the calls, latest first, each by its summary
+                let calls = m.get("calls").and_then(Json::as_array).unwrap_or(&[]);
+                let calls = calls.iter().enumerate().rev().map(|(i, c)| line(c.get("summary").and_then(Json::as_str).unwrap_or("").to_string(), Message::MayaForget("calls", i))).collect();
+                let impression = m.get("impression").and_then(Json::as_str).unwrap_or("").to_string();
+                let impression = if impression.is_empty() { none("Nothing yet.") } else { vec![line(impression, Message::ClearImpression)] };
+                (
+                    "Maya",
+                    "What she remembers of you, from your calls. Remove anything you don't want her to know.",
+                    vec![
+                        group("You", vec![row_of("Your name", "What she calls you.".into(), name.into()), row_of("How close you are", known, value(stage))]),
+                        group("What she knows about you", or_none(facts, "Nothing yet.")),
+                        group("Moments you share", or_none(moments, "None yet.")),
+                        group("Calls she remembers", or_none(calls, "None yet.")),
+                        group("How she sees you", impression),
+                        group("Start over", vec![row_of("Forget everything", "She meets you again as a stranger. The old memory is kept beside it as a backup.".into(), action("Start over", Message::ResetMaya, true))]),
                     ],
                 )
             }
@@ -1267,8 +1311,8 @@ impl App {
 
         // where the call is: a dot of colour and a word; anything else (loading, an error) as a plain line
         let (dot, word) = match (in_call, self.call_state.as_str()) {
-            (true, _) if muted => (Some(s.faint), "Muted".to_string()),
             (true, _) if talking => (Some(s.accent), "Speaking".to_string()),
+            (true, _) if muted => (Some(s.faint), "Muted".to_string()),
             (true, "Thinking") => (Some(s.warn), "Thinking".to_string()),
             (true, "Hearing you") => (Some(s.ok), "Hearing you".to_string()),
             (true, "Listening") | (true, "") => (Some(s.ok), "Listening".to_string()),
@@ -1285,6 +1329,20 @@ impl App {
             .style(move |_| container::Style { background: Some(Background::Color(s.raise)), border: Border { radius: 999.0.into(), width: 1.0, color: s.line }, ..Default::default() })
             .into(),
             None => text(word).size(13).color(s.muted).into(),
+        };
+
+        // her mood and way of talking, as her last reply opened
+        let mood: Element<'_, Message> = match self.call_mood.as_ref().filter(|_| in_call) {
+            Some((m, t)) => {
+                let cap = |w: &str| w.chars().next().map(|c| c.to_uppercase().collect::<String>() + &w[c.len_utf8()..]).unwrap_or_default();
+                let line = |k: &'static str, v: String| row![text(k).size(12.5).color(s.faint), text(v).size(12.5).color(s.muted)].spacing(6);
+                let mut col = column![line("Current mood", cap(m))].spacing(3).align_x(Alignment::Center);
+                if !t.is_empty() {
+                    col = col.push(line("Way of talk", t.clone()));
+                }
+                container(col).padding([10, 0]).into()
+            }
+            None => Space::new().height(0).into(),
         };
 
         let face = canvas(crate::orb::Orb { sim: &self.orb, skin: s, cell: 6.0 }).width(288).height(288);
@@ -1329,7 +1387,7 @@ impl App {
             }
             _ => Space::new().height(0).into(),
         };
-        let mut col = column![Space::new().height(Fill), header, Space::new().height(6), talks, Space::new().height(8), status, face, captions].align_x(Alignment::Center).width(Fill);
+        let mut col = column![Space::new().height(Fill), header, Space::new().height(6), talks, Space::new().height(8), status, mood, face, captions].align_x(Alignment::Center).width(Fill);
         col = col.push(Space::new().height(28)).push(controls);
         // typing instead of speaking, answered aloud the same way: a box with a send button, when asked for
         if in_call && self.call_typing {

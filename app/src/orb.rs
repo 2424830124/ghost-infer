@@ -50,14 +50,35 @@ const HOT_L: f32 = 0.92;
 const MID_L: f32 = 0.65;
 const DEEP_L: f32 = 0.41;
 
-/// The five colours a cell can take, faint to bright: Graphite's from its accent to white, Fog's from pale to ink.
-fn ramp(s: &Skin) -> [Color; 5] {
-    let c = |r, g, b| Color::from_rgb8(r, g, b);
+/// Maya's moods and the colour each gives the orb (the first, calm, is its own indigo); a mood not here keeps
+/// the colour it has.
+pub const MOODS: [(&str, [u8; 3]); 10] = [
+    ("calm", [88, 104, 220]),
+    ("happy", [236, 184, 52]),
+    ("playful", [232, 92, 168]),
+    ("curious", [36, 184, 184]),
+    ("excited", [246, 126, 40]),
+    ("tender", [232, 116, 138]),
+    ("thoughtful", [132, 108, 222]),
+    ("sad", [86, 122, 176]),
+    ("annoyed", [222, 70, 58]),
+    ("tired", [138, 138, 164]),
+];
+
+/// The five colours a cell can take, faint to bright, from the orb's colour: from deep to white on Graphite,
+/// from pale to ink on Fog.
+fn ramp(s: &Skin, tint: [f32; 3]) -> [Color; 5] {
+    let scale = |k: f32| Color::from_rgb(tint[0] * k, tint[1] * k, tint[2] * k);
+    let pale = |k: f32| Color::from_rgb(tint[0] + (1.0 - tint[0]) * k, tint[1] + (1.0 - tint[1]) * k, tint[2] + (1.0 - tint[2]) * k);
     if s.dark {
-        [c(44, 48, 82), c(78, 90, 186), c(185, 199, 255), c(232, 235, 243), c(255, 255, 255)]
+        [scale(0.32), scale(0.85), pale(0.55), pale(0.88), Color::WHITE]
     } else {
-        [c(212, 216, 240), c(150, 160, 222), c(61, 74, 168), c(36, 44, 120), c(11, 14, 23)]
+        [pale(0.78), pale(0.45), scale(0.72), scale(0.45), scale(0.1)]
     }
+}
+
+fn rgb(c: [u8; 3]) -> [f32; 3] {
+    c.map(|v| v as f32 / 255.0)
 }
 
 fn bayer(x: usize, y: usize) -> f32 {
@@ -88,6 +109,8 @@ pub struct Sim {
     seed: u32,
     phase: Phase,
     last: Option<u64>,
+    tint: [f32; 3],    // its colour now, easing to `tint_to` (her mood's)
+    tint_to: [f32; 3],
 }
 
 impl Sim {
@@ -105,6 +128,16 @@ impl Sim {
             seed: 0x9e37_79b9,
             phase: Phase::Ready,
             last: None,
+            tint: rgb(MOODS[0].1),
+            tint_to: rgb(MOODS[0].1),
+        }
+    }
+
+    /// Her mood, as the orb's colour ("" for calm, the call's start); one not in MOODS leaves it as it is.
+    pub fn set_mood(&mut self, mood: &str) {
+        let mood = if mood.is_empty() { "calm" } else { mood };
+        if let Some((_, c)) = MOODS.iter().find(|(m, _)| *m == mood) {
+            self.tint_to = rgb(*c);
         }
     }
 
@@ -126,6 +159,11 @@ impl Sim {
         let tgt = params(phase);
         for (c, t) in self.cur.iter_mut().zip(tgt) {
             *c += (t - *c) * k;
+        }
+        // a new mood's colour comes in over about a second
+        let kt = 1.0 - (-dt * 2.5).exp();
+        for (c, t) in self.tint.iter_mut().zip(self.tint_to) {
+            *c += (t - *c) * kt;
         }
         // quick up, slow down (per sixtieth of a second, as the mockup's frames)
         let raw = if phase == Phase::Muted { 0.0 } else { level };
@@ -485,7 +523,7 @@ impl<Message> canvas::Program<Message> for Orb<'_> {
             }
         }
         self.rings(&set, &mut lvl, n);
-        let ramp = ramp(self.skin);
+        let ramp = ramp(self.skin, self.sim.tint);
         runs(&mut frame, n, n, ox, oy, cell, |x, y| match lvl[y * n + x] {
             0 => None,
             l => Some(ramp[l as usize - 1]),

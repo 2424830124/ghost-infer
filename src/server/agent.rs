@@ -1353,6 +1353,8 @@ struct Request {
     preview: bool,  // the client shows web pages the model writes itself (the app's preview pane)
     sub: String,    // a subagent's: the id of the call that started it, its own calls' ids begun with it ("" for a reply)
     persona: String, // who answers instead of ghost ("persona": "maya", the voice call's companion): her prompt (maya.rs)
+    cut: Option<String>, // a call's: the last reply was cut off by the user's voice after these words (it is kept as said)
+    auto: bool,          // the message is the call's, not the user's ("they went quiet"): hidden, and not what they said
 }
 
 impl Request {
@@ -1389,6 +1391,8 @@ impl Request {
             preview: b.get("preview").and_then(Json::as_bool).unwrap_or(false),
             sub: String::new(),
             persona: if maya { super::maya::prompt() } else { String::new() },
+            cut: b.get("cut").and_then(Json::as_str).map(String::from),
+            auto: b.get("auto").and_then(Json::as_bool).unwrap_or(false),
         }
     }
 
@@ -1465,6 +1469,27 @@ pub fn run(conn: &mut TcpStream, body: &Json, work: &mpsc::Sender<Work>, shared:
         let req = req.in_chat(&chat, shared);
         match &req.message {
             Some(m) => {
+                // cut off by the user's voice: her last reply is what she got out before it, as the model
+                // should remember it
+                // (a reply stopped while it was written was not kept: it is added)
+                if let Some(said) = &req.cut {
+                    let said = said.trim();
+                    let kept = if said.is_empty() { "—".to_string() } else { format!("{said} —") };
+                    match chat.messages.last_mut() {
+                        Some(Json::Obj(fields)) if fields.iter().any(|(k, v)| k == "role" && v.as_str() == Some("assistant")) => {
+                            fields.retain(|(k, _)| k != "content");
+                            fields.push(("content".to_string(), str(&kept)));
+                        }
+                        Some(_) => chat.messages.push(obj(vec![("role", str("assistant")), ("content", str(&kept))])),
+                        None => {}
+                    }
+                }
+                if req.auto {
+                    chat.messages.push(obj(vec![("role", str("user")), ("content", str(m)), ("auto", Json::Bool(true))]));
+                    chat.save()?;
+                    let Some(_turn) = take_turn(&mut out) else { return Err("the client went away".into()) };
+                    return reply(&mut out, &req, &mut chat, false, work, shared, loaded);
+                }
                 if chat.title.is_empty() {
                     let line = m.trim().lines().next().unwrap_or("");
                     chat.title = if line.chars().count() > 60 { format!("{}…", line.chars().take(57).collect::<String>().trim_end()) } else { line.to_string() };
@@ -1682,6 +1707,8 @@ pub fn run_away(w: &Wakeup, keep: impl Fn(&str) -> bool, work: &mpsc::Sender<Wor
         preview: false,
         sub: String::new(),
         persona: String::new(),
+        cut: None,
+        auto: false,
     };
     let before = chat.messages.len();
     chat.messages.push(obj(vec![("role", str("user")), ("content", str(w.text)), ("shown", str(w.shown))]));

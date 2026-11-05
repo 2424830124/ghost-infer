@@ -17,6 +17,8 @@ pub const MIC_RATE: u32 = 16_000;
 const FRAME: usize = 480;
 /// Audio kept from before the voice rose (its first sounds are quiet).
 const PRE_ROLL: usize = 10; // frames: 300 ms
+/// Loud frames in a row that cut into the call's voice (300 ms).
+const BARGE_FRAMES: usize = 10;
 /// Quiet that ends an utterance (GHOST_APP_END_MS), quiet after which what was said so far is offered for
 /// transcribing ahead (GHOST_APP_PAUSE_MS; 0: never), and the longest utterance (then it is sent as it is).
 /// Measured with the 4B model, from the last word to the first sound: 750 ms and none took 1.5–1.95 s; 450 and
@@ -51,6 +53,11 @@ pub struct Shared {
     voice: AtomicU32,
     /// ends both threads
     pub stop: AtomicBool,
+    /// the user's voice is heard while the call's voice plays, to cut in (a headset: the call's own voice does
+    /// not reach the microphone; GHOST_APP_NO_BARGE_IN=1 on speakers, where it would cut itself off)
+    pub barge: AtomicBool,
+    /// the user is typing a message (the call does not take the quiet for its turn)
+    pub typing: AtomicBool,
 }
 
 fn now_ms() -> u64 {
@@ -199,9 +206,11 @@ pub fn start_mic(shared: Arc<Shared>, heard: mpsc::Sender<Heard>) -> Result<(), 
             rs.push(&block, &mut pending);
             while pending.len() >= FRAME {
                 let frame: Vec<f32> = pending.drain(..FRAME).collect();
-                // the call's own voice, or muted: heard as silence (and the noise floor is left alone)
-                let deaf = shared.muted.load(Ordering::Relaxed) || shared.speaking();
-                if let Some(h) = det.push(&frame, deaf, &shared) {
+                // the call's own voice, or muted: heard as silence (and the noise floor is left alone); with
+                // barge-in, only a voice held longer while it plays
+                let speaking = shared.speaking();
+                let deaf = shared.muted.load(Ordering::Relaxed) || (speaking && !shared.barge.load(Ordering::Relaxed));
+                if let Some(h) = det.push(&frame, deaf, speaking, &shared) {
                     if heard.send(h).is_err() {
                         return;
                     }
@@ -244,7 +253,8 @@ fn trimmed(audio: &[f32], quiet: usize) -> Vec<f32> {
 }
 
 impl Detector {
-    fn push(&mut self, frame: &[f32], deaf: bool, shared: &Shared) -> Option<Heard> {
+    /// `over_voice`: the call's voice is playing (a voice must last longer to start, and the floor is kept).
+    fn push(&mut self, frame: &[f32], deaf: bool, over_voice: bool, shared: &Shared) -> Option<Heard> {
         let rms = (frame.iter().map(|v| v * v).sum::<f32>() / frame.len() as f32).sqrt();
         shared.level.store(((rms * 12.0).min(1.0)).to_bits(), Ordering::Relaxed);
         if self.floor == 0.0 {
@@ -262,14 +272,17 @@ impl Detector {
         match &mut self.speech {
             None => {
                 // the floor follows the room while nobody speaks: down at once, up slowly
-                self.floor = if rms < self.floor { rms.max(1e-4) } else { self.floor * 0.995 + rms * 0.005 };
+                if !over_voice {
+                    self.floor = if rms < self.floor { rms.max(1e-4) } else { self.floor * 0.995 + rms * 0.005 };
+                }
                 self.loud_run = if loud { self.loud_run + 1 } else { 0 };
                 self.before.push_back(frame.to_vec());
                 if self.before.len() > PRE_ROLL {
                     self.before.pop_front();
                 }
-                // three loud frames in a row (90 ms): a voice, not a click
-                if self.loud_run >= 3 {
+                // three loud frames in a row (90 ms): a voice, not a click; over the call's voice ten (300 ms),
+                // so a breath or a bump does not cut it off
+                if self.loud_run >= if over_voice { BARGE_FRAMES } else { 3 } {
                     let audio: Vec<f32> = self.before.drain(..).flatten().collect();
                     self.speech = Some(Speech { audio, quiet: 0, loud: 3, last_loud: Instant::now(), paused: false });
                     return Some(Heard::Started);

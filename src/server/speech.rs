@@ -427,7 +427,8 @@ fn pieces(text: &str, tags: bool) -> Vec<Piece> {
         }
         words.clear();
     };
-    let mut rest = text;
+    let text = no_special(text);
+    let mut rest = text.as_str();
     while let Some(open) = rest.find('[') {
         let Some(len) = rest[open..].find(']') else { break };
         words.push_str(&rest[..open]);
@@ -484,6 +485,26 @@ fn maya1_tags(text: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// A reply without the chat format's own tokens a model let slip into its text, and the role name right after
+/// one: a Llama 3 roleplay model answered "<|python_tag|>user<|python_tag|>(\"Hello...\")", and maya1, whose
+/// tokenizer has the same specials, read the tokens as tokens and mumbled.
+fn no_special(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find("<|") {
+        let Some(len) = rest[open..].find("|>") else { break };
+        out.push_str(&rest[..open]);
+        rest = &rest[open + len + 2..];
+        let word = rest.trim_start().split(|c: char| !c.is_alphabetic()).next().unwrap_or("");
+        if matches!(word, "user" | "assistant" | "system") {
+            rest = &rest.trim_start()[word.len()..];
+        }
+        out.push(' ');
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Words as the voice reads them well: straight quotes and apostrophes, three dots for an ellipsis, no Markdown
@@ -735,6 +756,13 @@ mod tests {
             vec![Piece::Words("<laugh> Stop it.".into()), Piece::Quiet(0.8), Piece::Words("I know <sigh> right? <whisper> Come here. Ugh, fine, <laugh>".into())]
         );
         assert_eq!(pieces("[giggles] okay [gasps] what [chuckles]", true), vec![Piece::Words("<giggle> Okay <gasp> what <chuckle>".into())]);
+    }
+
+    #[test]
+    fn chat_format_tokens_are_not_read() {
+        assert_eq!(pieces("<|python_tag|>user<|python_tag|>(\"Hello there. How are you?\")", true), vec![Piece::Words("(Hello there. How are you?)".into())]);
+        assert_eq!(pieces("<|python_tag|>user", true), vec![]);
+        assert_eq!(pieces("Fine, thanks.<|eot_id|>", false), vec![Piece::Words("Fine, thanks.".into())]);
     }
 
     #[test]

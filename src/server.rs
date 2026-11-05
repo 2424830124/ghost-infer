@@ -132,6 +132,12 @@ impl VoiceTags {
                 if c == ']' {
                     let tag = self.open[1..self.open.len() - 1].trim().to_lowercase();
                     let (pause, sound) = (Self::PAUSES.contains(&tag.as_str()), Self::SOUNDS.contains(&tag.as_str()));
+                    // Maya ending the call: for the app, never spoken (the voice leaves it out)
+                    if tag == "hang up" {
+                        out.push_str(&self.open);
+                        self.open.clear();
+                        continue;
+                    }
                     // a pause before the first word is only a later start; a sound there ([laughs] when asked to laugh) is kept
                     if (pause && self.spoke && !self.paused) || (sound && !self.sounded) {
                         out.push_str(&self.open);
@@ -601,6 +607,31 @@ fn warm_agent(engine: &mut Engine, shared: &Shared) {
 fn run(engine: &mut Engine, model: &str, job: Job) {
     if job.model != model {
         let _ = job.events.send(Event::Error(409, format!("the model changed to {model} while this request waited; send it again")));
+        return;
+    }
+    // GHOST_INFER_WIZARD=<folder>: a voice call's replies written by hand instead of by the model (to tell a
+    // weak model from a weak voice): the prompt goes to <folder>\ask.txt, the reply is taken from reply.txt
+    if let (true, Some(dir)) = (job.style.spoken, std::env::var_os("GHOST_INFER_WIZARD")) {
+        let dir = PathBuf::from(dir);
+        let (ask, reply) = (dir.join("ask.txt"), dir.join("reply.txt"));
+        let _ = std::fs::remove_file(&reply);
+        let _ = std::fs::write(&ask, &job.prompt);
+        let t = Instant::now();
+        let text = loop {
+            if let Ok(r) = std::fs::read_to_string(&reply) {
+                if r.ends_with('\n') {
+                    let _ = std::fs::remove_file(&reply);
+                    break r.trim().to_string();
+                }
+            }
+            if t.elapsed().as_secs() > 180 {
+                break "[sighs] Sorry, I lost my train of thought.".to_string();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+        };
+        let _ = std::fs::remove_file(&ask);
+        let _ = job.events.send(Event::Text(text));
+        let _ = job.events.send(Event::Done { finish: "stop", prompt_tokens: 0, completion_tokens: 0 });
         return;
     }
     let t0 = Instant::now();
@@ -1365,6 +1396,10 @@ fn handle(mut conn: TcpStream, work: &mpsc::Sender<Work>, shared: &Shared) -> Re
             ("POST", "/api/maya/reset") => match maya::reset() {
                 Ok(()) => respond_private(&mut conn, 200, &maya::status()),
                 Err(e) => respond_private(&mut conn, 500, &error_body(&e)),
+            },
+            ("POST", "/api/maya/edit") => match maya::edit(&body().unwrap_or(Json::Null)) {
+                Ok(j) => respond_private(&mut conn, 200, &j),
+                Err(e) => respond_private(&mut conn, 400, &error_body(&e)),
             },
             // {"id": ..., "decision": "once" | "always" | "deny"}: the user's answer to an approval event
             ("POST", "/api/agent/approve") => {
