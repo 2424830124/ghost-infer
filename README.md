@@ -34,7 +34,7 @@ for the other case: **one person, one consumer GPU, one model at a time**, and i
 
 ## What's new
 
-Since 0.2.3:
+New in 0.2.4:
 
 - **Long chats stay fast on Qwen3.6-35B-A3B.** Its attention (256-wide heads) now runs on the tensor cores,
   both when it writes and when it reads a prompt. On an RTX 2060 SUPER, generation at a 16K context went from
