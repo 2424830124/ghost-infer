@@ -7,6 +7,9 @@ mod api;
 mod attach;
 mod call;
 mod ghost;
+// the app's words in English or Chinese
+#[macro_use]
+mod i18n;
 #[path = "../../src/json.rs"]
 #[allow(dead_code)]
 mod json;
@@ -17,6 +20,7 @@ mod tray;
 mod view;
 mod voice;
 
+use crate::i18n::tr;
 use std::time::Instant;
 
 use iced::futures::channel::{mpsc, oneshot};
@@ -99,7 +103,7 @@ fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> impl s
     std::thread::spawn(move || {
         let _ = tx.send(f());
     });
-    async move { rx.await.expect("the worker thread ended without an answer") }
+    async move { rx.await.expect(tr("the worker thread ended without an answer")) }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -205,11 +209,11 @@ fn folder_name(path: &str) -> String {
 /// What "Always allow" covers, by approval group.
 fn group_name(group: &str) -> &'static str {
     match group {
-        "edit" => "file changes",
-        "cmd" => "commands",
-        "mcp" => "MCP tools",
-        "skills" => "skill installs",
-        _ => "web access",
+        "edit" => tr("file changes"),
+        "cmd" => tr("commands"),
+        "mcp" => tr("MCP tools"),
+        "skills" => tr("skill installs"),
+        _ => tr("web access"),
     }
 }
 
@@ -411,28 +415,39 @@ fn tool_label(t: &ToolLine) -> String {
 fn approval_text(t: &ToolLine) -> (String, String) {
     let a = Json::parse(&t.arguments).unwrap_or(Json::Null);
     let s = |k: &str| a.get(k).and_then(Json::as_str).unwrap_or("").to_string();
-    let cwd = if s("cwd").is_empty() { String::new() } else { format!(" in {}", s("cwd")) };
+    let dir = s("cwd");
     match t.name.as_str() {
-        "write_file" if a.get("append").and_then(Json::as_bool) == Some(true) => (format!("Add {} lines to {}?", s("content").lines().count(), s("path")), s("content")),
-        "write_file" => (format!("Write {} ({} lines)?", s("path"), s("content").lines().count()), s("content")),
+        "write_file" if a.get("append").and_then(Json::as_bool) == Some(true) => {
+            let (n, path) = (s("content").lines().count(), s("path"));
+            (tf!("Add {n} lines to {path}?", "向 {path} 追加 {n} 行？"), s("content"))
+        }
+        "write_file" => (
+            tf!("Write {} ({} lines)?", "写入 {}（{} 行）？", s("path"), s("content").lines().count()),
+            s("content"),
+        ),
         "edit_file" => {
             let lines = |k: &str, mark: &str| s(k).lines().map(|l| format!("{mark} {l}")).collect::<Vec<_>>().join("\n");
-            (format!("Change {}?", s("path")), format!("{}\n{}", lines("old_string", "-"), lines("new_string", "+")))
+            (tf!("Change {}?", "修改 {}？", s("path")), format!("{}\n{}", lines("old_string", "-"), lines("new_string", "+")))
         }
-        "run_command" => (format!("Run this in PowerShell{cwd}?"), s("command")),
-        "start_process" => (format!("Start this in the background{cwd}?"), s("command")),
-        "web_search" => (format!("Search the web for \"{}\"?", s("query")), String::new()),
-        "fetch_url" => (format!("Open {}?", s("url")), String::new()),
-        "install_skill" => (format!("Install a skill from {}?", s("source")), if s("skill").is_empty() { String::new() } else { format!("Skill: {}", s("skill")) }),
+        "run_command" if dir.is_empty() => (tf!("Run this in PowerShell?", "在 PowerShell 中运行这条？"), s("command")),
+        "run_command" => (tf!("Run this in PowerShell in {}?", "在 PowerShell 中（{}）运行这条？", &dir), s("command")),
+        "start_process" if dir.is_empty() => (tf!("Start this in the background?", "在后台启动这个？"), s("command")),
+        "start_process" => (tf!("Start this in the background in {}?", "在后台（{}）启动这个？", &dir), s("command")),
+        "web_search" => (tf!("Search the web for \"{}\"?", "联网搜索“{}”？", s("query")), String::new()),
+        "fetch_url" => (tf!("Open {}?", "打开 {}？", s("url")), String::new()),
+        "install_skill" => (
+            tf!("Install a skill from {}?", "从 {} 安装一个技能？", s("source")),
+            if s("skill").is_empty() { String::new() } else { tf!("Skill: {}", "技能：{}", s("skill")) },
+        ),
         n if n.starts_with("mcp__") => {
             let (server, tool) = mcp_parts(n);
             let args = match Json::parse(&t.arguments) {
                 Ok(Json::Obj(f)) => f.iter().map(|(k, v)| format!("{k}: {}", v.as_str().map(String::from).unwrap_or_else(|| v.to_string()))).collect::<Vec<_>>().join("\n"),
                 _ => t.arguments.clone(),
             };
-            (format!("Use {tool} from the {server} MCP server?"), args)
+            (tf!("Use {tool} from the {server} MCP server?", "使用 {server} MCP 服务器的 {tool}？"), args)
         }
-        other => (format!("Use {other}?"), t.arguments.clone()),
+        other => (tf!("Use {}?", "使用 {}？", other), t.arguments.clone()),
     }
 }
 
@@ -576,6 +591,7 @@ struct Saved {
     model_dirs: Vec<String>,    // folders of models already on this computer (an installed app's server reads them)
     call_timings: bool,         // a call shows how long each reply took (Settings, Voice)
     call_model: Option<String>, // the model calls talk to (None: the Code model's)
+    lang: crate::i18n::Lang,    // the app's words: English, Chinese, or whatever Windows is set to
 }
 
 fn load_settings() -> Saved {
@@ -600,6 +616,11 @@ fn load_settings() -> Saved {
         model_dirs: j.get("model_dirs").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(Json::as_str).map(String::from).collect(),
         call_timings: j.get("call_timings").and_then(Json::as_bool).unwrap_or(false),
         call_model: j.get("call_model").and_then(Json::as_str).map(String::from),
+        lang: match j.get("lang").and_then(Json::as_str) {
+            Some("en") => crate::i18n::Lang::En,
+            Some("zh") => crate::i18n::Lang::Zh,
+            _ => crate::i18n::Lang::System,
+        },
     }
 }
 
@@ -638,6 +659,7 @@ fn windows_dark() -> bool {
 struct App {
     theme: Theme,
     mode: ThemeMode,
+    lang: crate::i18n::Lang,
     dark: bool,
     menu: Option<Menu>,
     clock: u64,               // milliseconds since the app started, for the ghost
@@ -757,10 +779,12 @@ pub struct Slash {
 }
 
 /// The commands / offers before the skills.
-const COMMANDS: [(&str, &str); 2] = [
-    ("goal", "Keep working until what you describe is done, checked after each try"),
-    ("loop", "Repeat a prompt in this chat every few minutes: /loop 10m check the build"),
-];
+fn commands() -> [(&'static str, &'static str); 2] {
+    [
+        ("goal", tr("Keep working until what you describe is done, checked after each try")),
+        ("loop", tr("Repeat a prompt in this chat every few minutes: /loop 10m check the build")),
+    ]
+}
 
 /// Where the text names one of `names` with a slash (/design-taste-frontend), as byte ranges: a / at the start
 /// or after a space, then the name, ending at a space, a line's end or a mark such as a comma.
@@ -823,6 +847,7 @@ enum Message {
     Tick,
     Menu(Option<Menu>),
     SetTheme(ThemeMode),
+    SetLang(crate::i18n::Lang),
     SettingsPage(SettingsPage),
     MayaMemory(Result<Json, String>),
     MayaForget(&'static str, usize),
@@ -937,7 +962,7 @@ impl App {
         if let Some((rgba, side)) = ghost::icon_rgba(view::GRAPHITE.accent) {
             tray::install(rgba, side);
         }
-        let Saved { mode, perm, workdir, rail, rail_open, load_last, last_model, model_dirs, call_timings, call_model } = load_settings();
+        let Saved { mode, perm, workdir, rail, rail_open, load_last, last_model, model_dirs, call_timings, call_model, lang } = load_settings();
         // an installed app starts its own server (with the last model if it is set to), as the launcher does
         let launch = (model_dirs.clone(), if load_last { last_model.clone() } else { None });
         let dark = match mode {
@@ -945,9 +970,12 @@ impl App {
             ThemeMode::Light => false,
             ThemeMode::System => windows_dark(),
         };
+        // the app's words, before anything is drawn
+        crate::i18n::set(lang);
         let app = App {
             theme: if dark { view::GRAPHITE.theme() } else { view::FOG.theme() },
             mode,
+            lang,
             dark,
             menu: None,
             clock: 0,
@@ -1245,7 +1273,7 @@ impl App {
             }
             Message::AttachFiles => {
                 self.menu = None;
-                return Task::perform(blocking(|| rfd::FileDialog::new().set_title("Attach text or code files").pick_files().unwrap_or_default()), Message::FilesChosen);
+                return Task::perform(blocking(|| rfd::FileDialog::new().set_title(tr("Attach text or code files")).pick_files().unwrap_or_default()), Message::FilesChosen);
             }
             Message::FilesChosen(paths) => {
                 let mut refused = Vec::new();
@@ -1385,12 +1413,12 @@ impl App {
                         self.status = String::new();
                     }
                 } else if now.is_some() && self.busy.is_none() {
-                    self.status = "A scheduled task is running".into();
+                    self.status = tr("A scheduled task is running").into();
                 }
                 return Task::batch(tasks);
             }
             Message::RunScheduled(id) => {
-                self.status = "It runs as soon as nothing else is".into();
+                self.status = tr("It runs as soon as nothing else is").into();
                 let body = obj(vec![("id", str(&id))]);
                 return self.call(move |api| api.post("/api/schedules/run", &body), Message::Background);
             }
@@ -1408,6 +1436,11 @@ impl App {
                     ThemeMode::Light => false,
                     ThemeMode::System => windows_dark(),
                 });
+                self.save_settings();
+            }
+            Message::SetLang(lang) => {
+                self.lang = lang;
+                crate::i18n::set(lang);
                 self.save_settings();
             }
             Message::SettingsPage(page) => {
@@ -1498,8 +1531,8 @@ impl App {
             }
             Message::Trimmed(Ok(j)) => {
                 self.status = match j.get("trimmed").and_then(Json::as_f64).unwrap_or(0.0) as usize {
-                    0 => "Nothing to trim: only the last 3 tool outputs are left".into(),
-                    n => format!("Trimmed {n} old tool output{}; the next reply reads the chat again", if n == 1 { "" } else { "s" }),
+                    0 => tr("Nothing to trim: only the last 3 tool outputs are left").into(),
+                    n => if crate::i18n::is_zh() { format!("裁剪了 {n} 条旧工具输出；下一条回复会重新读一遍对话") } else { format!("Trimmed {n} old tool output{}; the next reply reads the chat again", if n == 1 { "" } else { "s" }) },
                 };
             }
             Message::Trimmed(Err(e)) => self.status = format!("Couldn't trim: {e}"),
@@ -1513,7 +1546,7 @@ impl App {
             }
             Message::PickWorkdir => {
                 self.menu = None;
-                return Task::perform(blocking(|| rfd::FileDialog::new().set_title("Choose the folder this chat works in").pick_folder().map(|p| p.display().to_string())), Message::SetWorkdir);
+                return Task::perform(blocking(|| rfd::FileDialog::new().set_title(tr("Choose the folder this chat works in")).pick_folder().map(|p| p.display().to_string())), Message::SetWorkdir);
             }
             Message::SetWorkdir(Some(f)) => {
                 self.workdir = Some(f);
@@ -1540,9 +1573,9 @@ impl App {
             Message::Undone(i, r) => {
                 let note = match r {
                     Ok(j) => match j.get("undone").and_then(Json::as_array).map_or(0, |a| a.len()) {
-                        0 => "Nothing to undo".to_string(),
-                        1 => "Undone: 1 file put back".to_string(),
-                        n => format!("Undone: {n} files put back"),
+                        0 => tr("Nothing to undo").to_string(),
+                        1 => tr("Undone: 1 file put back").to_string(),
+                        n => tf!("Undone: {n} files put back", "已撤销：放回 {n} 个文件"),
                     },
                     Err(e) => format!("Couldn't undo: {e}"),
                 };
@@ -1561,7 +1594,7 @@ impl App {
             Message::ToggleRecents => self.recents_open = !self.recents_open,
             Message::CopyChat => {
                 self.menu = None;
-                let md: Vec<String> = self.messages.iter().map(|m| if m.role == Role::User { format!("**You:** {}", m.raw) } else { m.answer_text() }).collect();
+                let md: Vec<String> = self.messages.iter().map(|m| if m.role == Role::User { tf!("**You:** {}", "**你：** {}", m.raw) } else { m.answer_text() }).collect();
                 return iced::clipboard::write(md.join("\n\n"));
             }
             Message::DeleteCurrent => {
@@ -1727,17 +1760,17 @@ impl App {
                     return Task::none();
                 }
                 if self.voice_models.0.is_none() || self.voice_models.1.is_none() {
-                    self.call_state = "The server has no voice: start it with --tts and --stt.".into();
+                    self.call_state = tr("The server has no voice: start it with --tts and --stt.").into();
                     return Task::none();
                 }
                 if self.loading.is_some() && self.call_wait.is_none() {
                     // one is loading: the call starts once it has
                     self.call_pending = true;
-                    self.call_state = "Waiting for the model to load…".into();
+                    self.call_state = tr("Waiting for the model to load…").into();
                     return self.wait_for_model();
                 }
                 let Some(target) = self.call_target() else {
-                    self.call_state = "Pick a model first: the call talks to it.".into();
+                    self.call_state = tr("Pick a model first: the call talks to it.").into();
                     return Task::none();
                 };
                 // the call model and the voice not loaded yet: switch to them (asking first when that unloads the
@@ -1745,24 +1778,26 @@ impl App {
                 if self.call_ready.as_deref() != Some(target.id.as_str()) {
                     if self.call_wait.as_deref() == Some(target.id.as_str()) {
                         self.call_wait = None;
-                        self.call_state = "The voice didn't load: the server's log says why.".into();
+                        self.call_state = tr("The voice didn't load: the server's log says why.").into();
                         return self.back_to_code();
                     }
                     match self.model.clone() {
                         Some(code) if code.id != target.id => {
-                            let ask = format!(
+                            let ask = tf!(
                                 "Your graphics card doesn't have room for {} and {} with the voice at the same time.\n\nUnload {} and start the call? It loads again when you switch back to Code.",
+                                "显卡装不下 {}、{} 和语音同时都在。\n\n卸载 {} 并开始通话？切回「代码」时会重新加载。",
                                 code.label, target.label, code.label
                             );
-                            self.call_confirm = Some((ask, "Unload and call"));
+                            self.call_confirm = Some((ask, tr("Unload and call")));
                             return Task::none();
                         }
                         Some(code) => {
-                            let ask = format!(
+                            let ask = tf!(
                                 "Your graphics card doesn't have room for the voice beside {} at its full context.\n\nReload {} with a smaller context and start the call? It gets its full context back when you switch back to Code.",
+                                "显卡装不下满上下文的 {} 再加语音。\n\n用更小的上下文重新加载 {} 并开始通话？切回「代码」时它会拿回完整的上下文。",
                                 code.label, code.label
                             );
-                            self.call_confirm = Some((ask, "Reload and call"));
+                            self.call_confirm = Some((ask, tr("Reload and call")));
                             return Task::none();
                         }
                         None => return self.switch_for_call(),
@@ -1801,7 +1836,7 @@ impl App {
                 } else if !pending {
                     return Task::none();
                 }
-                self.call_state = "Call ended".into();
+                self.call_state = tr("Call ended").into();
                 return Task::batch([self.call(|api| api.get("/api/chats"), Message::Chats), self.after_call()]);
             }
             Message::Reflected(r) => {
@@ -1810,8 +1845,8 @@ impl App {
                     return Task::none();
                 }
                 self.call_state = match r {
-                    Ok(_) => "Call ended".into(),
-                    Err(e) => format!("Call ended (Maya couldn't think it over: {e})"),
+                    Ok(_) => tr("Call ended").into(),
+                    Err(e) => tf!("Call ended (Maya couldn't think it over: {e})", "通话已结束（Maya 没能回想起来：{e}）"),
                 };
                 return self.back_to_code();
             }
@@ -1863,12 +1898,12 @@ impl App {
                 call::CallEvent::Ended => {
                     self.call = None;
                     self.call_task = None;
-                    self.call_state = if self.call_lines.is_empty() { String::new() } else { "Call ended".into() };
+                    self.call_state = if self.call_lines.is_empty() { String::new() } else { tr("Call ended").into() };
                     return Task::batch([self.call(|api| api.get("/api/chats"), Message::Chats), self.after_call()]);
                 }
             },
             Message::UseModelFolder => {
-                return Task::perform(blocking(|| rfd::FileDialog::new().set_title("Choose a folder with GGUF models").pick_folder().map(|p| p.display().to_string())), Message::ModelFolder);
+                return Task::perform(blocking(|| rfd::FileDialog::new().set_title(tr("Choose a folder with GGUF models")).pick_folder().map(|p| p.display().to_string())), Message::ModelFolder);
             }
             Message::ModelFolder(None) => {}
             // a folder of models: listed at once, kept for the next start; added from the first-run screen with no
@@ -1897,7 +1932,7 @@ impl App {
             Message::AddFolder => {
                 self.menu = None;
                 // the dialog blocks, so it opens on its own thread
-                return Task::perform(blocking(|| rfd::FileDialog::new().set_title("Choose a folder the model may use").pick_folder().map(|p| p.display().to_string())), Message::FolderPicked);
+                return Task::perform(blocking(|| rfd::FileDialog::new().set_title(tr("Choose a folder the model may use")).pick_folder().map(|p| p.display().to_string())), Message::FolderPicked);
             }
             Message::FolderPicked(None) => {}
             Message::FolderPicked(Some(f)) => {
@@ -1934,7 +1969,7 @@ impl App {
                 return Task::perform(
                     blocking(move || {
                         let d = rfd::FileDialog::new();
-                        let picked = if archive { d.set_title("Choose a skill archive").add_filter("Skill", &["zip", "skill"]).pick_file() } else { d.set_title("Choose a skill's folder (it has a SKILL.md)").pick_folder() };
+                        let picked = if archive { d.set_title(tr("Choose a skill archive")).add_filter("Skill", &["zip", "skill"]).pick_file() } else { d.set_title(tr("Choose a skill's folder (it has a SKILL.md)")).pick_folder() };
                         picked.map(|p| p.display().to_string())
                     }),
                     Message::SkillPicked,
@@ -1945,7 +1980,7 @@ impl App {
             Message::InstallLink => {
                 let link = std::mem::take(&mut self.skill_link);
                 if !link.trim().is_empty() {
-                    self.status = "Downloading the skill…".into();
+                    self.status = tr("Downloading the skill…").into();
                     let body = obj(vec![("path", str(link.trim()))]);
                     return self.call(move |api| api.post("/api/skills/install", &body), Message::Skills);
                 }
@@ -1967,7 +2002,7 @@ impl App {
             }
             Message::InstallChoice(path) => {
                 if let Some((source, _)) = &self.skill_choices {
-                    self.status = "Installing…".into();
+                    self.status = tr("Installing…").into();
                     let body = obj(vec![("path", str(source)), ("skills", Json::Arr(vec![str(path.as_deref().unwrap_or("all"))]))]);
                     return self.call(move |api| api.post("/api/skills/install", &body), Message::Skills);
                 }
@@ -1977,12 +2012,12 @@ impl App {
                 self.skills = j.get("skills").and_then(Json::as_array).unwrap_or(&[]).iter().filter_map(|s| Some((s.get("name")?.as_str()?.to_string(), s.get("description").and_then(Json::as_str).unwrap_or("").to_string()))).collect();
                 if let Some(name) = j.get("installed").and_then(Json::as_str) {
                     self.skill_choices = None;
-                    self.status = if name.contains(", ") { format!("Installed the skills {name}") } else { format!("Installed the {name} skill") };
+                    self.status = if name.contains(", ") { tf!("Installed the skills {name}", "已安装技能 {name}") } else { tf!("Installed the {name} skill", "已安装技能 {name}") };
                 }
                 if let Some(list) = j.get("choose").and_then(Json::as_array) {
                     let s = |c: &Json, k: &str| c.get(k).and_then(Json::as_str).unwrap_or("").to_string();
                     let choices: Vec<_> = list.iter().map(|c| (s(c, "path"), s(c, "name"), s(c, "description"))).collect();
-                    self.status = format!("That link has {} skills: pick one in the rail", choices.len());
+                    self.status = tf!("That link has {} skills: pick one in the rail", "这个链接里有 {} 个技能：在右侧栏挑一个", choices.len());
                     self.skill_choices = Some((s(&j, "source"), choices));
                 }
             }
@@ -2023,7 +2058,7 @@ impl App {
                 if !file.exists() {
                     let note = "<!-- ghost reads this file into its chats, like a CLAUDE.md: write your instructions for the model below. Comments like this one are left out. -->\n\n";
                     if let Err(e) = std::fs::write(file, note) {
-                        self.status = format!("Couldn't make {path}: {e}");
+                        self.status = tf!("Couldn't make {path}: {e}", "无法创建 {path}：{e}");
                         return Task::none();
                     }
                 }
@@ -2086,6 +2121,7 @@ impl App {
             ("rail_open", Json::Arr(self.rail_open.iter().map(|k| str(k)).collect())),
             ("load_last", Json::Bool(self.load_last)),
             ("call_timings", Json::Bool(self.call_timings)),
+            ("lang", str(match self.lang { crate::i18n::Lang::En => "en", crate::i18n::Lang::Zh => "zh", crate::i18n::Lang::System => "system" })),
         ];
         if let Some(m) = &self.last_model {
             fields.push(("last_model", str(m)));
@@ -2240,7 +2276,7 @@ impl App {
     /// before the call comes back.
     fn after_call(&mut self) -> Task<Message> {
         let (Some(started), Some(chat)) = (self.call_started.take(), self.call_chat.clone()) else { return self.back_to_code() };
-        self.call_state = "Maya is thinking back over the call…".into();
+        self.call_state = tr("Maya is thinking back over the call…").into();
         let body = obj(vec![("chat", str(&chat)), ("seconds", Json::Num(started.elapsed().as_secs_f64()))]);
         self.call(move |api| api.post("/api/maya/reflect", &body), Message::Reflected)
     }
@@ -2250,7 +2286,7 @@ impl App {
         let Some(target) = self.call_target() else { return Task::none() };
         self.call_wait = Some(target.id.clone());
         self.call_pending = true;
-        self.call_state = if self.model.as_ref().is_some_and(|m| m.id == target.id) { "Loading the voice…".into() } else { format!("Switching to {} for the call…", target.label) };
+        self.call_state = if self.model.as_ref().is_some_and(|m| m.id == target.id) { tr("Loading the voice…").into() } else { format!("Switching to {} for the call…", target.label) };
         self.load_models(true)
     }
 
@@ -2378,7 +2414,7 @@ impl App {
     /// Claude Code session does), or where a new one will.
     pub fn folder_label(&self) -> String {
         let dir = if self.messages.is_empty() { self.new_chat_dir() } else { self.chat_cwd.as_deref().or(self.folders.first().map(String::as_str)) };
-        dir.map(folder_name).unwrap_or_else(|| "Choose a folder".into())
+        dir.map(folder_name).unwrap_or_else(|| tr("Choose a folder").into())
     }
 
     /// What moves the call orb: where the call is, and its level: the microphone while the user may speak, the
@@ -2586,7 +2622,7 @@ impl App {
 
     /// What / offers: the server's commands, then the installed skills.
     fn slash_all(&self) -> Vec<Slash> {
-        let commands = COMMANDS.iter().map(|(n, a)| Slash { name: n.to_string(), about: a.to_string() });
+        let commands = commands().into_iter().map(|(n, a)| Slash { name: n.to_string(), about: a.to_string() });
         let skills = self.skills.iter().map(|(n, d)| Slash { name: n.clone(), about: d.lines().next().unwrap_or("").to_string() });
         commands.chain(skills).collect()
     }
@@ -2623,7 +2659,7 @@ impl App {
         }
         let Some((q, _, first)) = self.slash_typed() else { return Vec::new() };
         let q = q.to_lowercase();
-        let offered = self.slash_all().into_iter().filter(|e| first || !COMMANDS.iter().any(|(n, _)| *n == e.name));
+        let offered = self.slash_all().into_iter().filter(|e| first || !commands().iter().any(|(n, _)| *n == e.name));
         let (mut list, then): (Vec<Slash>, Vec<Slash>) = offered.filter(|e| e.name.to_lowercase().contains(&q)).partition(|e| e.name.to_lowercase().starts_with(&q));
         list.extend(then);
         // a whole name typed, and nothing longer to offer: nothing to pick, so Enter sends
@@ -2714,7 +2750,7 @@ impl App {
         (self.reply_tokens, self.reply_writing) = (0.0, (0.0, 0.0));
         // the server holds this message until a scheduled run answering in this chat is done
         let waits = self.chat.is_some() && self.background.get("running").and_then(Json::as_str) == self.chat.as_deref();
-        self.status = if waits { "Waiting for the scheduled task in this chat to finish".into() } else { "Reading".into() };
+        self.status = if waits { tr("Waiting for the scheduled task in this chat to finish").into() } else { "Reading".into() };
         let body = obj(body);
         let (tx, rx) = mpsc::unbounded();
         std::thread::spawn(move || {
@@ -2773,10 +2809,10 @@ impl App {
                     }
                 }
                 self.status = match name.as_str() {
-                    "write_file" | "edit_file" => "Writing a file".into(),
+                    "write_file" | "edit_file" => tr("Writing a file").into(),
                     // a subagent writing (its own text stays out of the reply)
-                    "subagent" => "A subagent is working".into(),
-                    _ => "Writing a tool call".into(),
+                    "subagent" => tr("A subagent is working").into(),
+                    _ => tr("Writing a tool call").into(),
                 };
             }
             "tool_call" => {
@@ -2794,19 +2830,19 @@ impl App {
                 let kind = s("kind");
                 match kind.as_str() {
                     // the chat outgrew the context: the model summarizes it (Claude Code's compaction)
-                    "compacting" => self.status = "Compacting the chat".into(),
+                    "compacting" => self.status = tr("Compacting the chat").into(),
                     "compact" => {
                         if let Some(m) = self.messages.last_mut() {
                             m.add_tool(ToolLine::compacted(&s("text")));
                         }
-                        self.status = "Compacted the chat".into();
+                        self.status = tr("Compacted the chat").into();
                     }
                     _ => {
                         let goal = kind == "goal";
                         if let Some(m) = self.messages.last_mut() {
                             m.add_tool(ToolLine::nudge(&s("text"), goal));
                         }
-                        self.status = if goal { "Back to work on the goal".into() } else { "Checking its work".into() };
+                        self.status = if goal { tr("Back to work on the goal").into() } else { tr("Checking its work").into() };
                     }
                 }
             }
@@ -2814,7 +2850,7 @@ impl App {
             "goal" => {
                 self.goal = goal_of(ev.get("goal"));
                 if ev.get("checking").and_then(Json::as_bool).unwrap_or(false) {
-                    self.status = "Checking the goal".into();
+                    self.status = tr("Checking the goal").into();
                     if let Some(g) = &mut self.goal {
                         g.checking = true;
                     }
@@ -2904,10 +2940,10 @@ impl App {
             // tokens, the whole wait, and the writing speed (from each round's first token: not counting
             // reading the prompt or the tools run between rounds)
             let speed = if writing > 0.0 && after_first > 0.0 { format!(" · {:.1} tok/s", after_first / writing) } else { String::new() };
-            let count = if tokens > 0.0 { format!("{tokens:.0} tokens · ") } else { String::new() };
+            let count = if tokens > 0.0 { tf!("{tokens:.0} tokens · ", "{tokens:.0} 词元 · ") } else { String::new() };
             m.stats = format!("{count}{secs:.1} s{speed}{}", match how {
-                "length" => ", stopped at the length limit",
-                "stopped" => ", stopped",
+                "length" => tr(", stopped at the length limit"),
+                "stopped" => tr(", stopped"),
                 _ => "",
             });
             m.writing = None;

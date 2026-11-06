@@ -93,6 +93,8 @@ of two runs, llama.cpp with its automatic GPU split. Method and more results in 
   is using in VRAM, and an 80B model runs on an 8 GB card.
 - **A desktop app with an agent.** The model reads and edits your files and runs commands, asking first,
   with permission modes, a task list and background jobs. [More](docs/desktop-app.md)
+- **English or Chinese.** The desktop app's own words come in either language: Settings, General, Language,
+  or follow Windows.
 - **Voice calls.** Talk with Maya, a companion who answers aloud and remembers your calls, with her own
   model beside the coding one when the GPU has room. Speech and listening run on the same card. The voice
   files (about 3 GB) are on [Hugging Face](https://huggingface.co/affifuddin-hazam/ghost-voice).

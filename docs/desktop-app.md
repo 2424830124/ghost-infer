@@ -87,6 +87,9 @@ computer. With models but none running, sending opens the model menu instead.
   your first message, which then goes first if it comes sooner. The ghost says "Warming up…" (and the model
   name "warming up") until it is done, then "Warmed up and ready". **Warm up after loading** in the settings
   menu turns it off.
+- **English or Chinese.** **Language** on the settings' General page picks the app's own words: English,
+  Chinese, or **System** to follow Windows. A line it has no Chinese for stays English, so a missing
+  translation never breaks the window. The model's replies are in whatever language you write in.
 
 Scheduled tasks and loops wait until nothing else has used the model for 20 seconds, and use only what
 you set to always allowed, since nobody is there to ask.

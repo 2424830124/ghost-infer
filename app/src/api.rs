@@ -1,6 +1,7 @@
 //! A small HTTP/1.1 client for the local ghost-infer server: JSON requests, and the agent's server-sent
 //! events read as they arrive. Localhost only, so no TLS and no HTTP crate.
 
+use crate::i18n::tr;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
@@ -28,7 +29,7 @@ impl Api {
         let mut api = Api { addr: addr.to_string(), token: String::new() };
         let page = api.body(api.send("GET", "/", None)?)?;
         let marker = "name=\"ghost-token\" content=\"";
-        let at = page.find(marker).ok_or("this server has no tool token (is it an older ghost-infer?)")? + marker.len();
+        let at = page.find(marker).ok_or(tr("this server has no tool token (is it an older ghost-infer?)"))? + marker.len();
         api.token = page[at..].split('"').next().unwrap_or("").to_string();
         Ok(api)
     }
@@ -51,7 +52,7 @@ impl Api {
         let mut reader = BufReader::new(conn);
         let mut line = String::new();
         reader.read_line(&mut line).map_err(|e| e.to_string())?;
-        let status = line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).ok_or("not an HTTP response")?;
+        let status = line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).ok_or(tr("not an HTTP response"))?;
         let mut chunked = false;
         loop {
             line.clear();
@@ -112,7 +113,7 @@ impl Api {
     pub fn stream_bytes(&self, path: &str, body: &Json, mut on_chunk: impl FnMut(&[u8]) -> bool) -> Result<(), String> {
         let mut r = self.send("POST", path, Some(&body.to_string()))?;
         if r.status >= 400 || !r.chunked {
-            return Err(self.body(r).err().unwrap_or_else(|| "the server did not stream an answer".into()));
+            return Err(self.body(r).err().unwrap_or_else(|| tr("the server did not stream an answer").into()));
         }
         while let Some(chunk) = next_chunk(&mut r.reader)? {
             if !on_chunk(&chunk) {
@@ -127,7 +128,7 @@ impl Api {
     pub fn stream(&self, path: &str, body: &Json, mut on_event: impl FnMut(Json) -> bool) -> Result<(), String> {
         let mut r = self.send("POST", path, Some(&body.to_string()))?;
         if r.status >= 400 || !r.chunked {
-            return Err(self.body(r).err().unwrap_or_else(|| "the server did not stream a reply".into()));
+            return Err(self.body(r).err().unwrap_or_else(|| tr("the server did not stream a reply").into()));
         }
         let mut pending = String::new();
         while let Some(chunk) = next_chunk(&mut r.reader)? {

@@ -17,23 +17,27 @@ pub struct Attachment {
 impl Attachment {
     /// How big it is, for its chip: "212 lines".
     pub fn size(&self) -> String {
-        let n = self.text.lines().count();
-        format!("{n} line{}", if n == 1 { "" } else { "s" })
+        lines(self.text.lines().count())
     }
+}
+
+/// A file's size on its chip: "212 lines".
+pub fn lines(n: usize) -> String {
+    if crate::i18n::is_zh() { format!("{n} 行") } else { format!("{n} line{}", if n == 1 { "" } else { "s" }) }
 }
 
 /// Reads a file to attach, if it is text (UTF-8) and not too big.
 pub fn read(path: &Path) -> Result<Attachment, String> {
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
-    let meta = std::fs::metadata(path).map_err(|e| format!("Could not read {name}: {e}"))?;
+    let meta = std::fs::metadata(path).map_err(|e| crate::tf!("Could not read {name}: {e}", "无法读取 {name}：{e}"))?;
     if meta.is_dir() {
-        return Err(format!("{name} is a folder: attach files from it, or add it with Add folder"));
+        return Err(crate::tf!("{name} is a folder: attach files from it, or add it with Add folder", "{name} 是文件夹：请附加其中的文件，或用「添加文件夹」加入它"));
     }
     if meta.len() as usize > MAX_BYTES {
-        return Err(format!("{name} is too big to attach ({} KB; up to {} KB)", meta.len() / 1024, MAX_BYTES / 1024));
+        return Err(crate::tf!("{name} is too big to attach ({} KB; up to {} KB)", "{name} 太大，无法附加（{} KB；上限 {} KB）", meta.len() / 1024, MAX_BYTES / 1024));
     }
-    let bytes = std::fs::read(path).map_err(|e| format!("Could not read {name}: {e}"))?;
-    let text = String::from_utf8(bytes).ok().filter(|t| !t.contains('\0')).ok_or_else(|| format!("{name} is not a text file"))?;
+    let bytes = std::fs::read(path).map_err(|e| crate::tf!("Could not read {name}: {e}", "无法读取 {name}：{e}"))?;
+    let text = String::from_utf8(bytes).ok().filter(|t| !t.contains('\0')).ok_or_else(|| crate::tf!("{name} is not a text file", "{name} 不是文本文件"))?;
     let text = text.strip_prefix('\u{feff}').unwrap_or(&text).replace("\r\n", "\n");
     Ok(Attachment { name, text })
 }

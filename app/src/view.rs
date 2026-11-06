@@ -2,6 +2,7 @@
 //! (dark, neutral greys) and Fog (light). Icons come from Segoe MDL2 Assets, the icon font every Windows 10
 //! and 11 has; text is Instrument Sans, the greeting Georgia.
 
+use crate::i18n::tr;
 use iced::widget::{button, canvas, column, container, markdown, mouse_area, opaque, rich_text, row, scrollable, stack, text, text_editor, text_input, tooltip, Space};
 use iced::{border, keyboard, Alignment, Background, Border, Color, Element, Fill, Font, Length, Padding, Pixels, Theme};
 
@@ -244,9 +245,9 @@ fn greeting() -> &'static str {
     let mut t = SystemTime::default();
     unsafe { GetLocalTime(&mut t) };
     match t.hour {
-        5..=11 => "Good morning",
-        12..=17 => "Good afternoon",
-        _ => "Good evening",
+        5..=11 => tr("Good morning"),
+        12..=17 => tr("Good afternoon"),
+        _ => tr("Good evening"),
     }
 }
 
@@ -254,9 +255,9 @@ fn greeting() -> &'static str {
 fn ago(ms: f64) -> String {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as f64).unwrap_or(0.0);
     match ((now - ms) / 86_400_000.0).floor() as i64 {
-        ..=0 => "Today".into(),
-        1 => "Yesterday".into(),
-        d => format!("{d} days ago"),
+        ..=0 => tr("Today").into(),
+        1 => tr("Yesterday").into(),
+        d => tf!("{d} days ago", "{d} 天前"),
     }
 }
 
@@ -294,16 +295,16 @@ impl App {
         let (title, items, pad, width, right): (Option<&str>, Vec<Item>, Padding, f32, bool) = match menu {
             Menu::Chat => (
                 None,
-                vec![item(ic::COPY, "Copy as Markdown", Message::CopyChat), Item { danger: true, ..item(ic::DELETE, "Delete", Message::DeleteCurrent) }],
+                vec![item(ic::COPY, tr("Copy as Markdown"), Message::CopyChat), Item { danger: true, ..item(ic::DELETE, tr("Delete"), Message::DeleteCurrent) }],
                 Padding { top: 44.0, left: if self.sidebar { 264.0 + 16.0 } else { 56.0 }, ..Padding::ZERO },
                 232.0,
                 false,
             ),
-            Menu::Settings => unreachable!("the settings are a window of their own"),
+            Menu::Settings => unreachable!("{}", tr("the settings are a window of their own")),
             // adding things; the tools themselves are always there, and the mode decides what needs an OK
             Menu::Plus => (
                 None,
-                vec![item(ic::ATTACH, "Attach files…", Message::AttachFiles), item(ic::FOLDER, "Add folder…", Message::AddFolder), item(ic::SKILL, "Install skill…", Message::InstallSkill(false)), item(ic::DOWNLOAD, "Install skill from a link…", Message::OpenSkillLink)],
+                vec![item(ic::ATTACH, tr("Attach files…"), Message::AttachFiles), item(ic::FOLDER, tr("Add folder…"), Message::AddFolder), item(ic::SKILL, tr("Install skill…"), Message::InstallSkill(false)), item(ic::DOWNLOAD, tr("Install skill from a link…"), Message::OpenSkillLink)],
                 above(false),
                 232.0,
                 false,
@@ -311,10 +312,10 @@ impl App {
             Menu::Model => {
                 let current = self.model.as_ref().map(|m| m.id.as_str());
                 let items = self.models.iter().map(|m| Item { icon: None, check: Some(current == Some(m.id.as_str())), ..item(ic::BOLT, &m.label, Message::PickModel(m.clone())) }).collect();
-                (Some("Model"), items, above(true), 260.0, true)
+                (Some(tr("Model")), items, above(true), 260.0, true)
             }
             Menu::CallModel => {
-                let same = Item { icon: None, detail: self.code_model().map(|m| m.label), check: Some(self.call_choice.is_none()), ..item(ic::BOLT, "Same as Code", Message::PickCallModel(None)) };
+                let same = Item { icon: None, detail: self.code_model().map(|m| m.label), check: Some(self.call_choice.is_none()), ..item(ic::BOLT, tr("Same as Code"), Message::PickCallModel(None)) };
                 let items = std::iter::once(same)
                     .chain(self.models.iter().map(|m| Item { icon: None, check: Some(self.call_choice.as_deref() == Some(m.id.as_str())), ..item(ic::BOLT, &m.label, Message::PickCallModel(Some(m.id.clone()))) }))
                     .collect();
@@ -323,15 +324,15 @@ impl App {
                     Some(at) => Padding { left: (at.x + at.width / 2.0 - 130.0).max(0.0), top: at.y + at.height + 6.0, ..Padding::ZERO },
                     None => Padding { top: 140.0, ..Padding::ZERO },
                 };
-                (Some("Maya talks with"), items, below, 260.0, false)
+                (Some(tr("Maya talks with")), items, below, 260.0, false)
             }
             Menu::Mode => {
                 let items = crate::MODES
                     .iter()
                     .enumerate()
-                    .map(|(i, (_, name, what))| Item { icon: None, detail: Some(what.to_string()), hint: Some((i + 1).to_string()), check: Some(i == self.perm), ..item(ic::BOLT, name, Message::SetMode(i)) })
+                    .map(|(i, (_, name, what))| Item { icon: None, detail: Some(tr(what).to_string()), hint: Some((i + 1).to_string()), check: Some(i == self.perm), ..item(ic::BOLT, tr(name), Message::SetMode(i)) })
                     .collect();
-                (Some("Mode"), items, above(true), 300.0, true)
+                (Some(tr("Mode")), items, above(true), 300.0, true)
             }
             Menu::Folder => {
                 let current = self.new_chat_dir();
@@ -343,8 +344,8 @@ impl App {
                     .into_iter()
                     .map(|d| Item { detail: Some(d.to_string()), check: Some(current == Some(d)), ..item(ic::FOLDER, &crate::folder_name(d), Message::SetWorkdir(Some(d.to_string()))) })
                     .collect();
-                items.push(item(ic::ADD, "Choose a folder…", Message::PickWorkdir));
-                (Some("Work in"), items, above(false), 300.0, false)
+                items.push(item(ic::ADD, tr("Choose a folder…"), Message::PickWorkdir));
+                (Some(tr("Work in")), items, above(false), 300.0, false)
             }
         };
         let mut list = column![].spacing(1);
@@ -480,13 +481,13 @@ impl App {
             button(line).on_press(Message::SettingsPage(p)).width(Fill).padding([8, 10]).style(move |_, st| row_style(s, st, on)).into()
         };
         let nav = column![
-            container(text("Settings").size(15).font(MEDIUM).color(s.text)).padding(Padding { top: 4.0, right: 10.0, bottom: 14.0, left: 10.0 }),
-            nav_item(P::General, ic::SETTINGS, "General"),
-            nav_item(P::Appearance, ic::COLOR, "Appearance"),
-            nav_item(P::Models, ic::FOLDER, "Models"),
-            nav_item(P::Voice, ic::MIC, "Voice"),
-            nav_item(P::Maya, ic::MEMORY, "Maya"),
-            nav_item(P::About, ic::INFO, "About"),
+            container(text(tr("Settings")).size(15).font(MEDIUM).color(s.text)).padding(Padding { top: 4.0, right: 10.0, bottom: 14.0, left: 10.0 }),
+            nav_item(P::General, ic::SETTINGS, tr("General")),
+            nav_item(P::Appearance, ic::COLOR, tr("Appearance")),
+            nav_item(P::Models, ic::FOLDER, tr("Models")),
+            nav_item(P::Voice, ic::MIC, tr("Voice")),
+            nav_item(P::Maya, ic::MEMORY, tr("Maya")),
+            nav_item(P::About, ic::INFO, tr("About")),
         ]
         .spacing(2);
         let nav = container(nav).width(208).height(Fill).padding([18, 12]).style(move |_| container::Style {
@@ -547,21 +548,56 @@ impl App {
         // a value shown, not changed
         let value = |v: String| -> Element<'static, Message> { text(v).size(13).color(s.muted).into() };
 
+        // the language picker: like the theme's, three in a bordered row
+        let lang_choice = |label: &'static str, m: crate::i18n::Lang| -> Element<'static, Message> {
+            let on = self.lang == m;
+            button(text(label).size(13).color(if on { s.text } else { s.muted }).font(if on { MEDIUM } else { BODY }))
+                .on_press(Message::SetLang(m))
+                .padding([5, 14])
+                .style(move |_, st| button::Style {
+                    background: Some(Background::Color(if on { s.raise2 } else if hovered(st) { s.hover } else { Color::TRANSPARENT })),
+                    border: border::rounded(7),
+                    ..Default::default()
+                })
+                .into()
+        };
+        let picker_box = |inner: Element<'static, Message>| -> Element<'static, Message> {
+            container(inner).padding(3).style(move |_| container::Style {
+                border: Border { radius: 10.0.into(), width: 1.0, color: s.line2 },
+                ..Default::default()
+            }).into()
+        };
         let (title, about, groups): (&str, &str, Vec<Element<'static, Message>>) = match page {
             P::General => (
-                "General",
-                "How ghost starts and stops.",
+                tr("General"),
+                tr("How ghost starts and stops."),
                 vec![
                     group(
-                        "Startup",
+                        tr("Language"),
+                        vec![row_of(
+                            tr("Language"),
+                            tr("English by default. Chinese follows Windows unless you pick one.").into(),
+                            picker_box(
+                                row![
+                                    lang_choice(tr("English"), crate::i18n::Lang::En),
+                                    lang_choice(tr("中文"), crate::i18n::Lang::Zh),
+                                    lang_choice(tr("System"), crate::i18n::Lang::System),
+                                ]
+                                .spacing(2)
+                                .into(),
+                            ),
+                        )],
+                    ),
+                    group(
+                        tr("Startup"),
                         vec![
-                            row_of("Open with the last model", "Loads the model you used last when ghost starts.".into(), switch(self.load_last, Message::ToggleLoadLast)),
-                            row_of("Warm up after loading", "Runs a few short replies after a model loads, so the first real answer comes quickly.".into(), switch(self.warm_up, Message::ToggleWarmUp)),
+                            row_of(tr("Open with the last model"), tr("Loads the model you used last when ghost starts.").into(), switch(self.load_last, Message::ToggleLoadLast)),
+                            row_of(tr("Warm up after loading"), tr("Runs a few short replies after a model loads, so the first real answer comes quickly.").into(), switch(self.warm_up, Message::ToggleWarmUp)),
                         ],
                     ),
                     group(
-                        "Quitting",
-                        vec![row_of("Quit ghost", "Closing the window keeps ghost in the tray. This stops it and frees the model's memory.".into(), action("Quit", Message::Quit, true))],
+                        tr("Quitting"),
+                        vec![row_of(tr("Quit ghost"), tr("Closing the window keeps ghost in the tray. This stops it and frees the model's memory.").into(), action(tr("Quit"), Message::Quit, true))],
                     ),
                 ],
             ),
@@ -578,11 +614,11 @@ impl App {
                         })
                         .into()
                 };
-                let picker = container(row![choice("Light", ThemeMode::Light), choice("Dark", ThemeMode::Dark), choice("System", ThemeMode::System)].spacing(2)).padding(3).style(move |_| container::Style {
+                let picker = container(row![choice(tr("Light"), ThemeMode::Light), choice(tr("Dark"), ThemeMode::Dark), choice(tr("System"), ThemeMode::System)].spacing(2)).padding(3).style(move |_| container::Style {
                     border: Border { radius: 10.0.into(), width: 1.0, color: s.line2 },
                     ..Default::default()
                 });
-                ("Appearance", "How ghost looks.", vec![group("Theme", vec![row_of("Colour theme", "Fog is light, Graphite dark. System follows Windows.".into(), picker.into())])])
+                (tr("Appearance"), tr("How ghost looks."), vec![group(tr("Theme"), vec![row_of(tr("Colour theme"), tr("Fog is light, Graphite dark. System follows Windows.").into(), picker.into())])])
             }
             P::Models => {
                 // each folder by its path; the ones added here can be removed (the server's own come back when it
@@ -592,46 +628,46 @@ impl App {
                     .iter()
                     .map(|f| {
                         let ours = self.model_dirs.contains(f);
-                        let words = column![text(f.clone()).size(13.5).color(s.text), text(if ours { "Added in ghost" } else { "Set when ghost started" }).size(12.5).color(s.faint)].spacing(3).width(Fill);
-                        let control: Element<'static, Message> = if ours { action("Remove", Message::RemoveModelFolder(f.clone()), false) } else { Space::new().width(0).into() };
+                        let words = column![text(f.clone()).size(13.5).color(s.text), text(if ours { tr("Added in ghost") } else { tr("Set when ghost started") }).size(12.5).color(s.faint)].spacing(3).width(Fill);
+                        let control: Element<'static, Message> = if ours { action(tr("Remove"), Message::RemoveModelFolder(f.clone()), false) } else { Space::new().width(0).into() };
                         row![words, control].spacing(24).align_y(Alignment::Center).padding([14, 18]).into()
                     })
                     .collect();
-                rows.push(row_of("Add a folder", "Its GGUF files show in the model menus at once, and from then on.".into(), action("Add folder…", Message::UseModelFolder, false)));
+                rows.push(row_of(tr("Add a folder"), tr("Its GGUF files show in the model menus at once, and from then on.").into(), action(tr("Add folder…"), Message::UseModelFolder, false)));
                 (
-                    "Models",
-                    "Where ghost finds models.",
+                    tr("Models"),
+                    tr("Where ghost finds models."),
                     vec![
-                        group("Folders", rows),
+                        group(tr("Folders"), rows),
                         text("Voice calls find their files in these folders too: a speech folder (a maya1 GGUF with snac.gguf) and a whisper folder with a whisper*.gguf, from huggingface.co/affifuddin-hazam/ghost-voice. They are read when ghost starts.").size(12.5).color(s.faint).into(),
                     ],
                 )
             }
             P::Voice => {
                 let (speech, listen) = &self.voice_models;
-                let named = |v: &Option<String>| v.clone().unwrap_or_else(|| "Not set up".into());
+                let named = |v: &Option<String>| v.clone().unwrap_or_else(|| tr("Not set up").into());
                 (
-                    "Voice",
-                    "Voice calls with Maya.",
+                    tr("Voice"),
+                    tr("Voice calls with Maya."),
                     vec![
                         group(
-                            "Models",
+                            tr("Models"),
                             vec![
-                                row_of("Voice", "What Maya speaks with.".into(), value(named(speech))),
-                                row_of("Listening", "What turns your speech into text.".into(), value(named(listen))),
+                                row_of(tr("Voice"), tr("What Maya speaks with.").into(), value(named(speech))),
+                                row_of(tr("Listening"), tr("What turns your speech into text.").into(), value(named(listen))),
                                 row_of(
-                                    "Call model",
-                                    "Picked on the call screen. Kept loaded beside the Code model when your graphics card has room for both and the voice; otherwise a call asks before swapping them.".into(),
+                                    tr("Call model"),
+                                    tr("Picked on the call screen. Kept loaded beside the Code model when your graphics card has room for both and the voice; otherwise a call asks before swapping them.").into(),
                                     value(match (&self.call_choice, self.call_target()) {
-                                        (None, _) => "Same as Code".into(),
+                                        (None, _) => tr("Same as Code").into(),
                                         (Some(_), Some(m)) => m.label,
                                         (Some(id), None) => crate::short_model(id),
                                     }),
                                 ),
                             ],
                         ),
-                        group("During a call", vec![row_of("Show response timings", "How long each reply took to start: for checking speed.".into(), switch(self.call_timings, Message::ToggleCallTimings))]),
-                        text("The voice models are chosen when the server starts (its --tts and --stt options).").size(12.5).color(s.faint).into(),
+                        group(tr("During a call"), vec![row_of(tr("Show response timings"), tr("How long each reply took to start: for checking speed.").into(), switch(self.call_timings, Message::ToggleCallTimings))]),
+                        text(tr("The voice models are chosen when the server starts (its --tts and --stt options).")).size(12.5).color(s.faint).into(),
                     ],
                 )
             }
@@ -649,11 +685,11 @@ impl App {
                 let count = m.get("count").and_then(Json::as_f64).unwrap_or(0.0) as u64;
                 let minutes = (m.get("seconds").and_then(Json::as_f64).unwrap_or(0.0) / 60.0).round() as u64;
                 let stage = m.get("stage").and_then(Json::as_str).unwrap_or("stranger");
-                let known = if count == 0 { "You haven't talked yet.".to_string() } else { format!("{count} call{}, about {minutes} min in all.", if count == 1 { "" } else { "s" }) };
+                let known = if count == 0 { tr("You haven't talked yet.").to_string() } else { if crate::i18n::is_zh() { format!("共 {count} 次通话，约 {minutes} 分钟。") } else { format!("{count} call{}, about {minutes} min in all.", if count == 1 { "" } else { "s" }) } };
                 let stage = stage[..1].to_uppercase() + &stage[1..];
                 let name = row![
-                    text_input("What she calls you", &self.maya_name).on_input(Message::MayaName).on_submit(Message::SaveMayaName).size(13).padding([6, 10]).width(200).style(move |t, st| input_style(s, t, st)),
-                    action("Save", Message::SaveMayaName, false),
+                    text_input(tr("What she calls you"), &self.maya_name).on_input(Message::MayaName).on_submit(Message::SaveMayaName).size(13).padding([6, 10]).width(200).style(move |t, st| input_style(s, t, st)),
+                    action(tr("Save"), Message::SaveMayaName, false),
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center);
@@ -664,41 +700,41 @@ impl App {
                 let calls = m.get("calls").and_then(Json::as_array).unwrap_or(&[]);
                 let calls = calls.iter().enumerate().rev().map(|(i, c)| line(c.get("summary").and_then(Json::as_str).unwrap_or("").to_string(), Message::MayaForget("calls", i))).collect();
                 let impression = m.get("impression").and_then(Json::as_str).unwrap_or("").to_string();
-                let impression = if impression.is_empty() { none("Nothing yet.") } else { vec![line(impression, Message::ClearImpression)] };
+                let impression = if impression.is_empty() { none(tr("Nothing yet.")) } else { vec![line(impression, Message::ClearImpression)] };
                 (
-                    "Maya",
-                    "What she remembers of you, from your calls. Remove anything you don't want her to know.",
+                    tr("Maya"),
+                    tr("What she remembers of you, from your calls. Remove anything you don't want her to know."),
                     vec![
-                        group("You", vec![row_of("Your name", "What she calls you.".into(), name.into()), row_of("How close you are", known, value(stage))]),
-                        group("What she knows about you", or_none(facts, "Nothing yet.")),
-                        group("Moments you share", or_none(moments, "None yet.")),
-                        group("Calls she remembers", or_none(calls, "None yet.")),
-                        group("How she sees you", impression),
-                        group("Start over", vec![row_of("Forget everything", "She meets you again as a stranger. The old memory is kept beside it as a backup.".into(), action("Start over", Message::ResetMaya, true))]),
+                        group(tr("You"), vec![row_of(tr("Your name"), tr("What she calls you.").into(), name.into()), row_of(tr("How close you are"), known, value(stage))]),
+                        group(tr("What she knows about you"), or_none(facts, tr("Nothing yet."))),
+                        group(tr("Moments you share"), or_none(moments, tr("None yet."))),
+                        group(tr("Calls she remembers"), or_none(calls, tr("None yet."))),
+                        group(tr("How she sees you"), impression),
+                        group(tr("Start over"), vec![row_of(tr("Forget everything"), tr("She meets you again as a stranger. The old memory is kept beside it as a backup.").into(), action(tr("Start over"), Message::ResetMaya, true))]),
                     ],
                 )
             }
             P::About => {
                 let sys = &self.system;
-                let gpu = sys.get("gpus").and_then(Json::as_array).and_then(|g| g.first()).and_then(|g| g.get("name")).and_then(Json::as_str).map(|n| n.trim_start_matches("NVIDIA ").to_string()).unwrap_or_else(|| "None found".into());
-                let model = self.model.as_ref().map(|m| m.label.clone()).unwrap_or_else(|| "None loaded".into());
+                let gpu = sys.get("gpus").and_then(Json::as_array).and_then(|g| g.first()).and_then(|g| g.get("name")).and_then(Json::as_str).map(|n| n.trim_start_matches("NVIDIA ").to_string()).unwrap_or_else(|| tr("None found").into());
+                let model = self.model.as_ref().map(|m| m.label.clone()).unwrap_or_else(|| tr("None loaded").into());
                 let head = row![
                     canvas(Ghost::still(2.0, s.accent)).width(48).height(44),
-                    column![text("ghost").size(18).font(MEDIUM).color(s.text), text(format!("Version {}", env!("CARGO_PKG_VERSION"))).size(12.5).color(s.faint)].spacing(2),
+                    column![text("ghost").size(18).font(MEDIUM).color(s.text), text(tf!("Version {}", "版本 {}", env!("CARGO_PKG_VERSION"))).size(12.5).color(s.faint)].spacing(2),
                 ]
                 .spacing(14)
                 .align_y(Alignment::Center);
                 (
-                    "About",
-                    "This copy of ghost and the computer it runs on.",
+                    tr("About"),
+                    tr("This copy of ghost and the computer it runs on."),
                     vec![
                         head.into(),
                         group(
                             "Running",
                             vec![
-                                row_of("Engine", "Runs the models on this computer.".into(), value("ghost-infer".into())),
-                                row_of("Model", "The model loaded now.".into(), value(model)),
-                                row_of("Graphics", "Where the model runs.".into(), value(gpu)),
+                                row_of(tr("Engine"), tr("Runs the models on this computer.").into(), value("ghost-infer".into())),
+                                row_of(tr("Model"), tr("The model loaded now.").into(), value(model)),
+                                row_of(tr("Graphics"), tr("Where the model runs.").into(), value(gpu)),
                             ],
                         ),
                     ],
@@ -799,9 +835,9 @@ impl App {
             env = env.push(line(ic::PC, name, format!("{:.1} / {:.0} GB", f(&gpu, "vram_used_gb"), f(&gpu, "vram_total_gb"))));
         }
         if f(sys, "ram_total_gb") > 0.0 {
-            env = env.push(line(ic::CHIP, "Memory".into(), format!("{:.1} / {:.0} GB", f(sys, "ram_total_gb") - f(sys, "ram_available_gb"), f(sys, "ram_total_gb"))));
+            env = env.push(line(ic::CHIP, tr("Memory").into(), format!("{:.1} / {:.0} GB", f(sys, "ram_total_gb") - f(sys, "ram_available_gb"), f(sys, "ram_total_gb"))));
         }
-        let model = self.model.as_ref().map(|m| m.label.clone()).unwrap_or_else(|| "No model".into());
+        let model = self.model.as_ref().map(|m| m.label.clone()).unwrap_or_else(|| tr("No model").into());
         let runs = sys.get("model_runs_on").and_then(Json::as_str).map(|b| if b.starts_with("GPU") { "GPU" } else { "CPU" }).unwrap_or("");
         env = env.push(line(ic::BOLT, model.clone(), runs.into()));
         let dir = if self.messages.is_empty() { self.new_chat_dir() } else { self.chat_cwd.as_deref().or(self.folders.first().map(String::as_str)) };
@@ -810,17 +846,17 @@ impl App {
                 let place = std::path::Path::new(d).parent().map(|p| format!(" · {}", p.display())).unwrap_or_default();
                 container(pair(crate::folder_name(d), place, ic::FOLDER)).padding([5, 0]).into()
             }
-            None => line(ic::FOLDER, "No folder".into(), String::new()),
+            None => line(ic::FOLDER, tr("No folder").into(), String::new()),
         });
         // the folders every chat may use besides its own
-        env = env.push(fold("environment.folders", "Other folders", self.folders.len().to_string()));
+        env = env.push(fold("environment.folders", tr("Other folders"), self.folders.len().to_string()));
         if open("environment.folders") {
             for (i, d) in self.folders.iter().enumerate() {
                 env = env.push(row![Space::new().width(18), container(text(d.clone()).size(12.5).color(s.muted).wrapping(text::Wrapping::None)).width(Fill).clip(true), remove(Message::RemoveFolder(i))].spacing(8).align_y(Alignment::Center));
             }
-            env = env.push(row![Space::new().width(18), link("Add folder", Message::AddFolder)].spacing(8));
+            env = env.push(row![Space::new().width(18), link(tr("Add folder"), Message::AddFolder)].spacing(8));
         }
-        let environment = card("environment", "Environment", faint(model), env.into());
+        let environment = card("environment", tr("Environment"), faint(model), env.into());
 
         // context: how full it is, and what fills it, as Claude's rail breaks it down
         let (used, total) = self.context;
@@ -830,15 +866,15 @@ impl App {
         let grey = |a: f32| Color { a, ..s.muted };
         let parts: Vec<(&str, f64, Color)> = if self.parts != Json::Null && used > 0.0 {
             vec![
-                ("Messages", (used - counted).max(0.0), PART_BLUE),
-                ("Tools", part("tools"), PART_ORANGE),
-                ("Skills", part("skills"), PART_GREEN),
-                ("System prompt", part("system"), grey(0.85)),
-                ("Instructions", part("instructions"), grey(0.6)),
-                ("Memory", part("memory"), grey(0.4)),
+                (tr("Messages"), (used - counted).max(0.0), PART_BLUE),
+                (tr("Tools"), part("tools"), PART_ORANGE),
+                (tr("Skills"), part("skills"), PART_GREEN),
+                (tr("System prompt"), part("system"), grey(0.85)),
+                (tr("Instructions"), part("instructions"), grey(0.6)),
+                (tr("Memory"), part("memory"), grey(0.4)),
             ]
         } else {
-            vec![("Used", used, PART_BLUE)]
+            vec![(tr("Used"), used, PART_BLUE)]
         };
         let free = (total - used).max(0.0);
         let portion = |n: f64| if total > 0.0 { ((n / total) * 1000.0).round().max(1.0) as u16 } else { 1 };
@@ -863,34 +899,34 @@ impl App {
         };
         let mut ctx = column![].spacing(8);
         if total == 0.0 {
-            ctx = ctx.push(faint("No model".into()));
+            ctx = ctx.push(faint(tr("No model").into()));
         } else {
-            ctx = ctx.push(row![text(format!("{pct:.0}% used")).size(13).font(MEDIUM).color(s.text), Space::new().width(Fill), text(format!("{} / {}", tokens_k(used), tokens_k(total))).size(12.5).color(s.faint)].align_y(Alignment::Center));
+            ctx = ctx.push(row![text(tf!("{pct:.0}% used", "已用 {pct:.0}%")).size(13).font(MEDIUM).color(s.text), Space::new().width(Fill), text(format!("{} / {}", tokens_k(used), tokens_k(total))).size(12.5).color(s.faint)].align_y(Alignment::Center));
             ctx = ctx.push(bar);
             let mut rows = column![];
             for (label, n, c) in parts.iter().filter(|_| used > 0.0) {
                 rows = rows.push(entry(label, *n, *c));
             }
-            rows = rows.push(entry("Free space", free, s.raise2));
+            rows = rows.push(entry(tr("Free space"), free, s.raise2));
             ctx = ctx.push(rows);
         }
         // the GHOST.md files and the remembered facts, as Claude's memory files
         let in_use = self.instructions.iter().filter(|f| f.1).count();
-        let mut lists = column![fold("context.instructions", "Instructions", in_use.to_string())];
+        let mut lists = column![fold("context.instructions", tr("Instructions"), in_use.to_string())];
         if open("context.instructions") {
             for (path, exists, global) in &self.instructions {
                 let file = path.rsplit(['\\', '/']).next().unwrap_or(path).to_string();
-                let note = if *global { "every chat".to_string() } else { path.rsplit(['\\', '/']).nth(1).unwrap_or("").to_string() };
+                let note = if *global { tr("every chat").to_string() } else { path.rsplit(['\\', '/']).nth(1).unwrap_or("").to_string() };
                 let words: [text::Span<'static, (), Font>; 2] = [iced::widget::span(file).color(if *exists { s.text } else { s.faint }), iced::widget::span(format!(" · {note}")).color(s.faint)];
-                lists = lists.push(row![Space::new().width(18), container(rich_text(words).size(12.5).wrapping(text::Wrapping::None)).width(Fill).clip(true), link(if *exists { "Edit" } else { "Add" }, Message::EditInstructions(path.clone()))].spacing(8).align_y(Alignment::Center));
+                lists = lists.push(row![Space::new().width(18), container(rich_text(words).size(12.5).wrapping(text::Wrapping::None)).width(Fill).clip(true), link(if *exists { tr("Edit") } else { tr("Add") }, Message::EditInstructions(path.clone()))].spacing(8).align_y(Alignment::Center));
             }
         }
-        lists = lists.push(fold("context.memory", "Memory", self.memory.len().to_string()));
+        lists = lists.push(fold("context.memory", tr("Memory"), self.memory.len().to_string()));
         if open("context.memory") {
             for (i, fact) in self.memory.iter().enumerate() {
                 lists = lists.push(row![Space::new().width(18), text(fact.clone()).size(12.5).color(s.muted).width(Fill), remove(Message::Forget(i))].spacing(8).align_y(Alignment::Center));
             }
-            let add_memory = text_input("Add a memory", &self.memory_draft).on_input(Message::MemoryDraft).on_submit(Message::AddMemory).size(12.5).padding([5, 8]).style(move |t, st| input_style(s, t, st));
+            let add_memory = text_input(tr("Add a memory"), &self.memory_draft).on_input(Message::MemoryDraft).on_submit(Message::AddMemory).size(12.5).padding([5, 8]).style(move |t, st| input_style(s, t, st));
             lists = lists.push(row![Space::new().width(18), add_memory].spacing(8).padding(Padding { top: 4.0, ..Padding::ZERO }));
         }
         ctx = ctx.push(lists);
@@ -898,8 +934,8 @@ impl App {
         if total > 0.0 && self.chat.is_some() {
             let room = (total - 4096f64.min(total / 4.0) - used).max(0.0);
             let can_trim = self.busy.is_none().then_some(Message::TrimChat);
-            let until = container(text(format!("{} until old output is trimmed", tokens_k(room))).size(12).color(s.faint).wrapping(text::Wrapping::None)).width(Fill).clip(true);
-            ctx = ctx.push(row![until, action("Trim now", can_trim)].spacing(8).align_y(Alignment::Center));
+            let until = container(text(tf!("{} until old output is trimmed", "距裁剪旧输出还有 {}", tokens_k(room))).size(12).color(s.faint).wrapping(text::Wrapping::None)).width(Fill).clip(true);
+            ctx = ctx.push(row![until, action(tr("Trim now"), can_trim)].spacing(8).align_y(Alignment::Center));
         }
         let filled = (pct.round() as u16).clamp(1, 99);
         let mini = container(row![
@@ -909,7 +945,7 @@ impl App {
         .width(26)
         .style(move |_| container::Style { background: Some(Background::Color(s.raise2)), border: border::rounded(99), ..Default::default() });
         let folded: Element<'static, Message> = if total > 0.0 { row![faint(format!("{pct:.0}%")), mini].spacing(8).align_y(Alignment::Center).into() } else { Space::new().into() };
-        let context = card("context", "Context", folded, ctx.into());
+        let context = card("context", tr("Context"), folded, ctx.into());
 
         // changes: the files this chat changed, their lines, and undo for all of them
         let changes = self.changes();
@@ -917,17 +953,17 @@ impl App {
         let counts = |a: usize, d: usize| -> Element<'static, Message> { row![text(format!("+{a}")).size(12.5).font(MONO).color(s.ok), text(format!("−{d}")).size(12.5).font(MONO).color(s.bad)].spacing(6).into() };
         let mut ch = column![];
         if changes.is_empty() {
-            ch = ch.push(faint("No changes".into()));
+            ch = ch.push(faint(tr("No changes").into()));
         }
         for (path, add, del) in &changes {
             let name = path.rsplit(['\\', '/']).next().unwrap_or(path).to_string();
             ch = ch.push(row![icon(ic::FILE, 12).color(s.faint).width(18), container(text(name).size(13).color(s.text).wrapping(text::Wrapping::None)).width(Fill).clip(true), counts(*add, *del)].spacing(8).align_y(Alignment::Center).padding([4, 0]));
         }
         if !changes.is_empty() {
-            ch = ch.push(row![icon(ic::EDIT, 12).color(s.faint).width(18), counts(adds, dels), Space::new().width(Fill), action("Undo all", Some(Message::UndoAll))].spacing(8).align_y(Alignment::Center).padding(Padding { top: 6.0, ..Padding::ZERO }));
+            ch = ch.push(row![icon(ic::EDIT, 12).color(s.faint).width(18), counts(adds, dels), Space::new().width(Fill), action(tr("Undo all"), Some(Message::UndoAll))].spacing(8).align_y(Alignment::Center).padding(Padding { top: 6.0, ..Padding::ZERO }));
         }
         let changed: Element<'static, Message> = if changes.is_empty() { Space::new().into() } else { counts(adds, dels) };
-        let changes = card("changes", "Changes", changed, ch.into());
+        let changes = card("changes", tr("Changes"), changed, ch.into());
 
         // the model's task list, while it keeps one
         let done = self.tasks.iter().filter(|t| t.1 == "done").count();
@@ -939,7 +975,7 @@ impl App {
             };
             row![icon(mark, 10).color(mc).width(18), text(task.clone()).size(13).color(tc).width(Fill)].spacing(8).align_y(Alignment::Center).padding([3, 0]).into()
         }));
-        let tasks = card("tasks", "Tasks", faint(format!("{done} of {}", self.tasks.len())), tasks.into());
+        let tasks = card("tasks", tr("Tasks"), faint(tf!("{done} of {total}", "{done} / {total}")), tasks.into());
 
         // background tasks, as Claude's: the chat's commands running now, each with its time and a stop button,
         // and how many finished; a click opens the panel with all of them
@@ -958,55 +994,55 @@ impl App {
         }
         let finished = list.iter().filter(|t| t.state != TaskState::Running).count();
         if finished > 0 {
-            bt = bt.push(button(row![icon(ic::TASKS, 12).color(s.faint).width(18), text(format!("{finished} finished")).size(13).color(s.text)].spacing(8).align_y(Alignment::Center)).on_press(Message::ShowTasks).width(Fill).padding([2, 0]).style(move |_, _| button::Style { background: None, ..Default::default() }));
+            bt = bt.push(button(row![icon(ic::TASKS, 12).color(s.faint).width(18), text(tf!("{finished} finished", "{finished} 项已完成")).size(13).color(s.text)].spacing(8).align_y(Alignment::Center)).on_press(Message::ShowTasks).width(Fill).padding([2, 0]).style(move |_, _| button::Style { background: None, ..Default::default() }));
         }
         let running_now = list.len() - finished;
-        let tasks_note = if running_now > 0 { format!("{running_now} running") } else { format!("{finished} finished") };
-        let background = (!list.is_empty()).then(|| card("background", "Background tasks", faint(tasks_note), bt.into()));
+        let tasks_note = if running_now > 0 { tf!("{running_now} running", "{running_now} 项运行中") } else { tf!("{finished} finished", "{finished} 项已完成") };
+        let background = (!list.is_empty()).then(|| card("background", tr("Background tasks"), faint(tasks_note), bt.into()));
 
         // scheduled: the tasks the model set and the /loop ones, and the one running now
         let jobs = self.background.get("jobs").and_then(Json::as_array).unwrap_or(&[]);
         let running = self.background.get("running").and_then(Json::as_str).is_some();
         let mut sc = column![];
         if running {
-            sc = sc.push(line(ic::NOW, "Running one now".into(), String::new()));
+            sc = sc.push(line(ic::NOW, tr("Running one now").into(), String::new()));
         }
         for j in jobs {
             let g = |k: &str| j.get(k).and_then(Json::as_str).unwrap_or("").to_string();
-            sc = sc.push(row![pair(g("name"), format!(" · {}, next {}", g("when"), g("next")), ic::CLOCK), link("Run", Message::RunScheduled(g("id"))), remove(Message::CancelScheduled(g("id")))].spacing(4).align_y(Alignment::Center).padding([3, 0]));
+            sc = sc.push(row![pair(g("name"), tf!(" · {}, next {}", " · {}，下次 {}", g("when"), g("next")), ic::CLOCK), link("Run", Message::RunScheduled(g("id"))), remove(Message::CancelScheduled(g("id")))].spacing(4).align_y(Alignment::Center).padding([3, 0]));
         }
         let due = match (running, jobs.len()) {
             (true, _) => "running".to_string(),
             (false, 0) => String::new(),
             (false, n) => n.to_string(),
         };
-        let scheduled = (running || !jobs.is_empty()).then(|| card("scheduled", "Scheduled", faint(due), sc.into()));
+        let scheduled = (running || !jobs.is_empty()).then(|| card("scheduled", tr("Scheduled"), faint(due), sc.into()));
 
         // skills: installed ones, and installing
         let mut sk = column![];
         for (name, desc) in &self.skills {
             sk = sk.push(row![pair(name.clone(), format!(" · {desc}"), ic::SKILL), remove(Message::RemoveSkill(name.clone()))].spacing(8).align_y(Alignment::Center).padding([2, 0]));
         }
-        sk = sk.push(row![link("Install from folder", Message::InstallSkill(false)), link("From .zip", Message::InstallSkill(true))]);
-        let skill_link = text_input("Skill link (GitHub or .zip)", &self.skill_link).id("skill-link").on_input(Message::SkillLink).on_submit(Message::InstallLink).size(12.5).padding([5, 8]).style(move |t, st| input_style(s, t, st));
+        sk = sk.push(row![link(tr("Install from folder"), Message::InstallSkill(false)), link(tr("From .zip"), Message::InstallSkill(true))]);
+        let skill_link = text_input(tr("Skill link (GitHub or .zip)"), &self.skill_link).id("skill-link").on_input(Message::SkillLink).on_submit(Message::InstallLink).size(12.5).padding([5, 8]).style(move |t, st| input_style(s, t, st));
         sk = sk.push(container(skill_link).padding(Padding { top: 4.0, ..Padding::ZERO }));
         // a link or folder with several skills: which to install
         if let Some((_, choices)) = &self.skill_choices {
-            sk = sk.push(container(faint(format!("It has {} skills. Install which?", choices.len()))).padding(Padding { top: 6.0, ..Padding::ZERO }));
+            sk = sk.push(container(faint(tf!("It has {} skills. Install which?", "其中有 {} 个技能，要装哪个？", choices.len()))).padding(Padding { top: 6.0, ..Padding::ZERO }));
             for (path, name, desc) in choices {
                 let place = if path.is_empty() { desc.clone() } else { format!("{path} · {desc}") };
-                sk = sk.push(row![pair(name.clone(), format!(" · {place}"), ic::SKILL), link("Install", Message::InstallChoice(Some(path.clone())))].spacing(8).align_y(Alignment::Center));
+                sk = sk.push(row![pair(name.clone(), format!(" · {place}"), ic::SKILL), link(tr("Install"), Message::InstallChoice(Some(path.clone())))].spacing(8).align_y(Alignment::Center));
             }
-            sk = sk.push(row![link("Install all", Message::InstallChoice(None)), link("Cancel", Message::CancelChoice)]);
+            sk = sk.push(row![link(tr("Install all"), Message::InstallChoice(None)), link(tr("Cancel"), Message::CancelChoice)]);
         }
-        let skills = card("skills", "Skills", faint(if self.skills.is_empty() { String::new() } else { self.skills.len().to_string() }), sk.into());
+        let skills = card("skills", tr("Skills"), faint(if self.skills.is_empty() { String::new() } else { self.skills.len().to_string() }), sk.into());
 
         // MCP servers: each with its state, and editing the list
         let mut mc = column![];
         for (name, state, tools) in &self.mcp {
             let (dot, note) = match state.as_str() {
-                "ready" => (s.ok, format!("{tools} tools")),
-                "starting" => (s.warn, "starting".to_string()),
+                "ready" => (s.ok, tf!("{tools} tools", "{tools} 个工具")),
+                "starting" => (s.warn, tr("starting").to_string()),
                 other => (s.bad, crate::clip_line(other, 40)),
             };
             mc = mc.push(
@@ -1020,15 +1056,15 @@ impl App {
                 .padding([4, 0]),
             );
         }
-        mc = mc.push(row![link("Edit servers", Message::McpEdit), link("Reload", Message::McpReload), link("From Claude", Message::McpImport)]);
+        mc = mc.push(row![link(tr("Edit servers"), Message::McpEdit), link(tr("Reload"), Message::McpReload), link(tr("From Claude"), Message::McpImport)]);
         let ready = self.mcp.iter().filter(|m| m.1 == "ready").count();
         let broken = self.mcp.iter().filter(|m| m.1 != "ready" && m.1 != "starting").count();
         let mcp_note = match (ready, broken) {
-            (_, b) if b > 0 => format!("{b} not working"),
+            (_, b) if b > 0 => tf!("{b} not working", "{b} 个不可用"),
             (0, _) => String::new(),
-            (r, _) => format!("{r} ready"),
+            (r, _) => tf!("{r} ready", "{r} 个就绪"),
         };
-        let mcp = card("mcp", "MCP servers", faint(mcp_note), mc.into());
+        let mcp = card("mcp", tr("MCP servers"), faint(mcp_note), mc.into());
 
         let mut body = column![environment, context, changes].spacing(10);
         if !self.tasks.is_empty() {
@@ -1054,7 +1090,7 @@ impl App {
         let tool = |c: char, msg: Message| -> Element<'static, Message> { button(icon(c, 12).color(s.muted)).on_press(msg).padding(7).style(move |_, st| bare(s, st)).into() };
         let finished: Vec<String> = list.iter().filter(|t| t.state != TaskState::Running).map(|t| t.key.clone()).collect();
         let head = row![
-            text("Background tasks").size(14).font(MEDIUM).color(s.text),
+            text(tr("Background tasks")).size(14).font(MEDIUM).color(s.text),
             Space::new().width(Fill),
             tool(ic::DELETE, Message::ClearFinished(finished.clone())),
             tool(if self.tasks_wide { ic::RESTORE } else { ic::MAXIMIZE }, Message::WideTasks),
@@ -1066,9 +1102,9 @@ impl App {
         let item = |t: &crate::BgTask| -> Element<'static, Message> {
             let open = t.state == TaskState::Running || self.task_open.contains(&t.key);
             let (right, color) = match (t.state, t.secs) {
-                (TaskState::Failed, _) => ("Failed".to_string(), s.bad),
-                (TaskState::Stopped, Some(n)) => (format!("Stopped · {}", duration(n)), s.faint),
-                (TaskState::Stopped, None) => ("Stopped".to_string(), s.faint),
+                (TaskState::Failed, _) => (tr("Failed").to_string(), s.bad),
+                (TaskState::Stopped, Some(n)) => (tf!("Stopped · {}", "已停止 · {}", duration(n)), s.faint),
+                (TaskState::Stopped, None) => (tr("Stopped").to_string(), s.faint),
                 (_, Some(n)) => (duration(n), s.faint),
                 (_, None) => (String::new(), s.faint),
             };
@@ -1096,7 +1132,7 @@ impl App {
             col = col.push(item(t));
         }
         if !finished.is_empty() {
-            let group = button(row![icon(if self.finished_open { ic::DOWN } else { ic::RIGHT }, 8).color(s.faint).width(14), text("Finished").size(12.5).color(s.faint), text(finished.len().to_string()).size(12.5).color(s.faint)].spacing(6).align_y(Alignment::Center))
+            let group = button(row![icon(if self.finished_open { ic::DOWN } else { ic::RIGHT }, 8).color(s.faint).width(14), text(tr("Finished")).size(12.5).color(s.faint), text(finished.len().to_string()).size(12.5).color(s.faint)].spacing(6).align_y(Alignment::Center))
                 .on_press(Message::ToggleFinished)
                 .padding(Padding { top: 10.0, right: 0.0, bottom: 4.0, left: 2.0 })
                 .style(move |_, _| button::Style { background: None, ..Default::default() });
@@ -1106,12 +1142,12 @@ impl App {
                     col = col.push(item(t));
                 }
                 if finished.len() > self.tasks_shown {
-                    col = col.push(button(text("Show more").size(12.5).color(s.muted)).on_press(Message::MoreTasks).padding([6, 4]).style(move |_, st| bare(s, st)));
+                    col = col.push(button(text(tr("Show more")).size(12.5).color(s.muted)).on_press(Message::MoreTasks).padding([6, 4]).style(move |_, st| bare(s, st)));
                 }
             }
         }
         if list.is_empty() {
-            col = col.push(text("None").size(12.5).color(s.faint));
+            col = col.push(text(tr("None")).size(12.5).color(s.faint));
         }
         let body = scrollable(container(col).padding(Padding { top: 0.0, right: 12.0, bottom: 12.0, left: 12.0 })).height(Fill).style(move |t, st| scroll_style(s, t, st));
         container(column![head, body])
@@ -1156,17 +1192,17 @@ impl App {
                 .padding([7, 10])
                 .style(move |_, st| row_style(s, st, false))
         };
-        let mut col = column![chrome, nav(ic::ADD, "New chat", Message::NewChat), nav(ic::SEARCH, "Search", Message::ToggleSearch)].spacing(1);
+        let mut col = column![chrome, nav(ic::ADD, tr("New chat"), Message::NewChat), nav(ic::SEARCH, tr("Search"), Message::ToggleSearch)].spacing(1);
         if self.searching {
             col = col.push(
-                text_input("Search chats", &self.filter)
+                text_input(tr("Search chats"), &self.filter)
                     .on_input(Message::Filter)
                     .size(13.5)
                     .padding([7, 10])
                     .style(move |t, st| input_style(s, t, st)),
             );
         }
-        let recents_head = button(row![text("Recents").size(12).color(s.faint), icon(if self.recents_open { ic::DOWN } else { ic::RIGHT }, 8).color(s.faint)].spacing(6).align_y(Alignment::Center))
+        let recents_head = button(row![text(tr("Recents")).size(12).color(s.faint), icon(if self.recents_open { ic::DOWN } else { ic::RIGHT }, 8).color(s.faint)].spacing(6).align_y(Alignment::Center))
             .on_press(Message::ToggleRecents)
             .padding(Padding { top: 14.0, right: 10.0, bottom: 4.0, left: 10.0 })
             .style(move |_, _| button::Style { background: None, ..Default::default() });
@@ -1175,7 +1211,7 @@ impl App {
         let rows = column(self.chats.iter().filter(|c| filter.is_empty() || c.title.to_lowercase().contains(&filter)).map(|c| {
             let on = self.chat.as_deref() == Some(c.id.as_str());
             let hover = self.hovered.as_deref() == Some(c.id.as_str());
-            let name = container(text(if c.title.is_empty() { "New chat" } else { c.title.as_str() }).size(14).color(s.text).wrapping(text::Wrapping::None)).width(Fill).clip(true);
+            let name = container(text(if c.title.is_empty() { tr("New chat") } else { c.title.as_str() }).size(14).color(s.text).wrapping(text::Wrapping::None)).width(Fill).clip(true);
             // a long title fades out at the right instead of being cut (the fade is the row's own colour)
             let bg = if on { s.raise } else if hover { s.hover } else { s.side };
             let fade = iced::gradient::Linear::new(iced::Radians(std::f32::consts::FRAC_PI_2)).add_stop(0.0, Color { a: 0.0, ..bg }).add_stop(1.0, bg);
@@ -1198,11 +1234,11 @@ impl App {
         let list: Element<'_, Message> = if self.recents_open { scrollable(rows).height(Fill).style(move |t, st| scroll_style(s, t, st)).into() } else { Space::new().height(Fill).into() };
         col = col.push(list);
         // you, at the bottom: this computer, the model, settings
-        let model = self.model.as_ref().map(|m| m.label.clone()).unwrap_or_else(|| "No model".into());
+        let model = self.model.as_ref().map(|m| m.label.clone()).unwrap_or_else(|| tr("No model").into());
         let me = button(
             row![
                 canvas(Ghost::still(1.0, s.accent)).width(24).height(22),
-                column![text("This PC").size(13.5).color(s.text), text(model).size(12).color(s.faint).wrapping(text::Wrapping::None)].width(Fill),
+                column![text(tr("This PC")).size(13.5).color(s.text), text(model).size(12).color(s.faint).wrapping(text::Wrapping::None)].width(Fill),
                 icon(ic::SETTINGS, 13).color(s.muted),
             ]
             .spacing(10)
@@ -1252,7 +1288,7 @@ impl App {
         if self.messages.is_empty() {
             // a new chat: the greeting, the ghost on the message box, recent chats; on the first run, with no
             // model yet, the models to download instead of the message box
-            let hello = text(if self.api.is_some() { greeting() } else { "Connecting…" }).size(38).font(SERIF).color(s.text);
+            let hello = text(if self.api.is_some() { greeting() } else { tr("Connecting…") }).size(38).font(SERIF).color(s.text);
             let first_run = self.api.is_some() && self.models.is_empty() && self.model.is_none() && self.loading.is_none();
             let below = if first_run { self.setup_card() } else { self.dock_parts() };
             let mut center = column![Space::new().height(Fill), hello, Space::new().height(26), below].align_x(Alignment::Center).max_width(760).width(Fill);
@@ -1268,7 +1304,7 @@ impl App {
                         .into()
                 }))
                 .spacing(12);
-                center = center.push(Space::new().height(30)).push(row![text("Recent chats").size(13).color(s.muted)].padding([0, 2])).push(Space::new().height(10)).push(cards);
+                center = center.push(Space::new().height(30)).push(row![text(tr("Recent chats")).size(13).color(s.muted)].padding([0, 2])).push(Space::new().height(10)).push(cards);
             }
             center = center.push(Space::new().height(Fill));
             return container(column![top, container(center).center_x(Fill).height(Fill).padding([0, 24])]).style(move |_| container::Style { background: Some(Background::Color(s.bg)), ..Default::default() }).into();
@@ -1277,7 +1313,7 @@ impl App {
         let first = self.messages.len().saturating_sub(self.shown);
         let mut items: Vec<Element<'_, Message>> = Vec::new();
         if first > 0 {
-            items.push(container(button(text(format!("Show {} earlier messages", first.min(crate::SHOWN))).size(13).color(s.muted)).on_press(Message::ShowEarlier).padding([6, 14]).style(move |_, st| pill(s, st, false))).center_x(Fill).into());
+            items.push(container(button(text(tf!("Show {} earlier messages", "显示更早的 {} 条消息", first.min(crate::SHOWN))).size(13).color(s.muted)).on_press(Message::ShowEarlier).padding([6, 14]).style(move |_, st| pill(s, st, false))).center_x(Fill).into());
         }
         for (i, m) in self.messages.iter().enumerate().skip(first) {
             items.push(self.message(i, m));
@@ -1305,7 +1341,7 @@ impl App {
                 });
             tooltip(b, container(text(tip).size(12).color(s.text)).padding([4, 8]).style(move |_| container::Style { background: Some(Background::Color(s.raise)), border: border::rounded(6), ..Default::default() }), tooltip::Position::Bottom)
         };
-        container(row![seg(ic::PHONE, "Voice call", self.voice, Message::SetVoice(true)), seg(ic::CODE, "Code", !self.voice, Message::SetVoice(false))].spacing(2))
+        container(row![seg(ic::PHONE, tr("Voice call"), self.voice, Message::SetVoice(true)), seg(ic::CODE, tr("Code"), !self.voice, Message::SetVoice(false))].spacing(2))
             .padding(2)
             .style(move |_| container::Style { background: Some(Background::Color(s.hover)), border: border::rounded(9), ..Default::default() })
             .into()
@@ -1321,12 +1357,12 @@ impl App {
 
         // who and how long, as a phone shows a call
         let since = self.call_started.filter(|_| in_call).map(|t| t.elapsed().as_secs()).map(|t| format!("{:02}:{:02}", t / 60, t % 60));
-        let header = column![text("Maya").size(22).font(MEDIUM).color(s.text), text(since.unwrap_or_else(|| "Voice call".into())).size(13).color(s.faint)].spacing(4).align_x(Alignment::Center);
+        let header = column![text(tr("Maya")).size(22).font(MEDIUM).color(s.text), text(since.unwrap_or_else(|| tr("Voice call").into())).size(13).color(s.faint)].spacing(4).align_x(Alignment::Center);
 
         // where the call is: a dot of colour and a word; anything else (loading, an error) as a plain line
         let (dot, word) = match (in_call, self.call_state.as_str()) {
             (true, _) if talking => (Some(s.accent), "Speaking".to_string()),
-            (true, _) if muted => (Some(s.faint), "Muted".to_string()),
+            (true, _) if muted => (Some(s.faint), tr("Muted").to_string()),
             (true, "Thinking") => (Some(s.warn), "Thinking".to_string()),
             (true, "Hearing you") => (Some(s.ok), "Hearing you".to_string()),
             (true, "Listening") | (true, "") => (Some(s.ok), "Listening".to_string()),
@@ -1350,9 +1386,9 @@ impl App {
             Some((m, t)) => {
                 let cap = |w: &str| w.chars().next().map(|c| c.to_uppercase().collect::<String>() + &w[c.len_utf8()..]).unwrap_or_default();
                 let line = |k: &'static str, v: String| row![text(k).size(12.5).color(s.faint), text(v).size(12.5).color(s.muted)].spacing(6);
-                let mut col = column![line("Current mood", cap(m))].spacing(3).align_x(Alignment::Center);
+                let mut col = column![line(tr("Current mood"), cap(m))].spacing(3).align_x(Alignment::Center);
                 if !t.is_empty() {
-                    col = col.push(line("Way of talk", t.clone()));
+                    col = col.push(line(tr("Way of talk"), t.clone()));
                 }
                 container(col).padding([10, 0]).into()
             }
@@ -1383,20 +1419,20 @@ impl App {
             let (mic_bg, mic_fg) = if muted { (s.text, s.bg) } else { (s.raise2, s.text) };
             let (key_bg, key_fg) = if self.call_typing { (s.text, s.bg) } else { (s.raise2, s.text) };
             row![
-                control(if muted { ic::MIC_OFF } else { ic::MIC }, if muted { "Unmute" } else { "Mute" }, Message::ToggleMute, mic_bg, mic_fg, 56.0),
-                control(ic::KEYBOARD, "Type", Message::ToggleCallTyping, key_bg, key_fg, 56.0),
-                control(ic::HANG_UP, "End", Message::EndCall, s.bad, Color::WHITE, 56.0),
+                control(if muted { ic::MIC_OFF } else { ic::MIC }, if muted { tr("Unmute") } else { tr("Mute") }, Message::ToggleMute, mic_bg, mic_fg, 56.0),
+                control(ic::KEYBOARD, tr("Type"), Message::ToggleCallTyping, key_bg, key_fg, 56.0),
+                control(ic::HANG_UP, tr("End"), Message::EndCall, s.bad, Color::WHITE, 56.0),
             ]
             .spacing(28)
             .into()
         } else {
-            control(ic::PHONE, "Call Maya", Message::StartCall, s.ok, Color::WHITE, 64.0)
+            control(ic::PHONE, tr("Call Maya"), Message::StartCall, s.ok, Color::WHITE, 64.0)
         };
 
         // who she talks with: the call model, picked here (its menu opens above it)
         let talks: Element<'_, Message> = match self.call_target() {
             Some(m) if !in_call => {
-                let line = row![text(format!("Talks with {}", m.label)).size(12.5).color(s.muted), icon(ic::DOWN, 9).color(s.faint)].spacing(6).align_y(Alignment::Center);
+                let line = row![text(tf!("Talks with {}", "通话用 {}", m.label)).size(12.5).color(s.muted), icon(ic::DOWN, 9).color(s.faint)].spacing(6).align_y(Alignment::Center);
                 container(button(line).on_press(Message::OpenMenu(Menu::CallModel)).padding([4, 10]).style(move |_, st| row_style(s, st, false))).id("call_model").into()
             }
             _ => Space::new().height(0).into(),
@@ -1405,7 +1441,7 @@ impl App {
         col = col.push(Space::new().height(28)).push(controls);
         // typing instead of speaking, answered aloud the same way: a box with a send button, when asked for
         if in_call && self.call_typing {
-            let field = text_input("Type a message", &self.call_text)
+            let field = text_input(tr("Type a message"), &self.call_text)
                 .on_input(Message::CallText)
                 .on_submit(Message::SendCallText)
                 .size(14)
@@ -1423,7 +1459,7 @@ impl App {
         }
         // a line under the call only when calls cannot work yet
         if self.voice_models.0.is_none() || self.voice_models.1.is_none() {
-            let note = "Voice calls need the server started with --tts (a voice folder) and --stt (a Whisper file).";
+            let note = tr("Voice calls need the server started with --tts (a voice folder) and --stt (a Whisper file).");
             col = col.push(Space::new().height(14)).push(container(text(note).size(12).color(s.faint)).max_width(520).center_x(Fill));
         }
         col = col.push(Space::new().height(Fill));
@@ -1447,8 +1483,8 @@ impl App {
                 })
                 .into()
         };
-        let buttons = row![Space::new().width(Fill), choice("Cancel", Message::ConfirmCall(false), false), choice(yes, Message::ConfirmCall(true), true)].spacing(8);
-        let card = container(column![text("Not enough graphics memory for both").size(16).font(MEDIUM).color(s.text), text(question.clone()).size(13.5).color(s.muted), buttons].spacing(14))
+        let buttons = row![Space::new().width(Fill), choice(tr("Cancel"), Message::ConfirmCall(false), false), choice(yes, Message::ConfirmCall(true), true)].spacing(8);
+        let card = container(column![text(tr("Not enough graphics memory for both")).size(16).font(MEDIUM).color(s.text), text(question.clone()).size(13.5).color(s.muted), buttons].spacing(14))
             .padding(22)
             .max_width(440)
             .style(move |_| container::Style { background: Some(Background::Color(s.bg)), border: Border { radius: 14.0.into(), width: 1.0, color: s.line2 }, ..Default::default() });
@@ -1466,14 +1502,14 @@ impl App {
         for (i, o) in crate::setup::OFFERS.iter().enumerate() {
             let this = file == o.file;
             let name = text(o.name).size(15).font(MEDIUM).color(s.text);
-            let mut left = column![name, text(o.note).size(13).color(s.muted)].spacing(4).width(Fill);
+            let mut left = column![name, text(tr(o.note)).size(13).color(s.muted)].spacing(4).width(Fill);
             let size = text(format!("{:.1} GB", o.size as f64 / 1e9)).size(13).color(s.faint);
             let action: Element<'_, Message> = if this && busy {
-                button(text("Cancel").size(13).color(s.text)).on_press(Message::CancelDownload).padding([6, 14]).style(move |_, st| pill(s, st, false)).into()
+                button(text(tr("Cancel")).size(13).color(s.text)).on_press(Message::CancelDownload).padding([6, 14]).style(move |_, st| pill(s, st, false)).into()
             } else if busy {
                 Space::new().into()
             } else {
-                let label = if this && matches!(state, "failed" | "cancelled") { "Resume" } else { "Download" };
+                let label = if this && matches!(state, "failed" | "cancelled") { tr("Resume") } else { tr("Download") };
                 button(row![icon(ic::DOWNLOAD, 12).color(s.text), text(label).size(13).color(s.text)].spacing(8).align_y(Alignment::Center))
                     .on_press(Message::GetModel(i))
                     .padding([6, 14])
@@ -1492,11 +1528,11 @@ impl App {
                 let mut note = crate::setup::progress_text(bytes, total);
                 if rate > 1e5 {
                     let mins = ((total - bytes) / rate / 60.0).ceil();
-                    note += &if mins <= 1.0 { " · about a minute left".to_string() } else { format!(" · {mins:.0} min left") };
+                    note += &if mins <= 1.0 { tr(" · about a minute left").to_string() } else { tf!(" · {mins:.0} min left", " · 还剩 {mins:.0} 分钟") };
                 }
                 left = left.push(Space::new().height(6)).push(track).push(text(note).size(12).color(s.muted));
             } else if this && state == "failed" {
-                let why = self.download.get("error").and_then(Json::as_str).unwrap_or("The download stopped");
+                let why = self.download.get("error").and_then(Json::as_str).unwrap_or(tr("The download stopped"));
                 left = left.push(text(why).size(12).color(s.bad));
             }
             let line = row![left, size, action].spacing(16).align_y(Alignment::Center);
@@ -1506,9 +1542,9 @@ impl App {
                 ..Default::default()
             }));
         }
-        let mut card = column![row![text("Choose a model").size(13).color(s.muted)].padding([0, 2]), rows].spacing(10).max_width(640).width(Fill);
+        let mut card = column![row![text(tr("Choose a model")).size(13).color(s.muted)].padding([0, 2]), rows].spacing(10).max_width(640).width(Fill);
         if self.own_server && !busy {
-            let folder = button(row![icon(ic::FOLDER, 13).color(s.muted), text("Use models already on this computer").size(13).color(s.muted)].spacing(8).align_y(Alignment::Center))
+            let folder = button(row![icon(ic::FOLDER, 13).color(s.muted), text(tr("Use models already on this computer")).size(13).color(s.muted)].spacing(8).align_y(Alignment::Center))
                 .on_press(Message::UseModelFolder)
                 .padding([6, 10])
                 .style(move |_, st| bare(s, st));
@@ -1561,7 +1597,7 @@ impl App {
     fn dock_parts(&self) -> Element<'_, Message> {
         let s = self.skin();
         let ghost = canvas(Ghost { pixel: 3.0, mood: self.mood(), t: self.clock, talk: self.talking(), accent: s.accent }).width(72).height(66);
-        let say = if self.status.is_empty() && self.messages.is_empty() && self.api.is_some() { "Hello".to_string() } else { self.status_text() };
+        let say = if self.status.is_empty() && self.messages.is_empty() && self.api.is_some() { tr("Hello").to_string() } else { self.status_text() };
         // the ghost's hem tucks behind the box: the perch overlaps the card by a few pixels
         let perch = row![Space::new().width(18), container(ghost).height(58).clip(true), container(text(say).size(13).color(s.muted)).padding(Padding { bottom: 22.0, left: 10.0, ..Padding::ZERO })]
             .align_y(Alignment::End)
@@ -1577,9 +1613,9 @@ impl App {
             .id("editor")
             .highlight_with::<SlashNames>((self.skill_names(), s.accent), |c, _| iced::advanced::text::highlighter::Format { color: Some(*c), font: Some(MEDIUM) })
             .placeholder(match (&self.chip, self.messages.is_empty()) {
-                (Some(_), _) => "Say what to do with it",
-                (None, true) => "How can I help you today?",
-                (None, false) => "Reply to ghost-infer",
+                (Some(_), _) => tr("Say what to do with it"),
+                (None, true) => tr("How can I help you today?"),
+                (None, false) => tr("Reply to ghost-infer"),
             })
             .on_action(Message::Edit)
             .padding(if grown { Padding { top: 4.0, right: 6.0, bottom: 10.0, left: 6.0 } } else { Padding::from([6, 6]) })
@@ -1659,18 +1695,18 @@ impl App {
             border: Border { radius: radius.into(), width: 1.0, color: s.line2 },
             ..Default::default()
         });
-        let think = button(row![icon(ic::BOLT, 11).color(if self.thinking { s.accent } else { s.faint }), text(if self.thinking { "Think" } else { "Quick" }).size(13).color(s.muted)].spacing(6).align_y(Alignment::Center))
+        let think = button(row![icon(ic::BOLT, 11).color(if self.thinking { s.accent } else { s.faint }), text(if self.thinking { tr("Think") } else { tr("Quick") }).size(13).color(s.muted)].spacing(6).align_y(Alignment::Center))
             .on_press(Message::ToggleThinking)
             .padding([4, 8])
             .style(move |_, st| row_style(s, st, false));
         // the model by name, as Claude shows it: a label that opens the model menu
         let name = match &self.model {
-            Some(m) if self.warming => format!("{} · warming up", m.label),
+            Some(m) if self.warming => tf!("{} · warming up", "{} · 预热中", m.label),
             Some(m) => m.label.clone(),
-            None => "Model".into(),
+            None => tr("Model").into(),
         };
         let model = container(button(text(name).size(13).color(s.text)).on_press(Message::OpenMenu(Menu::Model)).padding([4, 8]).style(move |_, st| row_style(s, st, false))).id("model");
-        let mode = crate::MODES[self.perm].1;
+        let mode = tr(crate::MODES[self.perm].1);
         let mode = container(button(text(mode).size(13).color(s.text)).on_press(Message::OpenMenu(Menu::Mode)).padding([4, 8]).style(move |_, st| row_style(s, st, true))).id("mode");
         // where the chat works: picked for a new chat, then kept (as a Claude Code session keeps its folder)
         let folder = row![icon(ic::FOLDER, 12).color(s.muted), text(self.folder_label()).size(13).color(s.muted)].spacing(7).align_y(Alignment::Center);
@@ -1686,7 +1722,7 @@ impl App {
             let frac = (used / total).clamp(0.0, 1.0) as f32;
             let ring = canvas(Ring { frac, track: s.line2, fill: s.accent }).width(16).height(16);
             let ring = button(container(ring).center(24)).on_press(Message::ToggleRail).padding(2).style(move |_, st| row_style(s, st, false));
-            let tip = format!("{:.0}% of context used: {}", 100.0 * frac, self.context_note());
+            let tip = tf!("{:.0}% of context used: {}", "上下文已用 {:.0}%：{}", 100.0 * frac, self.context_note());
             let tip = container(text(tip).size(12).color(s.text)).padding([5, 9]).style(move |_| container::Style {
                 background: Some(Background::Color(s.raise)),
                 border: Border { radius: 8.0.into(), width: 1.0, color: s.line2 },
@@ -1709,15 +1745,15 @@ impl App {
         let g = self.goal.as_ref()?;
         let s = self.skin();
         let (mark, color, state) = match g.state.as_str() {
-            _ if g.checking => (ic::NOW, s.accent, "checking…".to_string()),
-            "met" => (ic::CHECK, s.ok, "met".to_string()),
-            "stopped" => (ic::TODO, s.faint, format!("stopped after {} checks", g.limit)),
-            _ if g.tries == 0 => (ic::NOW, s.accent, "working on it".to_string()),
-            _ => (ic::NOW, s.accent, format!("not met yet · {} of {} checks", g.tries, g.limit)),
+            _ if g.checking => (ic::NOW, s.accent, tr("checking…").to_string()),
+            "met" => (ic::CHECK, s.ok, tr("met").to_string()),
+            "stopped" => (ic::TODO, s.faint, tf!("stopped after {} checks", "检查 {} 次后停止", g.limit)),
+            _ if g.tries == 0 => (ic::NOW, s.accent, tr("working on it").to_string()),
+            _ => (ic::NOW, s.accent, tf!("not met yet · {} of {} checks", "尚未达成 · {}/{} 次检查", g.tries, g.limit)),
         };
         let mut head = row![
             icon(mark, 12).color(color),
-            container(text(format!("Goal: {}", g.text)).size(13).font(MEDIUM).color(s.text).wrapping(text::Wrapping::None)).width(Fill).clip(true),
+            container(text(tf!("Goal: {}", "目标：{}", g.text)).size(13).font(MEDIUM).color(s.text).wrapping(text::Wrapping::None)).width(Fill).clip(true),
             text(state).size(12.5).color(s.faint),
         ]
         .spacing(10)
@@ -1750,13 +1786,13 @@ impl App {
         let now = self.tasks.iter().find(|t| t.1 == "in_progress").or_else(|| self.tasks.iter().find(|t| t.1 != "done"));
         let title = match now {
             Some((task, _)) => task.clone(),
-            None if total == 1 => "The task is done".to_string(),
-            None => format!("All {total} tasks done"),
+            None if total == 1 => tr("The task is done").to_string(),
+            None => tf!("All {total} tasks done", "{total} 项任务全部完成"),
         };
         let head = row![
             icon(if done == total { ic::CHECK } else { ic::TASKS }, 12).color(if done == total { s.ok } else { s.accent }),
             container(text(title).size(13).font(MEDIUM).color(s.text).wrapping(text::Wrapping::None)).width(Fill).clip(true),
-            text(format!("{done} of {total}")).size(12.5).color(s.faint),
+            text(tf!("{done} of {total}", "{done} / {total}")).size(12.5).color(s.faint),
             icon(if open { ic::DOWN } else { ic::CHEVRON_UP }, 8).color(s.faint),
         ]
         .spacing(10)
@@ -1787,9 +1823,9 @@ impl App {
     fn context_note(&self) -> String {
         let (used, total) = self.context;
         match (used > 0.0, self.messages.is_empty()) {
-            (true, _) => format!("{} of {} tokens", thousands(used), thousands(total)),
-            (false, true) => format!("{} tokens free", thousands(total)),
-            (false, false) => "Shown after the next reply".to_string(), // a chat saved before tokens were kept
+            (true, _) => tf!("{} of {} tokens", "{}/{} 词元", thousands(used), thousands(total)),
+            (false, true) => tf!("{} tokens free", "剩余 {} 词元", thousands(total)),
+            (false, false) => tr("Shown after the next reply").to_string(), // a chat saved before tokens were kept
         }
     }
 
@@ -1797,9 +1833,9 @@ impl App {
     /// has written (its rounds' counts and this round's pieces so far), and its speed (this round's while it
     /// writes, else the reply's so far), as Claude Code shows them: Writing a file · 1m 23s · 2,345 tokens · 19 tok/s
     fn status_text(&self) -> String {
-        let (Some(started), true) = (self.started, self.busy.is_some()) else { return self.status.clone() };
+        let (Some(started), true) = (self.started, self.busy.is_some()) else { return crate::i18n::status(&self.status) };
         let secs = started.elapsed().as_secs();
-        let mut line = format!("{} · {}", self.status, if secs < 60 { format!("{secs}s") } else { format!("{}m {:02}s", secs / 60, secs % 60) });
+        let mut line = format!("{} · {}", crate::i18n::status(&self.status), if secs < 60 { format!("{secs}s") } else { format!("{}m {:02}s", secs / 60, secs % 60) });
         // the count and speed only while the model is writing: not while it waits for an OK, reads the
         // prompt or a tool runs (a round's writing ends with its "context" event)
         if self.writing_since.is_none() {
@@ -1807,7 +1843,7 @@ impl App {
         }
         let tokens = self.reply_tokens + self.chunks as f64;
         if tokens > 0.0 {
-            line.push_str(&format!(" · {} tokens", thousands(tokens)));
+            line.push_str(&tf!(" · {} tokens", " · {} 词元", thousands(tokens)));
         }
         let rate = match self.writing_since {
             Some(t) if self.chunks > 1 => Some((self.chunks - 1) as f64 / t.elapsed().as_secs_f64().max(0.001)),
@@ -1860,7 +1896,7 @@ impl App {
             let content: Element<'a, Message> = if files.is_empty() {
                 content
             } else {
-                let chips = row(files.into_iter().map(|(name, lines)| self.file_chip(name, format!("{lines} line{}", if lines == 1 { "" } else { "s" }), None))).spacing(6).wrap();
+                let chips = row(files.into_iter().map(|(name, lines)| self.file_chip(name, crate::attach::lines(lines), None))).spacing(6).wrap();
                 if raw.is_empty() { chips.into() } else { column![content, chips].spacing(8).into() }
             };
             let bubble = container(content).padding([10, 16]).max_width(560).style(move |_| container::Style {
@@ -1894,7 +1930,7 @@ impl App {
                 let thinking = live && k == last && r.answer.is_empty() && m.writing.is_none() && !m.tools.iter().any(|t| t.round == k);
                 let chevron = if r.think_open { ic::DOWN } else { ic::RIGHT };
                 parts.push(
-                    button(row![text(if thinking { "Thinking…" } else { "Thought" }).size(13.5).color(s.muted), icon(chevron, 9).color(s.faint)].spacing(7).align_y(Alignment::Center))
+                    button(row![text(tr(if thinking { "Thinking…" } else { "Thought" })).size(13.5).color(s.muted), icon(chevron, 9).color(s.faint)].spacing(7).align_y(Alignment::Center))
                         .on_press(Message::ToggleThinkView(i, k))
                         .padding([2, 0])
                         .style(move |_, _| button::Style { background: None, ..Default::default() })
@@ -1926,7 +1962,7 @@ impl App {
             }
             if m.changed && !m.undone && m.checkpoint.is_some() {
                 foot = foot.push(
-                    container(button(row![icon(ic::UNDO, 11).color(s.muted), text("Undo file changes").size(12.5).color(s.muted)].spacing(7).align_y(Alignment::Center)).on_press(Message::Undo(i)).padding([4, 10]).style(move |_, st| pill(s, st, false)))
+                    container(button(row![icon(ic::UNDO, 11).color(s.muted), text(tr("Undo file changes")).size(12.5).color(s.muted)].spacing(7).align_y(Alignment::Center)).on_press(Message::Undo(i)).padding([4, 10]).style(move |_, st| pill(s, st, false)))
                         .padding(Padding { left: 6.0, ..Padding::ZERO }),
                 );
             }
@@ -1944,14 +1980,14 @@ impl App {
         let s = self.skin();
         let file = w.path.as_deref().map(crate::short);
         let what = match (w.name.as_str(), file) {
-            ("write_file", Some(f)) => format!("Writing {f}…"),
-            ("edit_file", Some(f)) => format!("Editing {f}…"),
-            ("write_file" | "edit_file", None) => "Writing a file…".to_string(),
-            ("", _) => "Writing a tool call…".to_string(),
-            (n, _) => format!("Writing a call to {n}…"),
+            ("write_file", Some(f)) => tf!("Writing {f}…", "正在写入 {f}…"),
+            ("edit_file", Some(f)) => tf!("Editing {f}…", "正在编辑 {f}…"),
+            ("write_file" | "edit_file", None) => tr("Writing a file…").to_string(),
+            ("", _) => tr("Writing a tool call…").to_string(),
+            (n, _) => tf!("Writing a call to {n}…", "正在写 {n} 调用…"),
         };
         let secs = w.since.elapsed().as_secs();
-        let size = if w.bytes > 0 { format!("{:.1} KB", w.bytes as f64 / 1024.0) } else { format!("{} tokens", w.pieces) };
+        let size = if w.bytes > 0 { format!("{:.1} KB", w.bytes as f64 / 1024.0) } else { tf!("{} tokens", "{} 词元", w.pieces) };
         let head = row![
             icon(tool_icon(&w.name), 12).color(s.accent),
             container(text(what).size(13).color(s.text).wrapping(text::Wrapping::None)).width(Fill).clip(true),
@@ -1970,7 +2006,7 @@ impl App {
     /// The task list a reply finished, inside the reply: its steps, each checked.
     fn finished_plan<'a>(&'a self, plan: &'a [(String, String)]) -> Element<'a, Message> {
         let s = self.skin();
-        let title = if plan.len() == 1 { "The task is done".to_string() } else { format!("All {} tasks done", plan.len()) };
+        let title = if plan.len() == 1 { tr("The task is done").to_string() } else { tf!("All {} tasks done", "{} 项任务全部完成", plan.len()) };
         let head = row![icon(ic::CHECK, 12).color(s.ok), text(title).size(13).font(MEDIUM).color(s.text)].spacing(10).align_y(Alignment::Center);
         let steps = column(plan.iter().map(|(task, _)| {
             row![icon(ic::CHECK, 10).color(s.ok).width(14), text(task.as_str()).size(13).color(s.faint).width(Fill)].spacing(10).align_y(Alignment::Center).padding([3, 0]).into()
@@ -2000,7 +2036,7 @@ impl App {
             };
             let head = row![
                 icon(tool_icon(&t.name), 12).color(s.muted),
-                container(text(tool_label(t)).size(13).color(s.muted).wrapping(text::Wrapping::None)).width(Fill).clip(true),
+                container(text(crate::i18n::label(&tool_label(t))).size(13).color(s.muted).wrapping(text::Wrapping::None)).width(Fill).clip(true),
                 icon(mark, 11).color(color),
                 icon(if t.open { ic::DOWN } else { ic::RIGHT }, 8).color(s.faint),
             ]
@@ -2042,7 +2078,7 @@ impl App {
                 .padding([6, 14])
                 .style(move |_, st| answer_style(s, st, main))
         };
-        card = card.push(row![answer("Allow".into(), "once", true), answer(format!("Always allow {}", group_name(group)), "always", false), answer("Deny".into(), "deny", false)].spacing(8));
+        card = card.push(row![answer(tr("Allow").into(), "once", true), answer(tf!("Always allow {}", "始终允许 {} 操作", tr(group_name(group))), "always", false), answer(tr("Deny").into(), "deny", false)].spacing(8));
         container(card)
             .padding([12, 14])
             .width(Fill)

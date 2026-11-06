@@ -4,6 +4,7 @@
 //! The speaker plays 24 kHz speech (the server's voice) at the device's rate from a queue, so pieces that
 //! arrive while it plays follow on without a gap.
 
+use crate::i18n::tr;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
@@ -121,7 +122,7 @@ fn mono<T: Copy>(data: &[T], channels: usize, conv: impl Fn(T) -> f32, out: &mut
 /// The default microphone, its mono blocks into `tx`: its rate and the stream (kept open while held).
 fn open_mic(tx: mpsc::Sender<Vec<f32>>) -> Result<(u32, cpal::Stream), String> {
     let host = cpal::default_host();
-    let dev = host.default_input_device().ok_or("no microphone found")?;
+    let dev = host.default_input_device().ok_or(tr("no microphone found"))?;
     let cfg = dev.default_input_config().map_err(|e| format!("the microphone: {e}"))?;
     let (rate, channels, format) = (cfg.sample_rate().0, cfg.channels() as usize, cfg.sample_format());
     let err = |e| eprintln!("[microphone: {e}]");
@@ -219,7 +220,7 @@ pub fn start_mic(shared: Arc<Shared>, heard: mpsc::Sender<Heard>) -> Result<(), 
         }
         drop(stream);
     });
-    ok.recv().map_err(|_| "the microphone thread stopped".to_string())?
+    ok.recv().map_err(|_| tr("the microphone thread stopped").to_string())?
 }
 
 /// Cuts the microphone into utterances by loudness against a slowly followed noise floor.
@@ -330,7 +331,7 @@ impl Speaker {
         std::thread::spawn(move || {
             let host = cpal::default_host();
             let Some(dev) = host.default_output_device() else {
-                let _ = ready.send(Err("no speaker found".to_string()));
+                let _ = ready.send(Err(tr("no speaker found").to_string()));
                 return;
             };
             let cfg = match dev.default_output_config() {
@@ -388,7 +389,7 @@ impl Speaker {
             }
             drop(stream);
         });
-        let rate = ok.recv().map_err(|_| "the speaker thread stopped".to_string())??;
+        let rate = ok.recv().map_err(|_| tr("the speaker thread stopped").to_string())??;
         Ok(Speaker { queue, rate, resampler: Mutex::new(None) })
     }
 
