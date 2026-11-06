@@ -109,5 +109,5 @@ pub fn start_server(addr: &str, extra: &[String], last: Option<&str>) {
 
 /// "6.2 of 16.8 GB".
 pub fn progress_text(bytes: f64, total: f64) -> String {
-    format!("{:.1} of {:.1} GB", bytes / 1e9, total / 1e9)
+    crate::tf!("{:.1} of {:.1} GB", "{:.1} / {:.1} GB", bytes / 1e9, total / 1e9)
 }

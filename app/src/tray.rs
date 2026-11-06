@@ -3,6 +3,7 @@
 //! (stopping the model too). Starting the app again while it runs shows this one, as the tray apps Discord and
 //! Oryxis do: the first app owns a named event, a second one sets it and leaves.
 
+use crate::i18n::tr;
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -62,8 +63,8 @@ pub fn already_running(addr: &str) -> bool {
 /// made it, and iced's event loop is the one that reads them).
 pub fn install(rgba: Vec<u8>, side: u32) {
     let menu = Menu::new();
-    let _ = menu.append(&MenuItem::with_id(OPEN, "Open ghost-infer", true, None));
-    let _ = menu.append(&MenuItem::with_id(QUIT, "Quit and stop the model", true, None));
+    let _ = menu.append(&MenuItem::with_id(OPEN, tr("Open ghost-infer"), true, None));
+    let _ = menu.append(&MenuItem::with_id(QUIT, tr("Quit and stop the model"), true, None));
     let mut icon = TrayIconBuilder::new().with_tooltip("ghost-infer").with_menu(Box::new(menu)).with_menu_on_left_click(false);
     if let Ok(i) = tray_icon::Icon::from_rgba(rgba, side, side) {
         icon = icon.with_icon(i);
