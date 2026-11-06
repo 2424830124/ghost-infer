@@ -961,7 +961,8 @@ fn bench(o: &Opts) -> Result<(), String> {
     ids.truncate(o.prompt_len);
     let mut sampler = Sampler::new(0.0, 0, 1.0, 1);
     let (mut best_pp, mut best_tg) = (0f64, 0f64);
-    for round in 0..3 {
+    let rounds = std::env::var("GHOST_INFER_BENCH_ROUNDS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(3).max(1);
+    for round in 0..rounds {
         engine.reset();
         profile::reset();
         let t0 = Instant::now();
@@ -970,23 +971,28 @@ fn bench(o: &Opts) -> Result<(), String> {
             d.model.prefill(&ids, &mut d.sess)?;
         }
         let pp = ids.len() as f64 / t0.elapsed().as_secs_f64();
-        if round == 2 && profile::enabled() {
+        if round == rounds - 1 && profile::enabled() {
             eprintln!("-- prompt phase --");
             profile::report(ids.len());
         }
         profile::reset();
+        let _ = cuda::moe_stats_take(1);
+        let mut out_hash = 0xcbf29ce484222325u64; // FNV-1a of the greedy tokens, to compare outputs across builds
         let t1 = Instant::now();
         if engine.draft.is_some() {
             engine.speculate(o.max_new, false, &mut |_| Ok(true))?;
         } else {
             for _ in 0..o.max_new {
                 let next = sampler.sample(engine.backend.logits());
+                out_hash = (out_hash ^ next as u64).wrapping_mul(0x100000001b3);
                 engine.backend.step(next)?;
             }
         }
         let tg = o.max_new as f64 / t1.elapsed().as_secs_f64();
         best_pp = best_pp.max(pp);
         best_tg = best_tg.max(tg);
+        let stats = cuda::moe_stats_take(o.max_new).unwrap_or_default();
+        eprintln!("round {round}: {tg:.1} tok/s, tokens {out_hash:016x} {stats}");
     }
     println!("prompt {} tok: {:>8.1} tok/s | generate {} tok: {:>7.1} tok/s | {}", ids.len(), best_pp, o.max_new, best_tg, engine.backend.describe());
     if let Backend::Gpu(m, _) = &engine.backend {

@@ -1253,7 +1253,7 @@ __device__ __forceinline__ void att_s1(const int* kw, const kv_t* kt, const floa
 // floats of the key (one coalesced row read) and the dot products are reduced across the warp. The float
 // steps are spelled out: attention_vfy gives a token in a verify batch exactly these results.
 // Writes each head's unnormalised output, max score and exp-sum to `part`, or (nsplit == 1) the final
-// normalised result to `out`. Needs hd a multiple of 32 (<= 128) and G <= ATT_MAX_G.
+// normalised result to `out`. Needs hd a multiple of 32 (<= 128) or 256, and G <= ATT_MAX_G.
 __global__ void attention_partial_gqa(const float* __restrict__ qkv, const kv_t* __restrict__ kc, const kv_t* __restrict__ vc,
                                       const float* __restrict__ ks, const float* __restrict__ vs,
                                       float* __restrict__ part, float* __restrict__ out, int pos0, const int* __restrict__ posp,
@@ -1332,6 +1332,28 @@ __global__ void attention_partial_gqa(const float* __restrict__ qkv, const kv_t*
             #pragma unroll
             for (int g = 0; g < ATT_MAX_G; g++) if (g < G) sc[t][g] = __fmul_rn(s[g], kscale);
         }
+    } else if (hd == 256) {
+    // wide heads: a lane holds 8 consecutive floats of the query and the key, as two groups of 4
+    float q[ATT_MAX_G][8];
+    const float* qrow = qkv + (size_t)b * (q_dim + 2 * kv_dim) + kvh * G * hd + lane * 8;
+    #pragma unroll
+    for (int g = 0; g < ATT_MAX_G; g++)
+        #pragma unroll
+        for (int e = 0; e < 8; e++) q[g][e] = g < G ? __fmul_rn(qrow[g * hd + e], scale) : 0.f;
+    for (int t = warp; t < len; t += nwarps) {
+        const kv_t* kt = kc + (size_t)(t0 + t) * kv_dim + kvh * hd + lane * 8;
+        float4 v0 = kv_load4(kt), v1 = kv_load4(kt + 4);
+        float k0[4] = {v0.x, v0.y, v0.z, v0.w}, k1[4] = {v1.x, v1.y, v1.z, v1.w};
+        float kscale = KV_SCALE(ks, t0 + t, n_kv, kvh);
+        #pragma unroll
+        for (int g = 0; g < ATT_MAX_G; g++) {
+            if (g < G) {
+                float d = __fadd_rn(lane_dot(q[g], k0), lane_dot(q[g] + 4, k1));
+                for (int o = 16; o > 0; o >>= 1) d = __fadd_rn(d, __shfl_xor_sync(0xffffffff, d, o));
+                if (lane == 0) sc[t][g] = __fmul_rn(d, kscale);
+            }
+        }
+    }
     } else {
     int per = hd >> 5; // floats per lane: 2 (hd 64) or 4 (hd 128)
     float q[ATT_MAX_G][4];
@@ -1381,11 +1403,11 @@ __global__ void attention_partial_gqa(const float* __restrict__ qkv, const kv_t*
     }
     #pragma unroll
     for (int g = 0; g < ATT_MAX_G; g++) if (g < G) seg[g] = block_sum(seg[g], red); // barrier: the weights are visible to every thread
-    if (tid < hd) {
+    for (int d = tid; d < hd; d += blockDim.x) { // one pass for hd <= 128 (128 threads), two for 256
         float a[ATT_MAX_G];
         #pragma unroll
         for (int g = 0; g < ATT_MAX_G; g++) a[g] = 0.f;
-        const kv_t* vcol = vc + (size_t)t0 * kv_dim + kvh * hd + tid;
+        const kv_t* vcol = vc + (size_t)t0 * kv_dim + kvh * hd + d;
         // positions in order (the sums' order is fixed); unrolled so the loads of several go out together
         #pragma unroll 8
         for (int t = 0; t < len; t++) {
@@ -1404,11 +1426,11 @@ __global__ void attention_partial_gqa(const float* __restrict__ qkv, const kv_t*
             if (g < G) {
                 int h = kvh * G + g;
                 if (nsplit == 1) {
-                    out[(size_t)b * q_dim + h * hd + tid] = __fmul_rn(a[g], __fdiv_rn(1.f, seg[g]));
+                    out[(size_t)b * q_dim + h * hd + d] = __fmul_rn(a[g], __fdiv_rn(1.f, seg[g]));
                 } else {
                     float* p = part + (((size_t)b * n_heads + h) * nsplit + s) * (hd + 2);
-                    p[tid] = a[g];
-                    if (tid == 0) { p[hd] = mxg[g]; p[hd + 1] = seg[g]; }
+                    p[d] = a[g];
+                    if (d == 0) { p[hd] = mxg[g]; p[hd + 1] = seg[g]; }
                 }
             }
         }
@@ -1956,7 +1978,7 @@ __device__ __forceinline__ uint2 i8x4_to_h4(unsigned w) {
 // bytes: ldmatrix rows hit different banks); the same buffer stages Q at the start. An int8 cache stages
 // K and V as their exact integer values (in f16) and applies the scales to the scores and probabilities. Online softmax in
 // base 2 (Q is pre-scaled by scale * log2 e). The row sums come from the tensor cores too (P x ones), so they\n// add up exactly the rounded probabilities that P V uses.
-template <int HD>
+template <int HD, int SPLIT = 1> // SPLIT: blocks per head (grid z), each with HD / SPLIT of the output dimensions
 __device__ void attn_prefill_tc(const float* __restrict__ qkv, const kv_t* __restrict__ kc, const kv_t* __restrict__ vc,
                                 const float* __restrict__ ks, const float* __restrict__ vs,
                                 float* __restrict__ out, int pos0, int n, int n_heads, int n_kv, float scale) {
@@ -1997,9 +2019,11 @@ __device__ void attn_prefill_tc(const float* __restrict__ qkv, const kv_t* __res
         }
     }
 
-    float o[HD / 8][4]; // 16 rows x HD dims: per dim tile of 8, rows lo (c0, c1) and hi (c2, c3)
+    constexpr int DO = HD / SPLIT; // output dimensions of this block, from d0
+    const int d0 = blockIdx.z * DO;
+    float o[DO / 8][4]; // 16 rows x DO dims: per dim tile of 8, rows lo (c0, c1) and hi (c2, c3)
     #pragma unroll
-    for (int d = 0; d < HD / 8; d++) o[d][0] = o[d][1] = o[d][2] = o[d][3] = 0.f;
+    for (int d = 0; d < DO / 8; d++) o[d][0] = o[d][1] = o[d][2] = o[d][3] = 0.f;
     float m_lo = NEG_INF, m_hi = NEG_INF;
     float l[4] = {0.f, 0.f, 0.f, 0.f}; // row sums of the f16 probabilities: P x ones (c0 = row lo, c2 = row hi)
     int p_lo = pos0 + q0 + 16 * warp + (lane >> 2), p_hi = p_lo + 8; // positions of this thread's two rows
@@ -2119,10 +2143,10 @@ __device__ void attn_prefill_tc(const float* __restrict__ qkv, const kv_t* __res
         for (int j = 0; j < BK / 8; j++) MMA_F16(l, pf[j][0], pf[j][1], 0x3C003C00u); // f16 1.0 x2
         // O = O * alpha + P V: per dim tile one ldmatrix.x4.trans gives the B fragments of all 4 key steps
         #pragma unroll
-        for (int d = 0; d < HD / 8; d++) {
+        for (int d = 0; d < DO / 8; d++) {
             o[d][0] *= a_lo; o[d][1] *= a_lo; o[d][2] *= a_hi; o[d][3] *= a_hi;
             unsigned b[4];
-            LDSM_X4(b, vaddr + 16 * d, ".trans");
+            LDSM_X4(b, vaddr + 16 * (d0 / 8 + d), ".trans");
             #pragma unroll
             for (int j = 0; j < BK / 8; j++) MMA_F16(o[d], pv[j][0], pv[j][1], b[j]);
         }
@@ -2134,8 +2158,8 @@ __device__ void attn_prefill_tc(const float* __restrict__ qkv, const kv_t* __res
     float i_lo = 1.f / l[0], i_hi = 1.f / l[2];
 #endif
     #pragma unroll
-    for (int d = 0; d < HD / 8; d++) {
-        int col = h * HD + 8 * d + 2 * (lane & 3);
+    for (int d = 0; d < DO / 8; d++) {
+        int col = h * HD + d0 + 8 * d + 2 * (lane & 3);
         if (r_lo < n) *reinterpret_cast<float2*>(out + (size_t)r_lo * q_dim + col) = make_float2(o[d][0] * i_lo, o[d][1] * i_lo);
         if (r_hi < n) *reinterpret_cast<float2*>(out + (size_t)r_hi * q_dim + col) = make_float2(o[d][2] * i_hi, o[d][3] * i_hi);
     }
@@ -2148,6 +2172,8 @@ extern "C" {
                     float* __restrict__ out, int pos0, int n, int n_heads, int n_kv, int hd, float scale
 __global__ void __launch_bounds__(128) attention_prefill_tc64(ATT_TC_ARGS) { attn_prefill_tc<64>(qkv, kc, vc, ks, vs, out, pos0, n, n_heads, n_kv, scale); }
 __global__ void __launch_bounds__(128) attention_prefill_tc128(ATT_TC_ARGS) { attn_prefill_tc<128>(qkv, kc, vc, ks, vs, out, pos0, n, n_heads, n_kv, scale); }
+// head size 256: two blocks per head, each with half the output dimensions (all of Q, O for 256 do not fit in registers)
+__global__ void __launch_bounds__(128) attention_prefill_tc256(ATT_TC_ARGS) { attn_prefill_tc<256, 2>(qkv, kc, vc, ks, vs, out, pos0, n, n_heads, n_kv, scale); }
 
 // Flash-decoding attention, part 2: merge the slices of each (head, token) into the normalised output.
 #define COMBINE_MAX 2048 // slices whose weights fit in shared memory (more: computed where used)
@@ -3307,6 +3333,84 @@ __global__ void attention_wide(const float* __restrict__ qkv, const kv_t* __rest
     }
 }
 
+// attention_wide for WIDE_G query heads sharing a kv head at once: a block per (token, kv head, group of
+// WIDE_G heads), each warp loading a position's key and value slice once for all of them. Every head's
+// arithmetic is attention_wide's, step for step and in the same order, so the results are the same bits.
+#define WIDE_G 4
+__global__ void __launch_bounds__(256, 2) attention_wide_g(const float* __restrict__ qkv, const kv_t* __restrict__ kc, const kv_t* __restrict__ vc,
+                                 const float* __restrict__ ks, const float* __restrict__ vs, float* __restrict__ out,
+                                 int pos0, int n_heads, int n_kv, int hd, float scale) {
+    __shared__ float wm[WIDE_WARPS], wl[WIDE_WARPS], wo[WIDE_WARPS][256];
+    int b = blockIdx.x, kvh = blockIdx.y, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int G = n_heads / n_kv, h0 = kvh * G + blockIdx.z * WIDE_G;
+    int q_dim = n_heads * hd, kv_dim = n_kv * hd, per = hd >> 5;
+    float qr[WIDE_G][8], acc[WIDE_G][8], m[WIDE_G], l[WIDE_G];
+    #pragma unroll
+    for (int g = 0; g < WIDE_G; g++) {
+        const float* q = qkv + (size_t)b * (q_dim + 2 * kv_dim) + (h0 + g) * hd + lane * per;
+        #pragma unroll
+        for (int i = 0; i < 8; i++) { qr[g][i] = i < per ? __fmul_rn(q[i], scale) : 0.f; acc[g][i] = 0.f; }
+        m[g] = NEG_INF, l[g] = 0.f;
+    }
+    int span = pos0 + b + 1;
+    for (int t = warp; t < span; t += WIDE_WARPS) {
+        const kv_t* kt = kc + (size_t)t * kv_dim + kvh * hd + lane * per;
+        const kv_t* vt = vc + (size_t)t * kv_dim + kvh * hd + lane * per;
+        float4 k4[2], v4[2];
+        #pragma unroll
+        for (int j = 0; j < 2; j++) if (4 * j < per) { k4[j] = kv_load4(kt + 4 * j); v4[j] = kv_load4(vt + 4 * j); }
+        float kscale = KV_SCALE(ks, t, n_kv, kvh), vscale = KV_SCALE(vs, t, n_kv, kvh);
+        #pragma unroll
+        for (int g = 0; g < WIDE_G; g++) {
+            // attention_wide's expressions as NVRTC 12 contracts them (read from its SASS), spelled out so
+            // that this kernel cannot contract them differently
+            float s = 0.f;
+            #pragma unroll
+            for (int i = 0; i < 8; i += 4) {
+                if (i < per) {
+                    float4 k = k4[i >> 2];
+                    s = __fadd_rn(s, __fmaf_rn(qr[g][i + 3], k.w, __fmaf_rn(qr[g][i + 2], k.z, __fmaf_rn(qr[g][i], k.x, __fmul_rn(qr[g][i + 1], k.y)))));
+                }
+            }
+            for (int o = 16; o > 0; o >>= 1) s = __fadd_rn(s, __shfl_xor_sync(0xffffffff, s, o));
+            s = __fmul_rn(s, kscale);
+            float mn = fmaxf(m[g], s), c = __expf(__fsub_rn(m[g], mn)), p = __expf(__fsub_rn(s, mn));
+            l[g] = __fmaf_rn(l[g], c, p);
+            float pv = __fmul_rn(p, vscale);
+            #pragma unroll
+            for (int i = 0; i < 8; i += 4) {
+                if (i < per) {
+                    float4 v = v4[i >> 2];
+                    acc[g][i] = __fmaf_rn(acc[g][i], c, __fmul_rn(pv, v.x)); acc[g][i + 1] = __fmaf_rn(acc[g][i + 1], c, __fmul_rn(pv, v.y));
+                    acc[g][i + 2] = __fmaf_rn(pv, v.z, __fmul_rn(acc[g][i + 2], c)); acc[g][i + 3] = __fmaf_rn(pv, v.w, __fmul_rn(acc[g][i + 3], c));
+                }
+            }
+            m[g] = mn;
+        }
+    }
+    // merged a head at a time through one [warp][dim] buffer (small enough for two blocks an SM)
+    #pragma unroll
+    for (int g = 0; g < WIDE_G; g++) {
+        if (g > 0) __syncthreads(); // the last head's merge is done reading wo
+        if (lane == 0) { wm[warp] = m[g]; wl[warp] = l[g]; }
+        #pragma unroll
+        for (int i = 0; i < 8; i++) if (i < per) wo[warp][lane * per + i] = acc[g][i];
+        __syncthreads();
+        float mx = NEG_INF;
+        for (int w = 0; w < WIDE_WARPS; w++) mx = fmaxf(mx, wm[w]);
+        for (int d = threadIdx.x; d < hd; d += blockDim.x) {
+            float v = 0.f, tot = 0.f;
+            for (int w = 0; w < WIDE_WARPS; w++) {
+                if (wm[w] == NEG_INF) continue; // a warp that saw no position
+                float f = __expf(__fsub_rn(wm[w], mx));
+                v = __fmaf_rn(wo[w][d], f, v);
+                tot = __fmaf_rn(wl[w], f, tot);
+            }
+            out[(size_t)b * q_dim + (h0 + g) * hd + d] = __fdiv_rn(v, tot);
+        }
+    }
+}
+
 // x[i] *= sigmoid(g[i]) over n values: the attention output through its gates
 __global__ void sigmoid_mul(float* __restrict__ x, const float* __restrict__ g, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -4114,6 +4218,7 @@ struct Kernels {
     attention_combine: Ptr,
     attention_prefill: Ptr,
     attention_prefill_tc: Option<[Ptr; 2]>, // f16 tensor cores (sm_75+), head size 64 / 128
+    attention_prefill_tc256: Option<Ptr>,   // the same for head size 256 (prompt batches of attention_wide models)
     silu_mul: Ptr,
     silu_q8: Ptr,
     add_rows: Ptr,
@@ -4136,6 +4241,7 @@ struct Kernels {
     // Qwen3-Next
     next_split_qgate: Ptr,
     attention_wide: Ptr,
+    attention_wide_g: Ptr,
     sigmoid_mul: Ptr,
     delta_conv: Ptr,
     delta_prep: Ptr,
@@ -4318,6 +4424,7 @@ impl Kernels {
                 } else {
                     None
                 },
+                attention_prefill_tc256: if a.compute >= (7, 5) && std::env::var_os("GHOST_INFER_NO_TC_ATT").is_none() { Some(get("attention_prefill_tc256")?) } else { None },
                 silu_mul: get("silu_mul")?,
                 silu_q8: get("silu_q8")?,
                 add_rows: get("add_rows")?,
@@ -4338,6 +4445,7 @@ impl Kernels {
                 mla_combine: get("mla_combine")?,
                 next_split_qgate: get("next_split_qgate")?,
                 attention_wide: get("attention_wide")?,
+                attention_wide_g: get("attention_wide_g")?,
                 sigmoid_mul: get("sigmoid_mul")?,
                 delta_conv: get("delta_conv")?,
                 delta_prep: get("delta_prep")?,
@@ -7173,17 +7281,49 @@ impl GpuModel {
                     &[Arg::P(s.qkv.ptr), Arg::P(qn), Arg::P(kn), Arg::P(kc), Arg::P(vc), Arg::P(ks), Arg::P(vs), Arg::I(s.pos as i32), Arg::P(posp), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::I(hd as i32), Arg::I(c.rope_dim as i32), Arg::F(c.rope_base), Arg::P(self.rope_freqs.as_ref().map_or(0, |b| b.ptr)), Arg::I(c.rope_neox as i32), Arg::F(c.norm_eps)],
                 )
             })?;
-            if hd > ATT_MAX_HD {
+            // wide heads: prompt batches through attention_wide; one-token steps and verify batches (the same
+            // per token) through the split GQA kernel, which reads each kv row once for all its query heads
+            let split = self.gqa_kernel() && hd == 256 && (n < TILED_MIN_BATCH || s.exact.get()) && !old_wide_attention();
+            if hd > ATT_MAX_HD && !split {
                 let scale = 1.0 / (hd as f32).sqrt();
-                self.timed(4, || {
-                    k.launch(
-                        k.attention_wide,
-                        (n as u32, c.n_heads as u32),
-                        256,
-                        0,
-                        &[Arg::P(s.qkv.ptr), Arg::P(kc), Arg::P(vc), Arg::P(ks), Arg::P(vs), Arg::P(s.att.ptr), Arg::I(s.pos as i32), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::I(hd as i32), Arg::F(scale)],
-                    )
-                })?;
+                let g = c.n_heads / c.n_kv_heads;
+                // prompt batches: the tensor cores (f16 inputs, f32 sums: not attention_wide's bits); else groups
+                // of WIDE_G query heads sharing their kv head's reads (attention_wide's bits); else attention_wide
+                let tc = k.attention_prefill_tc256.filter(|_| hd == 256 && !old_wide_attention());
+                let mode = if tc.is_some() { 2 } else if g % WIDE_G == 0 && !old_wide_attention() { 1 } else { 0 };
+                let wide = |out: u64, mode: u8| {
+                    if let (2, Some(f)) = (mode, tc) {
+                        let args = [Arg::P(s.qkv.ptr), Arg::P(kc), Arg::P(vc), Arg::P(ks), Arg::P(vs), Arg::P(out), Arg::I(s.pos as i32), Arg::I(n as i32), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::I(hd as i32), Arg::F(scale)];
+                        return k.launch3(f, (c.n_heads as u32, n.div_ceil(PREFILL_TC_QT) as u32, 2), 128, 0, &args);
+                    }
+                    let args = [Arg::P(s.qkv.ptr), Arg::P(kc), Arg::P(vc), Arg::P(ks), Arg::P(vs), Arg::P(out), Arg::I(s.pos as i32), Arg::I(c.n_heads as i32), Arg::I(c.n_kv_heads as i32), Arg::I(hd as i32), Arg::F(scale)];
+                    if mode == 1 {
+                        k.launch3(k.attention_wide_g, (n as u32, c.n_kv_heads as u32, (g / WIDE_G) as u32), 256, 0, &args)
+                    } else {
+                        k.launch(k.attention_wide, (n as u32, c.n_heads as u32), 256, 0, &args)
+                    }
+                };
+                self.timed(4, || wide(s.att.ptr, mode))?;
+                if mode > 0 && check_wide_attention() {
+                    // GHOST_INFER_CHECK_WIDE=1: compare with attention_wide on the same inputs (bits, and the
+                    // largest difference relative to the largest value)
+                    let len = n * c.n_heads * hd;
+                    let other = DeviceBuf::alloc(len * 4)?;
+                    wide(other.ptr, 0)?;
+                    let (mut x, mut y) = (vec![0f32; len], vec![0f32; len]);
+                    k.d2h(&mut x, s.att.ptr)?;
+                    k.d2h(&mut y, other.ptr)?;
+                    let diff = x.iter().zip(&y).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+                    let worst = x.iter().zip(&y).fold(0f32, |w, (a, b)| w.max((a - b).abs()));
+                    let big = y.iter().fold(0f32, |w, b| w.max(b.abs()));
+                    static CALLS: AtomicUsize = AtomicUsize::new(0);
+                    static DIFFS: AtomicUsize = AtomicUsize::new(0);
+                    let calls = CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+                    let diffs = DIFFS.fetch_add(diff, Ordering::Relaxed) + diff;
+                    if (mode == 1 && diff > 0) || calls % 10 == 0 {
+                        eprintln!("[wide attention check: {calls} calls, {diffs} values differ (this call {diff} of {len}, largest difference {worst:e} of values up to {big:e}, {n} tokens at {})]", s.pos);
+                    }
+                }
             } else {
                 self.timed(4, || self.attention(s, n, (kc, vc, ks, vs), posp, fixed_split))?;
             }
@@ -7553,8 +7693,9 @@ impl GpuSession {
             max_batch(cfg) * widest,
             4 * max_batch(cfg) * widest / 32,
             4 * max_batch(cfg) * widest / 32,
-            // wide heads (attention_wide) keep no partial results
-            if cfg.head_dim > ATT_MAX_HD { 4 } else { 4 * slices * cfg.n_heads * (cfg.head_dim + 2) },
+            // wide heads: only one-token steps and verify batches split (prompt batches run attention_wide),
+            // so their partial results are sized for the slices a token actually uses
+            if cfg.head_dim > ATT_MAX_HD { 4 * SPLIT_MAX_BATCH * max_slices(cfg, ctx) * cfg.n_heads * (cfg.head_dim + 2) } else { 4 * slices * cfg.n_heads * (cfg.head_dim + 2) },
             4 * max_batch(cfg),
             4 * max_batch(cfg) * cfg.dim,
             4 * max_batch(cfg) * cfg.dim,
@@ -7671,6 +7812,29 @@ fn iq2_fmt(t: &[ExpertTensor; 3]) -> Option<i32> {
 /// Zeroes a device buffer (from the host: the driver API loaded here has no memset).
 fn zero(buf: &DeviceBuf) -> Result<(), String> {
     buf.write(&vec![0u8; buf.bytes])
+}
+
+/// GHOST_INFER_OLD_WIDE_ATT=1: one-token steps of 256-wide heads through attention_wide as before (for comparisons).
+fn old_wide_attention() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GHOST_INFER_OLD_WIDE_ATT").is_some())
+}
+
+/// GHOST_INFER_CHECK_WIDE=1: prompt batches of 256-wide heads also run attention_wide and compare its bits.
+fn check_wide_attention() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GHOST_INFER_CHECK_WIDE").is_some())
+}
+
+/// Query heads attention_wide_g takes per block (must match WIDE_G).
+const WIDE_G: usize = 4;
+
+/// Most slices a token of a ctx-position session splits its attention into (GpuModel::max_splits, from the
+/// config alone).
+fn max_slices(cfg: &Config, ctx: usize) -> usize {
+    let gqa = cfg.head_dim % 32 == 0 && cfg.n_heads % cfg.n_kv_heads == 0 && cfg.n_heads / cfg.n_kv_heads <= ATT_MAX_G;
+    let want = ATT_TARGET_BLOCKS.div_ceil(if gqa { cfg.n_kv_heads } else { cfg.n_heads });
+    (1..=ctx).map(|span| span.div_ceil(GpuModel::att_chunk(span, want))).max().unwrap_or(1)
 }
 
 /// A mixture of experts' session holds its positions in steps of this many: the memory of positions a
