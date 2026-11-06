@@ -2394,6 +2394,41 @@ impl ToolCalls {
         Some(name.map_or("", str::trim))
     }
 
+    /// While a call is being written: its "path" argument once that is whole (a file being written shows
+    /// its name), and how many bytes of the call have come so far.
+    fn writing_path(&self) -> Option<(Option<String>, usize)> {
+        if !self.in_call {
+            return None;
+        }
+        let b = self.buf.as_str();
+        let path = if let Some((_, r)) = b.split_once("<parameter=path>") {
+            r.split_once("</parameter>").map(|(p, _)| p.trim().to_string())
+        } else if let Some((_, r)) = b.split_once("<arg_key>path</arg_key>") {
+            r.split_once("</arg_value>").map(|(p, _)| p.trim().trim_start_matches("<arg_value>").trim().to_string())
+        } else if let Some((_, r)) = b.split_once("\"path\"") {
+            // JSON: the string up to its closing quote (one not escaped)
+            r.trim_start().strip_prefix(':').map(str::trim_start).and_then(|r| r.strip_prefix('"')).and_then(|r| {
+                let mut out = String::new();
+                let mut chars = r.chars();
+                while let Some(c) = chars.next() {
+                    match c {
+                        '"' => return Some(out),
+                        '\\' => out.push(match chars.next()? {
+                            'n' => '\n',
+                            't' => '\t',
+                            c => c,
+                        }),
+                        c => out.push(c),
+                    }
+                }
+                None
+            })
+        } else {
+            None
+        };
+        Some((path.filter(|p| !p.is_empty()), b.len()))
+    }
+
     /// What is left at the end of the reply.
     fn finish(&mut self) -> Vec<Part> {
         let rest = std::mem::take(&mut self.buf);
@@ -2768,6 +2803,21 @@ mod tests {
         assert_eq!(tc.writing(), Some("write_file"));
         tc.push("<arg_value>a.txt</arg_value></tool_call>");
         assert_eq!(tc.writing(), None);
+    }
+
+    #[test]
+    fn the_path_of_a_call_being_written() {
+        let path = |text: &str| {
+            let mut tc = ToolCalls::default();
+            tc.push(text);
+            tc.writing_path().and_then(|(p, _)| p)
+        };
+        assert_eq!(path("<tool_call>\n<function=write_file>\n<parameter=path>\nD:\\g\\index.html\n</parameter>\n<parameter=content>\n<html>"), Some("D:\\g\\index.html".into()));
+        assert_eq!(path("<tool_call>\n<function=write_file>\n<parameter=path>\nD:\\g\\ind"), None);
+        assert_eq!(path("<tool_call>write_file\n<arg_key>path</arg_key>\n<arg_value>a.txt</arg_value>\n<arg_key>content"), Some("a.txt".into()));
+        assert_eq!(path("<tool_call>\n{\"name\": \"write_file\", \"arguments\": {\"path\": \"D:\\\\g\\\\a \\\"b\\\".js\", \"content\": \"x"), Some("D:\\g\\a \"b\".js".into()));
+        assert_eq!(path("<tool_call>\n{\"name\": \"write_file\", \"arguments\": {\"path\": \"D:\\\\g"), None);
+        assert_eq!(path("no call here"), None);
     }
 
     #[test]

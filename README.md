@@ -12,6 +12,7 @@
 
 <p align="center">
   <a href="#install"><b>Install</b></a> ·
+  <a href="#whats-new">What's new</a> ·
   <a href="#speed">Speed</a> ·
   <a href="#models">Models</a> ·
   <a href="docs/desktop-app.md">Desktop app</a> ·
@@ -30,6 +31,22 @@
 
 Most inference engines are built for data centres: many users, big GPUs, batching. ghost-infer is built
 for the other case: **one person, one consumer GPU, one model at a time**, and it is tuned for exactly that.
+
+## What's new
+
+Since 0.2.3:
+
+- **Long chats stay fast on Qwen3.6-35B-A3B.** Its attention (256-wide heads) now runs on the tensor cores,
+  both when it writes and when it reads a prompt. On an RTX 2060 SUPER, generation at a 16K context went from
+  25.2 to 39.7 tokens/s and at 64K from 12.0 to 40.8; reading a 128K-token prompt takes about 4 minutes
+  instead of 27 (81 to 581 tokens/s). `GHOST_INFER_NO_TC_DECODE=1` and `GHOST_INFER_NO_TC_ATT=1` turn the new
+  kernels off.
+- **Attach files in the desktop app.** Text and code files go with a message: from the + menu, dropped on the
+  window, or pasted with Ctrl+V after copying them in Explorer.
+- **See a file being written.** While the model writes a file, the reply shows a live line with its name, how
+  much is written and for how long, instead of going quiet until the file is done.
+- **Smaller fixes in the app.** Each thinking block opens and closes on its own, and the token count and
+  speed show only while the model is writing (not while it waits for your OK).
 
 ## Install
 

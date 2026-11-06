@@ -16,9 +16,10 @@
 //!   {"type":"waiting","text"}                     the model is replying in another chat: this reply waits for it
 //!                                                 (one at a time, so neither reads its whole prompt again)
 //!   {"type":"text","text"}                        reply text as it streams (a thinking reply starts with <think>)
-//!   {"type":"calling","name"}                     a piece of a tool call being written, one per piece as "text"
+//!   {"type":"calling","name","bytes","path"?}     a piece of a tool call being written, one per piece as "text"
 //!                                                 is (the call itself comes whole, as "tool_call"); "name" its
-//!                                                 tool, "" until that can be read
+//!                                                 tool, "" until that can be read; "bytes" written so far;
+//!                                                 "path" its path argument once that is whole
 //!   {"type":"tool_call","id","name","arguments"}  the model called a tool
 //!   {"type":"approval","id","name","arguments","group"}  waiting for POST /api/agent/approve {"id","decision"}
 //!   {"type":"tool_result","id","name","result","denied","secs"?}  ("secs": how long it ran)
@@ -1896,7 +1897,14 @@ fn rounds(out: &mut Out, req: &Request, chat: &mut Chat, checkpoint: &str, work:
                     take(if tools.is_empty() { vec![Part::Text(t)] } else { split.push(&t) }, out, &mut text, &mut calls)?;
                     // a call shows nothing until it is whole (a file can take minutes): a sign of each piece
                     if let Some(name) = split.writing() {
-                        emit(out, obj(vec![("type", str("calling")), ("name", str(name))]))?;
+                        let mut ev = vec![("type", str("calling")), ("name", str(name))];
+                        if let Some((path, bytes)) = split.writing_path() {
+                            ev.push(("bytes", num(bytes as f64)));
+                            if let Some(p) = path {
+                                ev.push(("path", str(&p)));
+                            }
+                        }
+                        emit(out, obj(ev))?;
                     }
                 }
                 Event::Done { finish: f, prompt_tokens, completion_tokens } => {

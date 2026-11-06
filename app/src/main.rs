@@ -4,6 +4,7 @@
 #![windows_subsystem = "windows"]
 
 mod api;
+mod attach;
 mod call;
 mod ghost;
 #[path = "../../src/json.rs"]
@@ -220,6 +221,18 @@ pub struct Round {
     pub think: String,
     pub answer: String,
     pub md: markdown::Content, // the answer parsed
+    pub think_open: bool,      // its thinking shown (each round opens on its own)
+}
+
+/// A tool call the model is writing (its text streams for minutes when it is a whole file): what the reply
+/// shows of it until it comes whole as a tool line.
+#[derive(Debug)]
+pub struct Writing {
+    pub name: String,         // its tool, "" until that can be read
+    pub path: Option<String>, // its path argument, once whole (older servers do not send it)
+    pub pieces: usize,        // the pieces come one per token
+    pub bytes: usize,
+    pub since: Instant,
 }
 
 /// One message as drawn: a user's text, or a whole reply (its rounds and their tool calls).
@@ -229,8 +242,8 @@ struct Msg {
     raw: String,       // a user message's text
     rounds: Vec<Round>,
     new_round: bool,   // a tool ran since the last text: the next text starts a round
-    think_open: bool,  // the thinking shown (every round's at once)
     tools: Vec<ToolLine>,
+    pub writing: Option<Writing>, // a tool call being written right now (shown until it comes whole)
     stats: String,
     checkpoint: Option<String>, // where the reply's file changes are kept, for undo
     changed: bool,              // it changed files
@@ -246,8 +259,8 @@ impl Msg {
             raw: text.to_string(),
             rounds: Vec::new(),
             new_round: true,
-            think_open: false,
             tools: Vec::new(),
+            writing: None,
             stats: String::new(),
             checkpoint: None,
             changed: false,
@@ -265,7 +278,7 @@ impl Msg {
     /// (it only ever grows at its end, so the Markdown is fed just the new part).
     fn push(&mut self, more: &str) {
         if self.new_round || self.rounds.is_empty() {
-            self.rounds.push(Round { raw: String::new(), think: String::new(), answer: String::new(), md: markdown::Content::new() });
+            self.rounds.push(Round { raw: String::new(), think: String::new(), answer: String::new(), md: markdown::Content::new(), think_open: false });
             self.new_round = false;
         }
         let r = self.rounds.last_mut().unwrap();
@@ -455,7 +468,7 @@ fn clip(s: &str, lines: usize, chars: usize) -> String {
 }
 
 /// A label value kept short: a long path by its last two parts, other long text cut.
-fn short(v: &str) -> String {
+pub fn short(v: &str) -> String {
     let v = v.trim();
     if v.chars().count() <= 60 {
         return v.to_string();
@@ -706,6 +719,7 @@ struct App {
     preview_url: Option<String>, // the web page the agent last wrote, for the preview pane
     preview_open: bool,      // the pane is shown
     chip: Option<String>,    // a command or skill picked with /: a chip before the text, sent as /name
+    attached: Vec<attach::Attachment>, // files attached to the message being written
     slash_pick: usize,       // the / list's highlighted line
     slash_shut: Option<String>, // the text the / list was closed at (Esc): shut until the text changes
     composer_at: Option<iced::Rectangle>, // the message box on screen, for the / list above it
@@ -790,11 +804,15 @@ enum Message {
     SlashPick(Option<String>), // a line of the / list (None: the highlighted one)
     SlashClose,                // Esc: the / list shuts until the text changes
     ChipRemove,                // Backspace before any text
+    AttachFiles,               // the + menu's Attach files: the file picker
+    FilesChosen(Vec<std::path::PathBuf>), // picked, dropped or pasted: read and attached
+    Unattach(usize),           // a file chip's x
+    PasteKey,                  // Ctrl+V in the box: files copied in Explorer are attached, text pasted
     ComposerAt(Option<iced::Rectangle>),
     Send,
     Stop,
     Agent(Json),
-    ToggleThinkView(usize),
+    ToggleThinkView(usize, usize), // a reply's round's thinking opened or closed
     ToggleThinking,
     ShowEarlier,
     Link(String),
@@ -985,6 +1003,7 @@ impl App {
             instructions: Vec::new(),
             skills: Vec::new(),
             chip: None,
+            attached: Vec::new(),
             slash_pick: 0,
             slash_shut: None,
             composer_at: None,
@@ -1224,6 +1243,39 @@ impl App {
                 let task = if edits { self.after_edit() } else { Task::none() };
                 return self.keep_focus(shape, task);
             }
+            Message::AttachFiles => {
+                self.menu = None;
+                return Task::perform(blocking(|| rfd::FileDialog::new().set_title("Attach text or code files").pick_files().unwrap_or_default()), Message::FilesChosen);
+            }
+            Message::FilesChosen(paths) => {
+                let mut refused = Vec::new();
+                for p in paths {
+                    match attach::read(&p) {
+                        Ok(a) => {
+                            // the same file again replaces the one attached
+                            self.attached.retain(|b| b.name != a.name);
+                            self.attached.push(a);
+                        }
+                        Err(e) => refused.push(e),
+                    }
+                }
+                if !refused.is_empty() {
+                    self.status = refused.join("; ");
+                }
+                return iced::widget::operation::focus("editor");
+            }
+            Message::Unattach(k) => {
+                if k < self.attached.len() {
+                    self.attached.remove(k);
+                }
+            }
+            Message::PasteKey => {
+                let files = attach::clipboard_files();
+                if !files.is_empty() {
+                    return Task::done(Message::FilesChosen(files));
+                }
+                return iced::clipboard::read().map(|t| Message::Edit(text_editor::Action::Edit(text_editor::Edit::Paste(std::sync::Arc::new(t.unwrap_or_default())))));
+            }
             Message::SlashMove(d) => {
                 let n = self.slash_list().len().max(1) as i32;
                 self.slash_pick = (self.slash_pick as i32 + d).rem_euclid(n) as usize;
@@ -1267,9 +1319,9 @@ impl App {
                 self.finish("stopped");
             }
             Message::Agent(ev) => return self.on_event(ev),
-            Message::ToggleThinkView(i) => {
-                if let Some(m) = self.messages.get_mut(i) {
-                    m.think_open = !m.think_open;
+            Message::ToggleThinkView(i, k) => {
+                if let Some(r) = self.messages.get_mut(i).and_then(|m| m.rounds.get_mut(k)) {
+                    r.think_open = !r.think_open;
                 }
             }
             Message::ToggleThinking => self.thinking = !self.thinking,
@@ -2404,7 +2456,12 @@ impl App {
         } else {
             iced::Subscription::none()
         };
-        iced::Subscription::batch([tick, resized, keys, clicks, tray, close, orb])
+        // files dropped on the window: attached to the message
+        let drops = iced::event::listen_with(|e, _, _| match e {
+            iced::Event::Window(iced::window::Event::FileDropped(path)) => Some(Message::FilesChosen(vec![path])),
+            _ => None,
+        });
+        iced::Subscription::batch([tick, resized, keys, clicks, tray, close, orb, drops])
     }
 
     /// Shows a web page in the preview pane, making the pane's view the first time (on the window's thread).
@@ -2635,9 +2692,12 @@ impl App {
                     Some(c) => format!("/{c} {text}").trim_end().to_string(),
                     None => text,
                 };
+                // attached files go inside the message, after the words (the bubble shows them as chips)
+                let text = attach::join(&text, &self.attached);
                 if text.is_empty() {
                     return Task::none();
                 }
+                self.attached.clear();
                 self.composer = text_editor::Content::new();
                 self.messages.push(Msg::user(&text));
                 body.push(("message", str(&text)));
@@ -2701,7 +2761,18 @@ impl App {
                 self.chunks += 1;
                 self.writing_since.get_or_insert_with(Instant::now);
                 self.last_chunk_at = Some(self.born.elapsed().as_millis() as u64);
-                self.status = match s("name").as_str() {
+                let name = s("name");
+                // shown in the reply as it grows (a subagent's own writing stays out of it)
+                if let Some(m) = self.messages.last_mut().filter(|_| name != "subagent") {
+                    let w = m.writing.get_or_insert_with(|| Writing { name: String::new(), path: None, pieces: 0, bytes: 0, since: Instant::now() });
+                    w.pieces += 1;
+                    w.name = name.clone();
+                    w.bytes = ev.get("bytes").and_then(Json::as_f64).map_or(w.bytes, |b| b as usize);
+                    if let Some(p) = ev.get("path").and_then(Json::as_str) {
+                        w.path = Some(p.to_string());
+                    }
+                }
+                self.status = match name.as_str() {
                     "write_file" | "edit_file" => "Writing a file".into(),
                     // a subagent writing (its own text stays out of the reply)
                     "subagent" => "A subagent is working".into(),
@@ -2710,6 +2781,7 @@ impl App {
             }
             "tool_call" => {
                 if let Some(m) = self.messages.last_mut() {
+                    m.writing = None;
                     m.add_tool(ToolLine::new(&s("id"), &s("name"), &s("arguments")));
                 }
                 self.status = "Using a tool".into();
@@ -2785,6 +2857,9 @@ impl App {
                 let f = |k: &str| ev.get(k).and_then(Json::as_f64).unwrap_or(0.0);
                 self.context = (f("prompt_tokens") + f("completion_tokens"), f("context_length"));
                 self.parts = ev.get("parts").cloned().unwrap_or(Json::Null);
+                if let Some(m) = self.messages.last_mut() {
+                    m.writing = None;
+                }
                 self.end_round(f("completion_tokens"));
             }
             "done" => {
@@ -2835,6 +2910,7 @@ impl App {
                 "stopped" => ", stopped",
                 _ => "",
             });
+            m.writing = None;
             // a card left open when the reply stopped has nothing to answer any more
             for t in &mut m.tools {
                 t.ask = None;

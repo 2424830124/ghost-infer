@@ -146,6 +146,7 @@ mod ic {
     pub const INFO: char = '\u{E946}';
     pub const COLOR: char = '\u{E790}';
     pub const KEYBOARD: char = '\u{E765}';
+    pub const ATTACH: char = '\u{E723}';
 }
 
 fn icon<'a>(c: char, size: impl Into<Pixels>) -> text::Text<'a> {
@@ -302,7 +303,7 @@ impl App {
             // adding things; the tools themselves are always there, and the mode decides what needs an OK
             Menu::Plus => (
                 None,
-                vec![item(ic::FOLDER, "Add folder…", Message::AddFolder), item(ic::SKILL, "Install skill…", Message::InstallSkill(false)), item(ic::DOWNLOAD, "Install skill from a link…", Message::OpenSkillLink)],
+                vec![item(ic::ATTACH, "Attach files…", Message::AttachFiles), item(ic::FOLDER, "Add folder…", Message::AddFolder), item(ic::SKILL, "Install skill…", Message::InstallSkill(false)), item(ic::DOWNLOAD, "Install skill from a link…", Message::OpenSkillLink)],
                 above(false),
                 232.0,
                 false,
@@ -421,6 +422,19 @@ impl App {
     }
 
     /// The command or skill picked with /, before the text: its icon and name, as Claude shows one.
+    /// An attached file: its name and size; `remove` gives it an x (in the message box, before it is sent).
+    fn file_chip(&self, name: String, size: String, remove: Option<Message>) -> Element<'static, Message> {
+        let s = self.skin();
+        let mut label = row![icon(ic::FILE, 12).color(s.accent), text(name).size(13).font(MEDIUM).color(s.text), text(size).size(12).color(s.faint)].spacing(7).align_y(Alignment::Center);
+        if let Some(m) = remove {
+            label = label.push(button(icon(ic::CLOSE, 8).color(s.muted)).on_press(m).padding([2, 3]).style(move |_, st| bare(s, st)));
+        }
+        container(label)
+            .padding([4, 9])
+            .style(move |_| container::Style { background: Some(Background::Color(s.hover)), border: Border { radius: 8.0.into(), width: 1.0, color: s.line2 }, ..Default::default() })
+            .into()
+    }
+
     fn chip(&self, name: &str) -> Element<'static, Message> {
         let s = self.skin();
         let label = row![self.slash_icon(name, 12.0, s.accent), text(crate::slash_label(name)).size(14).font(MEDIUM).color(s.accent)].spacing(6).align_y(Alignment::Center);
@@ -1588,6 +1602,10 @@ impl App {
                 if chip_back && matches!(kp.key, keyboard::Key::Named(Named::Backspace)) {
                     return custom(Message::ChipRemove);
                 }
+                // Ctrl+V: files copied in Explorer are attached; text is pasted as before
+                if kp.modifiers.command() && !kp.modifiers.shift() && !kp.modifiers.alt() && kp.key.as_ref() == keyboard::Key::Character("v") {
+                    return custom(Message::PasteKey);
+                }
                 // Enter sends; Shift+Enter starts a new line
                 if matches!(kp.key, keyboard::Key::Named(keyboard::key::Named::Enter)) && !kp.modifiers.shift() {
                     return Some(text_editor::Binding::Custom(Message::Send));
@@ -1615,8 +1633,15 @@ impl App {
             button(container(icon(ic::UP, 13).color(s.ink)).center(32)).on_press(Message::Send).padding(0).style(move |_, st| send_style(s, st))
         };
         let chip = self.chip.as_deref().map(|c| self.chip(c));
-        let (inside, pad, radius): (Element<'_, Message>, Padding, f32) = if grown {
+        // files attached to the message: chips above the text, each with an x
+        let files = (!self.attached.is_empty()).then(|| {
+            row(self.attached.iter().enumerate().map(|(k, a)| self.file_chip(a.name.clone(), a.size(), Some(Message::Unattach(k))))).spacing(6).wrap()
+        });
+        let (inside, pad, radius): (Element<'_, Message>, Padding, f32) = if grown || files.is_some() {
             let mut col = column![].spacing(4);
+            if let Some(files) = files {
+                col = col.push(container(files).padding(Padding { bottom: 4.0, ..Padding::ZERO }));
+            }
             if let Some(chip) = chip {
                 col = col.push(row![chip]);
             }
@@ -1775,6 +1800,11 @@ impl App {
         let (Some(started), true) = (self.started, self.busy.is_some()) else { return self.status.clone() };
         let secs = started.elapsed().as_secs();
         let mut line = format!("{} · {}", self.status, if secs < 60 { format!("{secs}s") } else { format!("{}m {:02}s", secs / 60, secs % 60) });
+        // the count and speed only while the model is writing: not while it waits for an OK, reads the
+        // prompt or a tool runs (a round's writing ends with its "context" event)
+        if self.writing_since.is_none() {
+            return line;
+        }
         let tokens = self.reply_tokens + self.chunks as f64;
         if tokens > 0.0 {
             line.push_str(&format!(" · {} tokens", thousands(tokens)));
@@ -1819,11 +1849,19 @@ impl App {
                 words.push(iced::widget::span(&t[at..]).color(s.text));
                 rich_text(words).size(15).line_height(1.5).into()
             };
-            let picked = m.raw.strip_prefix('/').map(|t| t.split_once(char::is_whitespace).unwrap_or((t, ""))).filter(|(name, _)| self.slash_all().iter().any(|e| e.name == *name));
+            // files attached to it: chips under the words (the model got them whole, inside the message)
+            let (raw, files) = crate::attach::split(m.raw.as_str());
+            let picked = raw.strip_prefix('/').map(|t| t.split_once(char::is_whitespace).unwrap_or((t, ""))).filter(|(name, _)| self.slash_all().iter().any(|e| e.name == *name));
             let content: Element<'a, Message> = match picked {
                 Some((name, rest)) if rest.trim().is_empty() => self.chip(name),
                 Some((name, rest)) => column![row![self.chip(name)], said(rest.trim_start())].spacing(6).into(),
-                None => said(m.raw.as_str()).into(),
+                None => said(raw).into(),
+            };
+            let content: Element<'a, Message> = if files.is_empty() {
+                content
+            } else {
+                let chips = row(files.into_iter().map(|(name, lines)| self.file_chip(name, format!("{lines} line{}", if lines == 1 { "" } else { "s" }), None))).spacing(6).wrap();
+                if raw.is_empty() { chips.into() } else { column![content, chips].spacing(8).into() }
             };
             let bubble = container(content).padding([10, 16]).max_width(560).style(move |_| container::Style {
                 background: Some(Background::Color(s.bubble)),
@@ -1853,16 +1891,16 @@ impl App {
         for (k, r) in m.rounds.iter().enumerate() {
             if !r.think.is_empty() {
                 flush(&mut group, &mut parts);
-                let thinking = live && k == last && r.answer.is_empty() && !m.tools.iter().any(|t| t.round == k);
-                let chevron = if m.think_open { ic::DOWN } else { ic::RIGHT };
+                let thinking = live && k == last && r.answer.is_empty() && m.writing.is_none() && !m.tools.iter().any(|t| t.round == k);
+                let chevron = if r.think_open { ic::DOWN } else { ic::RIGHT };
                 parts.push(
                     button(row![text(if thinking { "Thinking…" } else { "Thought" }).size(13.5).color(s.muted), icon(chevron, 9).color(s.faint)].spacing(7).align_y(Alignment::Center))
-                        .on_press(Message::ToggleThinkView(i))
+                        .on_press(Message::ToggleThinkView(i, k))
                         .padding([2, 0])
                         .style(move |_, _| button::Style { background: None, ..Default::default() })
                         .into(),
                 );
-                if m.think_open {
+                if r.think_open {
                     parts.push(container(text(r.think.as_str()).size(13.5).color(s.muted).line_height(1.55)).padding(Padding { left: 14.0, ..Padding::ZERO }).into());
                 }
             }
@@ -1874,6 +1912,10 @@ impl App {
             group.extend(m.tools.iter().enumerate().filter(|(_, t)| t.round == k && t.name != "update_tasks").map(|(j, _)| j));
         }
         flush(&mut group, &mut parts);
+        // a tool call still being written: a line that grows with it, until it comes whole as a tool line
+        if let Some(w) = m.writing.as_ref().filter(|_| live) {
+            parts.push(self.writing_line(w));
+        }
         if !m.plan.is_empty() {
             parts.push(self.finished_plan(&m.plan));
         }
@@ -1894,6 +1936,35 @@ impl App {
             parts.push(foot.into());
         }
         column(parts).spacing(12).into()
+    }
+
+    /// The line for a tool call being written: what it is (the file, once its path can be read), how much has
+    /// come so far, and for how long.
+    fn writing_line<'a>(&'a self, w: &'a crate::Writing) -> Element<'a, Message> {
+        let s = self.skin();
+        let file = w.path.as_deref().map(crate::short);
+        let what = match (w.name.as_str(), file) {
+            ("write_file", Some(f)) => format!("Writing {f}…"),
+            ("edit_file", Some(f)) => format!("Editing {f}…"),
+            ("write_file" | "edit_file", None) => "Writing a file…".to_string(),
+            ("", _) => "Writing a tool call…".to_string(),
+            (n, _) => format!("Writing a call to {n}…"),
+        };
+        let secs = w.since.elapsed().as_secs();
+        let size = if w.bytes > 0 { format!("{:.1} KB", w.bytes as f64 / 1024.0) } else { format!("{} tokens", w.pieces) };
+        let head = row![
+            icon(tool_icon(&w.name), 12).color(s.accent),
+            container(text(what).size(13).color(s.text).wrapping(text::Wrapping::None)).width(Fill).clip(true),
+            text(format!("{size} · {secs} s")).size(12).color(s.faint),
+            icon(ic::CLOCK, 11).color(s.warn),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center);
+        container(container(head).padding([5, 8]))
+            .width(Fill)
+            .padding([4, 4])
+            .style(move |_| container::Style { background: Some(Background::Color(s.hover)), border: border::rounded(12), ..Default::default() })
+            .into()
     }
 
     /// The task list a reply finished, inside the reply: its steps, each checked.
