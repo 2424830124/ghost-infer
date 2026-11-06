@@ -34,6 +34,12 @@ for the other case: **one person, one consumer GPU, one model at a time**, and i
 
 ## What's new
 
+New in 0.2.5:
+
+- **The desktop app in Chinese.** Settings, General, Language: English, 中文, or System to follow Windows. It
+  switches at once, no restart. The model still answers in whatever language you write in. Thanks to
+  [huai_xin](https://github.com/2424830124) for the translation.
+
 New in 0.2.4:
 
 - **Long chats stay fast on Qwen3.6-35B-A3B.** Its attention (256-wide heads) now runs on the tensor cores,

@@ -1,6 +1,6 @@
 [package]
 name = "ghost-infer"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 description = "Fast local LLM inference for consumer GPUs: GGUF models, an OpenAI-compatible server and a chat page"
 license = "MIT OR Apache-2.0"

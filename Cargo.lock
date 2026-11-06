@@ -1187,7 +1187,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-app"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "cpal",
  "iced",
@@ -1198,7 +1198,7 @@ dependencies = [
 
 [[package]]
 name = "ghost-infer"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "memmap2",
  "rayon",
