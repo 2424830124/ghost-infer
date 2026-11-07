@@ -641,11 +641,29 @@ fn run(engine: &mut Engine, model: &str, job: Job) {
         let _ = job.events.send(Event::Error(400, format!("the prompt has {} tokens; the context holds {ctx}", ids.len())));
         return;
     }
-    // reuse the cache for the part of the prompt it already holds (at least one token is read anew,
-    // which gives the logits for the first reply token)
-    let keep = engine.hist.iter().zip(&ids).take_while(|(a, b)| a == b).count().min(ids.len() - 1);
+    // Give the caches to the conversation this request continues, then keep the part of the prompt they
+    // already hold (at least one token is read anew, which gives the logits for the first reply token).
+    // The card holds one context at a time and a client keeps coming back to the same conversation, so the
+    // conversation holding the caches now is copied out to host memory whenever a different one asks for
+    // them, and copied back in when its own client returns.
+    let keep = engine.adopt(&ids).min(ids.len() - 1);
     let keep = engine.truncate(keep);
     let reused = keep;
+    // Every conversation in a session opens with the same head: everything up to the end of the system
+    // block. That head is what a subagent shares with the conversation that spawned it and nothing else, and
+    // with a tool list it can be tens of thousands of tokens, so it is worth reading once per session rather
+    // than once per conversation. A note is left at its end and held apart from the ring, which would have
+    // dropped it first for being the oldest; the head is read from there and only what follows it is read
+    // again. If the prompt does not start with a system block, or the head does not line up with what the
+    // caches hold, the plain prefix is kept instead.
+    let keep = match job.prompt.find("<|im_end|>") {
+        Some(at) => {
+            let head = engine.tok.encode(&job.prompt[..at + "<|im_end|>\n".len()]);
+            let h = head.len();
+            if h > keep && h < ids.len() && ids[..h] == head[..] && engine.read_head(&ids[keep..h]).is_ok() { h } else { keep }
+        }
+        None => keep,
+    };
     // a recurrent (DeltaNet) model goes back only to a snapshot, and one is taken where a read ends: so the
     // prompt is read in two, up to the reply's own header and then the header. The next prompt may write this
     // turn's header differently (without its empty thinking once a message follows it, as the compaction's

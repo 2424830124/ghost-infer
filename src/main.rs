@@ -497,6 +497,14 @@ struct Engine<'a> {
     /// and greedy requests (their rounds cost and keep differently)
     lookup: lookup::Lookup,
     pace: [lookup::Pace; 2],
+    /// Conversations the GPU is not holding: their tokens and everything they left in the caches, kept in
+    /// host memory. The card holds one context at a time, but a client comes back to the same conversation
+    /// every turn, and an agent's subagents cut in between those turns — so without this, each of them pays
+    /// to read its history again every time it gets the caches back.
+    parked: Vec<cuda::Parked>,
+    /// Counts parks, so that `used` orders them by age. A counter rather than a clock: only the order
+    /// matters, and it must not be disturbed by anything outside this process.
+    clock: u64,
 }
 
 #[derive(Default)]
@@ -587,7 +595,131 @@ fn load_with_draft<'a>(g: &'a Gguf, gpu: bool, ctx: usize, draft: Option<&PathBu
             }
         }
     }
-    Ok(Engine { backend, tok: Arc::new(tok), stop, draft, hist: Vec::new(), lookup: Default::default(), pace: Default::default() })
+    Ok(Engine {
+        backend,
+        tok: Arc::new(tok),
+        stop,
+        draft,
+        hist: Vec::new(),
+        lookup: Default::default(),
+        pace: Default::default(),
+        parked: Vec::new(),
+        clock: 0,
+    })
+}
+
+impl Engine<'_> {
+    /// How much host memory parked conversations may hold: `GHOST_INFER_PARK_MB`, 2048 by default. This
+    /// costs nothing on the card: a conversation the GPU is not holding is doing nothing at all, and what it
+    /// left behind comes back in a few milliseconds when a request that continues it arrives.
+    fn park_budget() -> usize {
+        static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *BUDGET.get_or_init(|| {
+            std::env::var("GHOST_INFER_PARK_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(2048) << 20
+        })
+    }
+
+    /// At most this many conversations are kept in host memory: a hard ceiling, reached before the budget
+    /// above at very short contexts, so that a client opening many small chats cannot grow the list without
+    /// bound through rounding.
+    const PARKED_MAX: usize = 5;
+    /// A conversation shorter than this is not worth parking: reading it again costs about what the copy
+    /// does, and a park would hold a slot a longer conversation could use.
+    const PARK_MIN: usize = 512;
+
+    /// Gives the caches to whichever conversation `ids` continues, and says how much of `ids` they hold.
+    ///
+    /// There is nothing to guess here: a request carries its whole prompt, so comparing it token by token
+    /// against the live history and against each parked conversation settles it. The conversation a request
+    /// continues matches it for thousands of tokens; the others match for the few tokens their prompts happen
+    /// to share, or none. The longest match wins. When that beats what is live, the parked conversation goes
+    /// back in and whatever holds the caches is parked first — the card holds one context at a time, and the
+    /// one being pushed out is the one whose own client will ask for it again. A request that continues
+    /// neither is starting a new conversation: the live one is parked so that it is there when its client
+    /// comes back, and this one reads from the start.
+    fn adopt(&mut self, ids: &[u32]) -> usize {
+        let held = |tokens: &[u32]| tokens.iter().zip(ids).take_while(|(a, b)| a == b).count();
+        let live = held(&self.hist);
+        let back = self
+            .parked
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (i, held(&p.tokens)))
+            .filter(|&(_, kept)| kept > live && kept >= Self::PARK_MIN)
+            .max_by_key(|&(_, kept)| kept);
+        if let Some((i, kept)) = back {
+            let p = self.parked.remove(i);
+            self.park_now();
+            return self.put_back(p).unwrap_or_else(|| kept.min(ids.len().saturating_sub(1)));
+        }
+        // a request that follows neither is another conversation: keep this one for when it comes back
+        if live + Self::PARK_MIN <= self.hist.len() {
+            self.park_now();
+        }
+        live.min(ids.len().saturating_sub(1))
+    }
+
+    /// Copies what the caches hold into host memory, so that a request which continues this conversation
+    /// later has nothing to read: it finds the attention caches as they were and the recurrent state's
+    /// notes, and starts from its own last token. Nothing of it stays on the card — the caches go to
+    /// whichever conversation asks for them next.
+    fn park_now(&mut self) {
+        if self.hist.is_empty() || !matches!(self.backend, Backend::Gpu(..)) {
+            return;
+        }
+        let tokens = self.hist.clone();
+        let Backend::Gpu(_, s) = &mut self.backend else { return };
+        match s.park(tokens) {
+            Ok(mut p) => {
+                self.clock += 1;
+                p.used = self.clock;
+                let (n, mb) = (p.tokens.len(), p.bytes() >> 20);
+                self.parked.push(p);
+                self.sweep_parked();
+                eprintln!("[parked {n} tokens ({mb} MiB), {} in host memory]", self.parked.len());
+            }
+            Err(e) => eprintln!("[could not park this context: {e}]"),
+        }
+    }
+
+    /// Puts a parked conversation back into the caches and returns the position they now hold of it, or
+    /// None when it could not go back — then the prompt is read again, as it would have been without any of
+    /// this. The caches are grown first if this conversation reached further than they now do, which takes
+    /// the memory from the expert cache the way a long prompt does.
+    fn put_back(&mut self, p: cuda::Parked) -> Option<usize> {
+        let Backend::Gpu(m, s) = &mut self.backend else { return None };
+        if let Err(e) = m.reserve(s, p.pos).and_then(|()| s.restore(&p)) {
+            eprintln!("[could not put back a parked context: {e}; the prompt is read again]");
+            let _ = s.reset();
+            self.hist.clear();
+            return None;
+        }
+        let (n, mb, pos) = (p.tokens.len(), p.bytes() >> 20, p.pos);
+        self.hist = p.tokens;
+        eprintln!("[put back {n} tokens ({mb} MiB) into the caches]");
+        Some(pos)
+    }
+
+    /// Drops parked conversations until they fit the budget again, least recently used first.
+    ///
+    /// Age alone is the right thing to go on, because a conversation that is still in play keeps coming
+    /// back: a client sends it again every turn, and each time it is put back its `used` is refreshed, so
+    /// the main conversation and the subagents taking turns with it never grow old. What does grow old is a
+    /// conversation nobody sends any more — one the client has moved on from, or trimmed away — and that is
+    /// exactly the one worth dropping. The copy is not thrown away for being unused, but for being the least
+    /// likely to be asked for again.
+    fn sweep_parked(&mut self) {
+        let budget = Self::park_budget();
+        let held = |parked: &Vec<cuda::Parked>| parked.iter().map(|p| p.bytes()).sum::<usize>();
+        while self.parked.len() > Self::PARKED_MAX || (held(&self.parked) > budget && self.parked.len() > 1) {
+            let (i, _) = self.parked.iter().enumerate().min_by_key(|(_, p)| p.used).expect("not empty");
+            let p = self.parked.remove(i);
+            eprintln!("[dropped a parked context of {} tokens ({} MiB)]", p.tokens.len(), p.bytes() >> 20);
+        }
+        if held(&self.parked) > budget {
+            eprintln!("[{} MiB parked, over the {} MiB budget: raise GHOST_INFER_PARK_MB]", held(&self.parked) >> 20, budget >> 20);
+        }
+    }
 }
 
 impl Engine<'_> {
@@ -622,7 +754,10 @@ impl Engine<'_> {
         let base = self.backend.pos();
         self.hist.truncate(base);
         self.backend.prefill(prompt)?;
-        self.backend.snapshot();
+        // No note is left here, at the end of the prompt. The position a request comes back to is where a
+        // *reply* ended — a retry, a rewind, a fork, a subagent cutting in — never where a prompt ended:
+        // after a prompt come the reply head and then the reply itself, so a note at this point would be
+        // reached by nothing. The notes taken at the end of each reply, below, are the ones that get used.
         if let Some(d) = self.draft.as_mut().filter(|_| sampler.is_greedy()) {
             // the draft skips sampled replies; it catches up on whatever it missed, then reads the prompt
             d.sess.pos = d.sess.pos.min(base);
@@ -644,6 +779,8 @@ impl Engine<'_> {
                 emit(id)
             })?;
             self.hist.extend_from_slice(&ids);
+            // a recurrent (DeltaNet) model can only go back to a snapshot: leave one where this reply ends
+            self.backend.snapshot();
             return Ok(Stats { prompt_tokens: prompt.len(), prompt_secs, gen_tokens: generated, gen_secs: t1.elapsed().as_secs_f64(), stopped_on, ..Default::default() });
         }
         // not for a mixture of experts (a batch runs even the GPU-held experts on the CPU: other arithmetic than
@@ -657,6 +794,7 @@ impl Engine<'_> {
                 emit(id)
             })?;
             self.hist.extend_from_slice(&ids);
+            self.backend.snapshot();
             return Ok(Stats {
                 prompt_tokens: prompt.len(),
                 prompt_secs,
@@ -686,6 +824,7 @@ impl Engine<'_> {
             }
         }
         self.hist.extend_from_slice(&ids);
+        self.backend.snapshot();
         Ok(Stats { prompt_tokens: prompt.len(), prompt_secs, gen_tokens: generated, gen_secs: t1.elapsed().as_secs_f64(), stopped_on, ..Default::default() })
     }
 
@@ -702,6 +841,23 @@ impl Engine<'_> {
         self.backend.prefill(ids)?;
         self.backend.snapshot();
         self.hist.extend_from_slice(ids);
+        Ok(())
+    }
+
+    /// Reads the head a session's conversations share — its system block — and leaves a note at its end that
+    /// the ring cannot evict.
+    ///
+    /// The head is the one part of a prompt that everything in a session pays for: a subagent shares nothing
+    /// with the conversation that spawned it except this block, and it can be twenty thousand tokens with the
+    /// tool list. Read once per conversation, that is the whole cost of starting a subagent; read once per
+    /// session, it is nothing. The note is left here rather than at the end of a reply because the point it
+    /// marks is a point *between* conversations — no reply ends there, so only an explicit note can describe
+    /// it, and the ring would have called it the oldest and dropped it first.
+    fn read_head(&mut self, ids: &[u32]) -> Result<(), String> {
+        self.read_in(ids)?;
+        if let Backend::Gpu(_, s) = &mut self.backend {
+            s.snapshot_head()?;
+        }
         Ok(())
     }
 

@@ -7517,6 +7517,52 @@ enum Input<'a> {
     Vectors(&'a [f32]),
 }
 
+/// A conversation the GPU is not holding: everything it left in the caches, kept in host memory, so that a
+/// request which continues it can take the caches back without the model reading its history a second time
+/// (`GpuSession::park`, `GpuSession::restore`).
+///
+/// The card holds one context at a time — the caches are a single sequence, indexed by position — so a
+/// second conversation can only have them if the first one's contents are moved out. They go to host memory
+/// rather than being thrown away because the first one is not finished: its client will send it again on the
+/// next turn, and reading a long conversation back costs tens of seconds while moving it costs milliseconds.
+pub struct Parked {
+    /// The tokens the caches held, in order: what a later request is matched against to tell whether it
+    /// continues this conversation.
+    pub tokens: Vec<u32>,
+    /// Where it stopped: the caches held `0..pos`, and this is what a request continuing it must be given
+    /// room for.
+    pub pos: usize,
+    /// When it was last taken out of the caches, so that the least recently used one is the one dropped
+    /// when host memory runs short.
+    pub used: u64,
+    /// Each cache's layers in turn, each holding that layer's first `pos` rows.
+    parts: Vec<Vec<u8>>,
+    /// The Gated DeltaNet layers' convolution and recurrent states. The one part with no position of its
+    /// own, so unlike the rows above it cannot be recovered from the cache at any other point.
+    delta: Vec<u8>,
+    /// The states this conversation could come back to, as `(position, state)`. A request that continues it
+    /// usually stops a few tokens short of where it got — the previous reply's tail is not in the new prompt
+    /// — and the recurrent layers can only rewind to a note like one of these, never to an arbitrary
+    /// position. Without them, coming back means reading from the start.
+    snaps: Vec<(usize, Vec<u8>)>,
+    /// The note of the head its session's conversations share. It travels with the conversation, so that a
+    /// request which shares only that head still finds a note for it after this one has been put back.
+    head: Option<(usize, Vec<u8>)>,
+}
+
+impl Parked {
+    /// Bytes of host memory this holds, which is what `GHOST_INFER_PARK_MB` bounds. It comes to about the
+    /// size of the conversation itself: the caches are one row per position per layer, so a copy of them is
+    /// the same bytes the card was holding, plus the states, which are a fixed size.
+    pub fn bytes(&self) -> usize {
+        self.parts.iter().map(Vec::len).sum::<usize>()
+            + self.delta.len()
+            + self.snaps.iter().map(|(_, s)| s.len()).sum::<usize>()
+            + self.head.iter().map(|(_, s)| s.len()).sum::<usize>()
+    }
+
+}
+
 pub struct GpuSession {
     pub pos: usize,
     pub ctx: usize, // the most positions it may hold
@@ -7545,10 +7591,22 @@ pub struct GpuSession {
     graphs: [Ptr; 3],      // captured one-token steps: Last, Argmax, Hidden
     att_scr: DeviceBuf,    // the tiled verify attention's scores and weights (vfy_attention_fits models)
     exact: std::cell::Cell<bool>, // this pass checks a draft: verify kernels, no prompt kernels
-    /// Gated DeltaNet layers: every layer's convolution state, then every layer's recurrent state (f32); and
-    /// copies of it at earlier positions (see model::Session::snapshot)
+    /// Gated DeltaNet layers: every layer's convolution state, then every layer's recurrent state (f32).
+    /// This is the live state, the one `pos` stands at; notes of it at earlier positions are in `snaps`.
     delta: Option<DeviceBuf>,
-    snaps: Vec<(usize, DeviceBuf)>,
+    /// Notes taken at earlier positions: the recurrent state as it was, so a request that follows this
+    /// conversation less far than it got can go back to one of them. They live in **host** memory, for the
+    /// same reason a parked conversation does: a note is for a position this session has already moved past,
+    /// so nothing is reading it now, and unlike the live state below it is not read again on every token —
+    /// only when a request comes back to that point. Copies on the card would take memory away from the
+    /// expert cache for nothing, while moving one back costs a few milliseconds, once.
+    snaps: Vec<(usize, Vec<u8>)>,
+    /// The note of the head that every conversation of a session shares: everything up to the end of its
+    /// system block. It is held apart from the ring above because the ring drops the oldest note, and this
+    /// head *is* the oldest — it is written first, in every prompt. Yet it is also the one part every new
+    /// conversation of the session pays for again (a subagent shares nothing else), so it is the last note
+    /// worth dropping rather than the first.
+    head: Option<(usize, Vec<u8>)>,
     pub logits: Vec<f32>,
     pub rows: Vec<f32>, // Out::All: a batch's logits, one vocab-long row per token
 }
@@ -7575,6 +7633,15 @@ impl GpuModel {
     /// The GPU expert cache's state, if this model has one yet.
     pub fn expert_cache(&self) -> Option<String> {
         self.cache.borrow().as_ref().map(ExpertCache::describe)
+    }
+
+    /// Grows the session's caches until they hold `need` positions, so a parked conversation can go back in
+    /// (`GpuSession::restore`). The memory comes from the expert cache, the same as for a long prompt: the
+    /// two trade against each other, and a conversation that is coming back needs the positions it stood at
+    /// more than the cache needs the slots. A conversation parked from a session that already held this much
+    /// costs nothing here — it is the same session, so the caches never shrank below it.
+    pub fn reserve(&self, s: &mut GpuSession, need: usize) -> Result<(), String> {
+        self.fit_session(s, need.min(s.ctx), true)
     }
 
     /// A session that grows gets room for `need` positions, in CTX_STEP steps: the memory it takes comes
@@ -7695,6 +7762,7 @@ impl GpuSession {
                 }
             },
             snaps: Vec::new(),
+            head: None,
             logits_dev: logits_dev?,
             picks: picks?,
             pos_dev: pos_dev?,
@@ -7734,7 +7802,7 @@ impl GpuSession {
 
     /// Device memory of a session holding `ctx` positions (with room for the DeltaNet snapshots).
     fn bytes(cfg: &Config, ctx: usize) -> usize {
-        Self::sizes(cfg, ctx).iter().sum::<usize>() + cfg.n_attn_layers() * ctx * Self::cache_rows(cfg).iter().sum::<usize>() + (1 + MAX_SNAPS) * Self::delta_bytes(cfg)
+        Self::sizes(cfg, ctx).iter().sum::<usize>() + cfg.n_attn_layers() * ctx * Self::cache_rows(cfg).iter().sum::<usize>() + Self::delta_bytes(cfg)
     }
 
     /// Bytes of every DeltaNet layer's states (0 for other models).
@@ -7757,26 +7825,68 @@ impl GpuSession {
 
     pub fn reset(&mut self) -> Result<(), String> {
         self.pos = 0;
+        // The notes go with the history they describe: this session is holding none of it any more, so a
+        // note could only send a later request back into a state that no longer matches its tokens. The
+        // shared head stays — it belongs to the session rather than to this conversation, and it is exactly
+        // the note a request that shares only the system block is looking for.
         self.snaps.clear();
         self.delta.as_ref().map_or(Ok(()), zero)
     }
 
-    /// Keeps a copy of the DeltaNet states at the current position (the earliest and the latest are kept).
+    /// Copies the recurrent state out to host memory as a note to come back to.
+    ///
+    /// The caller takes one where a **reply** ends, and nowhere else. That is where a request comes back
+    /// to: a retry, a rewind, a fork, a subagent cutting in. A prompt's end is not — after a prompt comes
+    /// the reply head and then the reply, so the position the next request wants is the one at the end of
+    /// what was generated, not the one before it.
+    ///
+    /// The ring keeps as many notes as `note_budget()` allows and drops the oldest. That decides which
+    /// requests pay: what stays covers the positions this conversation passed through recently, which is
+    /// where a fork, a rewind or a retry comes back to. A request whose prefix stops before the oldest note
+    /// kept reads its history again — exactly what it would have done before any of this existed.
     pub fn snapshot(&mut self) -> Result<(), String> {
-        let Some(buf) = &self.delta else { return Ok(()) };
-        if self.snaps.iter().any(|s| s.0 == self.pos) {
+        if self.delta.as_ref().is_none_or(|b| b.bytes == 0) || self.snaps.iter().any(|s| s.0 == self.pos) {
             return Ok(());
         }
-        // full: the oldest after the earliest makes way
-        let copy = if self.snaps.len() == MAX_SNAPS { self.snaps.remove(1).1 } else { DeviceBuf::alloc(buf.bytes)? };
-        let a = api()?;
-        a.check(unsafe { (a.f.cuMemcpyDtoD_v2)(copy.ptr, buf.ptr, buf.bytes) }, "DeltaNet snapshot")?;
+        let Some(copy) = self.note_out()? else { return Ok(()) };
+        // the shared head holds the earliest position already, so the ring keeps the latest few
+        if self.snaps.len() == MAX_SNAPS {
+            self.snaps.remove(0);
+        }
         self.snaps.push((self.pos, copy));
         Ok(())
     }
 
-    /// Goes back to at most `pos` positions; returns how many are kept (a recurrent model: the latest snapshot at
-    /// or before `pos`, or none).
+    /// Leaves the note of the shared head. It is kept outside the ring, so no budget can evict it: a second
+    /// conversation of the same session — a subagent, or a new chat carrying the same system prompt — shares
+    /// nothing with this one *except* that block, and with a note at its end it reads only what follows. The
+    /// head is written first in every prompt, so a plain ring would always call it the oldest note and throw
+    /// it away first, which is the opposite of what is wanted. Nothing bounds it: it is one note, and a
+    /// session has one system block.
+    pub fn snapshot_head(&mut self) -> Result<(), String> {
+        let Some(copy) = self.note_out()? else { return Ok(()) };
+        let at = self.pos;
+        self.snaps.retain(|(p, _)| *p != at);
+        self.head = Some((at, copy));
+        Ok(())
+    }
+
+    /// The state at the current position, in host memory, or `None` for a model without recurrent layers.
+    fn note_out(&self) -> Result<Option<Vec<u8>>, String> {
+        let Some(buf) = self.delta.as_ref().filter(|b| b.bytes > 0) else { return Ok(None) };
+        let a = api()?;
+        let mut copy = vec![0u8; buf.bytes];
+        a.check(unsafe { (a.f.cuMemcpyDtoH_v2)(copy.as_mut_ptr() as *mut c_void, buf.ptr, copy.len()) }, "DeltaNet note")?;
+        Ok(Some(copy))
+    }
+
+    /// Goes back to at most `pos` positions and returns how many are kept.
+    ///
+    /// A model without recurrent layers keeps `pos` exactly: its caches are a sequence indexed by position,
+    /// so dropping `pos` from the end costs nothing and needs no copy. A recurrent one cannot stand at an
+    /// arbitrary position — its state carries no position of its own — so it can only go back to a note
+    /// taken at or before `pos` (from the ring, or the shared `head`), or start over when there is none. The
+    /// note comes back from host memory into the live state.
     pub fn truncate(&mut self, pos: usize) -> Result<usize, String> {
         if pos >= self.pos {
             return Ok(self.pos);
@@ -7786,15 +7896,100 @@ impl GpuSession {
             return Ok(pos);
         }
         self.snaps.retain(|s| s.0 <= pos);
-        match self.snaps.iter().max_by_key(|s| s.0) {
-            Some((at, copy)) => {
-                let (a, buf) = (api()?, self.delta.as_ref().unwrap());
-                a.check(unsafe { (a.f.cuMemcpyDtoD_v2)(buf.ptr, copy.ptr, buf.bytes) }, "DeltaNet restore")?;
-                self.pos = *at;
+        let at = self
+            .snaps
+            .iter()
+            .map(|(at, _)| *at)
+            .chain(self.head.iter().filter(|(at, _)| *at <= pos).map(|(at, _)| *at))
+            .max();
+        let Some(at) = at else {
+            self.reset()?;
+            return Ok(self.pos);
+        };
+        let note = self
+            .snaps
+            .iter()
+            .find(|(p, _)| *p == at)
+            .map(|(_, s)| s)
+            .or_else(|| self.head.as_ref().filter(|(p, _)| *p == at).map(|(_, s)| s));
+        if let (Some(copy), Some(buf)) = (note, self.delta.as_ref()) {
+            if !copy.is_empty() {
+                let a = api()?;
+                a.check(unsafe { (a.f.cuMemcpyHtoD_v2)(buf.ptr, copy.as_ptr() as *const c_void, copy.len()) }, "DeltaNet restore")?;
             }
-            None => self.reset()?,
         }
+        self.pos = at;
         Ok(self.pos)
+    }
+
+    /// Copies everything a conversation has written into the caches out to host memory, so another one can
+    /// have the GPU.
+    ///
+    /// The whole context goes, not just the part a later request will not recompute. The caches are a single
+    /// sequence at positions `0..pos` and the next reader writes from wherever it starts, so keeping any of
+    /// it on the card is a gamble on nobody having written there. The copy is the conversation's tokens, the
+    /// four caches' first `pos` rows, the DeltaNet state, and the notes that state can be rewound to. It
+    /// comes to about the size of the conversation, which is why what bounds how many are kept is host
+    /// memory rather than the card.
+    pub fn park(&mut self, tokens: Vec<u32>) -> Result<Parked, String> {
+        let a = api()?;
+        let pos = self.pos.min(self.cap);
+        let mut parts = Vec::new();
+        for c in [&self.k_cache, &self.v_cache, &self.k_scale, &self.v_scale] {
+            for b in &c.layers {
+                let mut buf = vec![0u8; pos * c.row];
+                if !buf.is_empty() {
+                    a.check(unsafe { (a.f.cuMemcpyDtoH_v2)(buf.as_mut_ptr() as *mut c_void, b.ptr, buf.len()) }, "park the attention cache")?;
+                }
+                parts.push(buf);
+            }
+        }
+        let mut delta = vec![0u8; self.delta.as_ref().map_or(0, |b| b.bytes)];
+        if let Some(b) = self.delta.as_ref().filter(|_| !delta.is_empty()) {
+            a.check(unsafe { (a.f.cuMemcpyDtoH_v2)(delta.as_mut_ptr() as *mut c_void, b.ptr, delta.len()) }, "park the DeltaNet state")?;
+        }
+        // The notes are host memory already, so they travel as they are — no round trip. The state at `pos`
+        // is `delta` itself, so a note there would only repeat what was read out a moment ago; the ones
+        // below it are the ones a later request can actually use.
+        let snaps = self.snaps.iter().filter(|(at, _)| *at < pos).cloned().collect();
+        Ok(Parked { tokens, pos, parts, delta, snaps, head: self.head.clone(), used: 0 })
+    }
+
+    /// Puts a parked conversation back into the caches, which must already hold room for `parked.pos`
+    /// positions (see `GpuModel::reserve`). Its token list is the caller's.
+    ///
+    /// The notes go back with it, and that is what makes this worth doing at all. A request that continues
+    /// the conversation almost never follows it all the way — the previous reply's tail is not part of the
+    /// new prompt — so the session is left a few tokens short of `pos` and has to step back to a note at or
+    /// before that point. Restoring without the notes leaves it with none, and a recurrent model with no
+    /// note to step back to has to read its history from the beginning: the caches came back, and then
+    /// nothing used them.
+    pub fn restore(&mut self, parked: &Parked) -> Result<(), String> {
+        let a = api()?;
+        if parked.pos > self.cap {
+            return Err(format!("the caches hold {} positions, the parked context has {}", self.cap, parked.pos));
+        }
+        let mut i = 0usize;
+        for c in [&self.k_cache, &self.v_cache, &self.k_scale, &self.v_scale] {
+            let _ = c.row;
+            for b in &c.layers {
+                if let Some(part) = parked.parts.get(i).filter(|p| !p.is_empty()) {
+                    a.check(unsafe { (a.f.cuMemcpyHtoD_v2)(b.ptr, part.as_ptr() as *const c_void, part.len()) }, "put back a parked attention cache")?;
+                }
+                i += 1;
+            }
+        }
+        if let Some(b) = self.delta.as_ref().filter(|_| !parked.delta.is_empty()) {
+            a.check(unsafe { (a.f.cuMemcpyHtoD_v2)(b.ptr, parked.delta.as_ptr() as *const c_void, parked.delta.len()) }, "put back a parked DeltaNet state")?;
+        }
+        // the notes come back as they were, so the step back that follows has somewhere to land
+        self.snaps = parked.snaps.clone();
+        self.head = parked.head.clone();
+        // the state just restored is where this conversation now stands: leave a note here too, so the next
+        // request that continues it has one at the position this one reached
+        self.pos = parked.pos;
+        self.snapshot()?;
+        Ok(())
     }
 
     /// The most memory `resize` to `ctx` positions holds besides the old caches and the new ones done so
@@ -7934,8 +8129,8 @@ pub fn session_bytes(cfg: &Config, ctx: usize) -> usize {
 /// Experts' slots per block of GPU memory (the expert cache grows and shrinks a block at a time).
 const SLOT_BLOCK: usize = 16;
 
-/// Copies of the DeltaNet states a session keeps (GpuSession::snapshot): the earliest (a prompt's shared
-/// opening), and the latest prompt's reply header and end.
+/// Copies of the DeltaNet states a session keeps besides the shared head: one per reply that ended here,
+/// the oldest making way. They are in host memory, so the count is all there is to bound.
 const MAX_SNAPS: usize = 3;
 
 /// A layer's experts in one 2-bit format (gate, up and down alike): its `fmt` for the IQ2 kernels.
